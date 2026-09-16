@@ -7,7 +7,7 @@ const CONFIG_KEY = "pawmodoro_config";       // { url, anonKey }
 const SESSION_KEY = "pawmodoro_session";     // supabase session, persisted by the client itself
 const SETTINGS_KEY = "pawmodoro_settings";   // { workMin, shortBreakMin, longBreakMin, sessionsBeforeLong }
 
-let supabase = null;
+let supabaseClient = null;
 let state = null;         // last sync_pull() result
 let pomodoro = {
   phase: "work",          // "work" | "short_break" | "long_break"
@@ -58,7 +58,7 @@ async function boot() {
   }
   initSupabase(cfg);
 
-  const { data: { session } } = await supabase.auth.getSession();
+  const { data: { session } } = await supabaseClient.auth.getSession();
   if (session) {
     await enterApp();
   } else {
@@ -67,7 +67,7 @@ async function boot() {
 }
 
 function initSupabase(cfg) {
-  supabase = window.supabase.createClient(cfg.url, cfg.anonKey, {
+  supabaseClient = window.supabase.createClient(cfg.url, cfg.anonKey, {
     auth: { persistSession: true, storageKey: SESSION_KEY },
   });
 }
@@ -125,13 +125,13 @@ async function doAuth(mode) {
     return;
   }
   const { error } = mode === "signup"
-    ? await supabase.auth.signUp({ email, password })
-    : await supabase.auth.signInWithPassword({ email, password });
+    ? await supabaseClient.auth.signUp({ email, password })
+    : await supabaseClient.auth.signInWithPassword({ email, password });
   if (error) {
     errEl.textContent = error.message;
     return;
   }
-  const { data: { session } } = await supabase.auth.getSession();
+  const { data: { session } } = await supabaseClient.auth.getSession();
   if (!session) {
     errEl.textContent = "Check your email to confirm the account, then log in.";
     return;
@@ -161,7 +161,7 @@ function renderShell() {
       <button data-tab="progress">\u{1F3C6} Progress</button>
     </nav>`;
   document.getElementById("logout-btn").addEventListener("click", async () => {
-    await supabase.auth.signOut();
+    await supabaseClient.auth.signOut();
     showLoginScreen();
   });
   document.querySelectorAll("#tabbar button").forEach(btn => {
@@ -182,7 +182,7 @@ function switchTab(tab) {
 }
 
 async function pullAndRender() {
-  const { data, error } = await supabase.rpc("sync_pull");
+  const { data, error } = await supabaseClient.rpc("sync_pull");
   if (error) {
     console.error("sync_pull failed", error);
     return;
@@ -241,7 +241,7 @@ function renderNotes() {
     document.getElementById("notes-status").textContent = "Saving…";
     clearTimeout(notesSaveTimer);
     notesSaveTimer = setTimeout(async () => {
-      await supabase.rpc("set_notes", { p_notes: editor.value });
+      await supabaseClient.rpc("set_notes", { p_notes: editor.value });
       document.getElementById("notes-status").textContent = "Autosaved";
       if (state) state.notes = editor.value;
     }, 800);
@@ -281,7 +281,7 @@ function renderChecklist() {
       await toggleTask(task.id, e.target.checked);
     });
     li.querySelector(".remove-btn").addEventListener("click", async () => {
-      await supabase.rpc("remove_task", { p_task_id: task.id });
+      await supabaseClient.rpc("remove_task", { p_task_id: task.id });
       await pullAndRender();
     });
     list.appendChild(li);
@@ -291,14 +291,14 @@ function renderChecklist() {
     const text = document.getElementById("task-text").value.trim();
     if (!text) return;
     const recurrence = document.getElementById("task-recurrence").value;
-    await supabase.rpc("add_task", { p_text: text, p_recurrence: recurrence, p_reminder_time: null });
+    await supabaseClient.rpc("add_task", { p_text: text, p_recurrence: recurrence, p_reminder_time: null });
     document.getElementById("task-text").value = "";
     await pullAndRender();
   });
 }
 
 async function toggleTask(taskId, done) {
-  const { data, error } = await supabase.rpc("complete_task", { p_task_id: taskId, p_done: done });
+  const { data, error } = await supabaseClient.rpc("complete_task", { p_task_id: taskId, p_done: done });
   if (!error && done && data) {
     let detail = `+${data.xp_gained ?? 0} XP`;
     if (data.new_level > data.old_level) detail += ` — Level up! Now level ${data.new_level}`;
@@ -415,7 +415,7 @@ async function onPhaseComplete() {
   const s = getSettings();
   if (pomodoro.phase === "work") {
     pomodoro.sessionCount += 1;
-    const { data } = await supabase.rpc("record_pomodoro_completed");
+    const { data } = await supabaseClient.rpc("record_pomodoro_completed");
     notify("Focus session complete!", data ? `+${data.xp_gained} XP` : "Nice work!");
     if (data) {
       for (const q of data.completed_quests ?? []) {
@@ -424,7 +424,7 @@ async function onPhaseComplete() {
     }
     pomodoro.phase = (pomodoro.sessionCount % s.sessionsBeforeLong === 0) ? "long_break" : "short_break";
   } else {
-    await supabase.rpc("record_break_completed");
+    await supabaseClient.rpc("record_break_completed");
     notify("Break's over", "Back to it when you're ready.");
     pomodoro.phase = "work";
   }
