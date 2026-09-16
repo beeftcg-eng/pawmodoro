@@ -118,18 +118,28 @@ class Storage:
 
     # ---------- Checklist ----------
     def _roll_recurring_tasks(self):
-        """Reset 'completed_today' for daily tasks whose last_completed isn't today."""
-        today = date.today().isoformat()
+        """Resets 'completed_today': for daily tasks, whenever
+        last_completed isn't today; for a weekly task pinned to a
+        specific weekday, only on that weekday (so checking it off on,
+        say, Tuesday leaves it checked the rest of the week, and it
+        un-checks itself the next time Tuesday comes around)."""
+        today_date = date.today()
+        today = today_date.isoformat()
         changed = False
         for task in self.data.get("checklist", []):
-            if task.get("recurrence") == "daily" and task.get("last_completed") != today:
+            recurrence = task.get("recurrence")
+            should_reset = (
+                recurrence == "daily"
+                or (recurrence == "weekly" and task.get("weekday") is not None and today_date.weekday() == task["weekday"])
+            )
+            if should_reset and task.get("last_completed") != today:
                 if task.get("completed_today"):
                     changed = True
                 task["completed_today"] = False
         if changed:
             self.save()
 
-    def add_task(self, text, recurrence="daily", reminder_time=None):
+    def add_task(self, text, recurrence="daily", reminder_time=None, weekday=None):
         # When synced, use the server-assigned id rather than generating our
         # own, so this task and its cloud copy are recognized as the same
         # row on the next pull instead of showing up as a duplicate.
@@ -149,6 +159,7 @@ class Storage:
             "last_completed": None,
             "completed_today": False,
             "reminder_time": reminder_time,  # "HH:MM" or None
+            "weekday": weekday,  # 0=Monday..6=Sunday, only meaningful for "weekly"; local-only, doesn't sync yet
             "last_reminded": None,  # date isoformat, so a reminder fires at most once/day
         }
         self.data["checklist"].append(task)
@@ -204,6 +215,20 @@ class Storage:
                 pass
             finally:
                 self._persist_sync_token_if_changed()
+
+    def reorder_tasks(self, ordered_ids):
+        """Reorders the checklist to match `ordered_ids` (a list of task
+        ids in the desired order). Local-only for now - the cloud side
+        doesn't track an order, so a synced task list always comes back
+        sorted by creation date on the phone regardless of how it's been
+        reordered on desktop. Any id not in the current checklist is
+        ignored; any current task not present in `ordered_ids` is kept,
+        appended at the end, so a stale/partial list can't drop tasks."""
+        by_id = {t["id"]: t for t in self.data["checklist"]}
+        new_order = [by_id[i] for i in ordered_ids if i in by_id]
+        remaining = [t for t in self.data["checklist"] if t["id"] not in ordered_ids]
+        self.data["checklist"] = new_order + remaining
+        self.save()
 
     def set_task_done(self, task_id, done):
         today = date.today().isoformat()

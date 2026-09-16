@@ -2,7 +2,7 @@
 
 A small desktop app (Python + PyQt6) with a pen-and-paper look, running natively on **both Linux and Windows** from the same codebase:
 
-1. **Notes & Checklist** — one tab, side by side. Notes are rich text (bold/underline/text color/highlighting/headings/lists) and autosave as you type. The checklist supports `daily` / `weekly` / `once` recurring tasks — daily ones (like "walk the dogs") automatically un-check themselves each new day.
+1. **Notes & Checklist** — one tab, side by side. Notes are rich text (bold/underline/text color/highlighting/headings/lists) and autosave as you type. The checklist supports `daily` / `weekly` / `once` recurring tasks — daily ones (like "walk the dogs") automatically un-check themselves each new day, and a `weekly` task can be pinned to a specific day of the week (pick it from the extra dropdown that appears), un-checking itself the next time that day comes around. Drag tasks up/down to reorder them (desktop-only for now — order doesn't sync to the mobile app yet, though the tasks themselves do).
 2. **Pomodoro timer** — configurable work/short-break/long-break durations and session count, with desktop notifications and auto-advance.
 3. **Ambient sounds** — six built-in tracks (Rain, Ocean Waves, White Noise, Wind, Café Ambience, Fireplace), pick up to 3 to play together, plus add your own audio files. All six built-ins are synthesized locally, not sampled — no copyright concerns.
 4. **Music** — a button to open YouTube Music in your regular browser, plus optional Spotify Connect integration if you want it. A player bar at the bottom controls whichever one you're using.

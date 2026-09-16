@@ -51,6 +51,29 @@ if (-not (Test-Path $VenvDir)) {
 & "$VenvDir\Scripts\python.exe" -m pip install --upgrade pip --quiet
 & "$VenvDir\Scripts\pip.exe" install -r (Join-Path $SrcDir "requirements.txt") --quiet
 
+# Optional: lets the player bar control a browser tab (YouTube Music,
+# etc.) via Windows' own media-control API. Deliberately NOT in
+# requirements.txt and installed as its own isolated, best-effort step -
+# it's a niche, infrequently-updated package that doesn't always have a
+# prebuilt wheel for every Python version, and without one, pip falls
+# back to compiling it from source, which needs a full Visual Studio C++
+# toolchain most machines don't have. A failure here must never take
+# down the rest of the install - the app already runs fine without it
+# (Spotify Connect still works either way), so this is wrapped to swallow
+# any failure rather than letting it escalate given $ErrorActionPreference
+# above.
+$PreviousErrorAction = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+& "$VenvDir\Scripts\pip.exe" install "winsdk>=1.0.0b1" --quiet *>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    Write-Host ""
+    Write-Host "Note: couldn't install the optional 'winsdk' package (used for controlling"
+    Write-Host "a browser tab's music from the player bar). This is likely because there's"
+    Write-Host "no prebuilt version of it for your Python version yet. Pawmodoro will still"
+    Write-Host "install and run fine - Spotify Connect in the Music tab still works either way."
+}
+$ErrorActionPreference = $PreviousErrorAction
+
 # A real, custom-built Pawmodoro.exe (windows_launcher/, see build.sh)
 # that just launches venv\Scripts\pythonw.exe main.py and exits. Earlier
 # attempts pointed the shortcut at pythonw.exe directly, or a same-file
