@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Pawmodoro
+Comment=Notes, recurring checklist, pomodoro timer, and YouTube Music
+Exec=__INSTALL_DIR__/run.sh
+Icon=__ICON_PATH__
+Terminal=false
+Categories=Utility;Office;
+StartupWMClass=Pawmodoro

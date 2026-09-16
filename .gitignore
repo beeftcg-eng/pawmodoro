@@ -1,0 +1,14 @@
+# Generated ambient sound tracks (large; regenerate with tools/generate_rain.py
+# and tools/generate_ambient.py, or download the full zip from Releases).
+resources/*.wav
+resources/*.ogg
+resources/*.mp3
+
+__pycache__/
+*.pyc
+
+venv/
+.venv/
+
+# Never commit local user data.
+data.json
