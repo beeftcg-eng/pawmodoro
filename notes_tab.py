@@ -68,6 +68,15 @@ class NotesTab(QWidget):
         p = theme.current()
         self.status_label.setStyleSheet(f"color: {p['INK_SOFT']}; font-size: 11px;")
 
+    def maybe_reload_from_remote(self):
+        """Called by the periodic cloud-sync poll (main.py's _SyncPoller).
+        Skips the reload whenever the editor currently has focus, so a
+        pull landing mid-keystroke can never clobber text being typed
+        right now — it'll pick up on the next poll after you click away."""
+        if self.editor.hasFocus():
+            return
+        self.reload_from_storage()
+
     def reload_from_storage(self):
         """Re-reads notes from storage (e.g. after a Cloud Sync connect
         just replaced them) without re-triggering the autosave loop."""

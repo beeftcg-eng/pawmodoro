@@ -47,17 +47,26 @@ class _SyncPoller(QObject):
     def __init__(self, storage, parent=None):
         super().__init__(parent)
         self.storage = storage
+        self._in_flight = False
 
     def poll(self):
         client = self.storage._sync_client
-        if not client:
+        # Skip this tick if the previous poll's network call hasn't
+        # returned yet — at a 5s interval that can happen on a slow
+        # connection, and overlapping calls would risk a slower, older
+        # result landing (and overwriting local state) after a faster,
+        # newer one already applied.
+        if not client or self._in_flight:
             return
+        self._in_flight = True
 
         def worker():
             try:
                 remote = client.sync_pull()
             except SyncError:
                 return
+            finally:
+                self._in_flight = False
             self.pulled.emit(remote)
 
         threading.Thread(target=worker, daemon=True).start()
@@ -149,12 +158,15 @@ class MainWindow(QMainWindow):
 
         # Cloud Sync: pick up changes made on the phone web app without
         # needing a restart. A no-op (cheap, no network call) whenever sync
-        # isn't enabled.
+        # isn't enabled. 5s keeps things feeling close to real-time without
+        # needing a full websocket/Realtime subscription; the network call
+        # itself runs on a background thread either way, so a short
+        # interval doesn't cost any UI responsiveness.
         self._sync_poller = _SyncPoller(self.storage, self)
         self._sync_poller.pulled.connect(self._on_remote_pulled)
         self.sync_timer = QTimer(self)
         self.sync_timer.timeout.connect(self._sync_poller.poll)
-        self.sync_timer.start(30000)
+        self.sync_timer.start(5000)
 
         state = self.storage.get_window_state()
         if state.get("widget_mode"):
@@ -176,6 +188,7 @@ class MainWindow(QMainWindow):
         self.progress_tab.refresh()
         self._refresh_level_indicator()
         self.widget_window.refresh_tasks()
+        self.notes_checklist_tab.notes_tab.maybe_reload_from_remote()
 
     def _open_sync_settings(self):
         dialog = SyncSettingsDialog(self.storage, self)

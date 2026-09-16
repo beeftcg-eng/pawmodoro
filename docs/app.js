@@ -185,15 +185,15 @@ async function doAuth(mode) {
 
 async function enterApp() {
   // Fetch state before building the shell — the shell's initial
-  // switchTab() renders a tab immediately, and pullAndRender() itself
-  // deliberately never re-renders the Notes tab afterward (so a later
-  // poll can't clobber text someone's actively typing), so if Notes is
-  // the tab shown on load, it needs real data on this very first render.
+  // switchTab() renders a tab immediately, and pullAndRender() skips
+  // refreshing the Notes editor whenever it's focused (so a poll can't
+  // clobber text being typed right now), so if Notes is the tab shown on
+  // load, it needs real data on this very first render regardless.
   const { data, error } = await supabaseClient.rpc("sync_pull");
   if (!error) state = data;
   renderShell();
   updateLevelBadge();
-  setInterval(pullAndRender, 20000); // pick up changes made on the desktop app
+  setInterval(pullAndRender, 5000); // pick up changes made on the desktop app
 }
 
 function renderShell() {
@@ -235,19 +235,36 @@ function switchTab(tab) {
   else if (tab === "progress") renderProgress();
 }
 
+let pullInFlight = false;
+
 async function pullAndRender() {
-  const { data, error } = await supabaseClient.rpc("sync_pull");
-  if (error) {
-    console.error("sync_pull failed", error);
-    return;
+  // Skip this tick if the previous poll hasn't returned yet — at a 5s
+  // interval that can happen on a slow connection, and an overlapping
+  // call risks a slower, older response landing (and overwriting state)
+  // after a faster, newer one already applied.
+  if (pullInFlight) return;
+  pullInFlight = true;
+  try {
+    const { data, error } = await supabaseClient.rpc("sync_pull");
+    if (error) {
+      console.error("sync_pull failed", error);
+      return;
+    }
+    state = data;
+    updateLevelBadge();
+    if (activeTab === "notes") {
+      // Only refresh if the editor doesn't currently have focus, so a
+      // poll landing mid-keystroke can never clobber text being typed
+      // right now — it picks up on the next poll after you tap away.
+      const editor = document.getElementById("notes-editor");
+      if (editor && document.activeElement !== editor) {
+        editor.innerHTML = state.notes ?? "";
+      }
+    } else if (activeTab === "checklist") renderChecklist();
+    else if (activeTab === "progress") renderProgress();
+  } finally {
+    pullInFlight = false;
   }
-  state = data;
-  updateLevelBadge();
-  // Only re-render the currently visible tab so typing in Notes isn't
-  // clobbered by a poll landing mid-keystroke.
-  if (activeTab === "notes") { /* left alone: notes editing owns its own buffer */ }
-  else if (activeTab === "checklist") renderChecklist();
-  else if (activeTab === "progress") renderProgress();
 }
 
 function levelFromXp(totalXp) {
