@@ -11,6 +11,7 @@ from datetime import date, datetime, timedelta
 
 import gamification
 from paths import app_data_dir
+from supabase_sync import SupabaseSync, SyncError
 
 APP_DIR = app_data_dir()
 DATA_FILE = os.path.join(APP_DIR, "data.json")
@@ -53,6 +54,13 @@ DEFAULT_DATA = {
         "weekly_quests_start": None,  # isoformat of the Tuesday the current weekly quests started
         "weekly_quests": [],  # list of {id, kind, target, desc, progress, completed}
     },
+    "sync": {
+        "enabled": False,
+        "url": "",
+        "anon_key": "",
+        "email": "",
+        "refresh_token": None,  # never the password itself, just a long-lived session token
+    },
 }
 
 
@@ -63,6 +71,8 @@ class Storage:
         os.makedirs(APP_DIR, exist_ok=True)
         self.data = self._load()
         self._roll_recurring_tasks()
+        self._sync_client = None
+        self._init_sync_client()
 
     def _load(self):
         if os.path.exists(DATA_FILE):
@@ -98,6 +108,11 @@ class Storage:
     def set_notes(self, text):
         self.data["notes"] = text
         self.save()
+        if self._sync_client:
+            try:
+                self._sync_client.set_notes(text)
+            except SyncError:
+                pass
 
     # ---------- Checklist ----------
     def _roll_recurring_tasks(self):
@@ -113,8 +128,18 @@ class Storage:
             self.save()
 
     def add_task(self, text, recurrence="daily", reminder_time=None):
+        # When synced, use the server-assigned id rather than generating our
+        # own, so this task and its cloud copy are recognized as the same
+        # row on the next pull instead of showing up as a duplicate.
+        task_id = None
+        if self._sync_client:
+            try:
+                remote_task = self._sync_client.add_task(text, recurrence, reminder_time)
+                task_id = remote_task["id"]
+            except SyncError:
+                pass
         task = {
-            "id": uuid.uuid4().hex[:8],
+            "id": task_id or uuid.uuid4().hex[:8],
             "text": text,
             "recurrence": recurrence,  # "daily", "weekly", "once"
             "last_completed": None,
@@ -133,6 +158,11 @@ class Storage:
                 task["reminder_time"] = reminder_time
                 task["last_reminded"] = None
         self.save()
+        if self._sync_client:
+            try:
+                self._sync_client.set_task_reminder(task_id, reminder_time)
+            except SyncError:
+                pass
 
     def check_due_reminders(self):
         """Returns the list of tasks whose reminder time matches right now
@@ -161,6 +191,11 @@ class Storage:
     def remove_task(self, task_id):
         self.data["checklist"] = [t for t in self.data["checklist"] if t["id"] != task_id]
         self.save()
+        if self._sync_client:
+            try:
+                self._sync_client.remove_task(task_id)
+            except SyncError:
+                pass
 
     def set_task_done(self, task_id, done):
         today = date.today().isoformat()
@@ -171,6 +206,11 @@ class Storage:
                 if task["recurrence"] == "once" and done:
                     pass  # left in list, shown as done; user can delete manually
         self.save()
+        if self._sync_client:
+            try:
+                self._sync_client.set_task_completed_flag(task_id, done)
+            except SyncError:
+                pass
 
     def get_checklist(self):
         return self.data.get("checklist", [])
@@ -235,6 +275,83 @@ class Storage:
     def set_spotify_config(self, config):
         self.data["spotify"] = config
         self.save()
+
+    # ---------- Cloud Sync (Supabase; see sync_settings_dialog.py) ----------
+    def _init_sync_client(self):
+        cfg = self.data.get("sync", {})
+        self._sync_client = None
+        if not (cfg.get("enabled") and cfg.get("url") and cfg.get("anon_key") and cfg.get("refresh_token")):
+            return
+        client = SupabaseSync(cfg["url"], cfg["anon_key"], refresh_token=cfg["refresh_token"])
+        try:
+            client.refresh_session()
+            self._sync_client = client
+        except SyncError:
+            # Offline (or the session finally expired) at startup: the app
+            # just runs local-only for this session, exactly like sync was
+            # never turned on. Reopen Cloud Sync settings, or restart once
+            # back online, to reconnect.
+            pass
+
+    def get_sync_config(self):
+        return dict(self.data.get("sync", DEFAULT_DATA["sync"]))
+
+    def save_sync_config(self, url, anon_key, email, refresh_token, enabled):
+        self.data["sync"] = {
+            "enabled": enabled, "url": url, "anon_key": anon_key,
+            "email": email, "refresh_token": refresh_token,
+        }
+        self.save()
+        self._init_sync_client()
+
+    def _apply_remote_state(self, remote):
+        """Overwrites the local cache with the server's copy of notes,
+        checklist, and gamification state (server is authoritative once
+        connected)."""
+        self.data["notes"] = remote["notes"]
+        self.data["checklist"] = [
+            {
+                "id": t["id"],
+                "text": t["text"],
+                "recurrence": t["recurrence"],
+                "last_completed": t.get("last_completed"),
+                "completed_today": t.get("completed_today", False),
+                "reminder_time": t.get("reminder_time"),
+                "last_reminded": t.get("last_reminded"),
+            }
+            for t in remote["checklist"]
+        ]
+        g = self.data["gamification"]
+        g["xp"] = remote["xp"]
+        g["total_pomodoros"] = remote["total_pomodoros"]
+        g["total_tasks"] = remote["total_tasks"]
+        g["current_streak"] = remote["current_streak"]
+        g["longest_streak"] = remote["longest_streak"]
+        g["quests"] = remote["quests"]
+        g["weekly_quests"] = remote["weekly_quests"]
+        today = date.today()
+        g["quests_date"] = today.isoformat()
+        g["weekly_quests_start"] = gamification.week_start_for(today).isoformat()
+        self.save()
+
+    def adopt_remote_state(self, remote):
+        """Public entry point for sync_settings_dialog's first-connect flow."""
+        self._apply_remote_state(remote)
+
+    def _remote_call(self, fn):
+        """Runs fn(sync_client) and, on success, re-pulls full state so the
+        local cache matches the server, returning fn's result. Returns None
+        (never raises) if sync isn't enabled or the call fails for any
+        reason, so callers can treat None as "fall back to local-only"."""
+        if not self._sync_client:
+            return None
+        try:
+            result = fn(self._sync_client)
+            remote = self._sync_client.sync_pull()
+            self._apply_remote_state(remote)
+            return result
+        except SyncError:
+            return None
 
     # ---------- Gamification: XP, levels, streaks, daily/weekly quests ----------
     def _ensure_daily_quests(self):
@@ -320,6 +437,9 @@ class Storage:
     def record_pomodoro_completed(self):
         """Call once per completed work session. Returns a dict describing
         what was earned, for the UI to celebrate."""
+        remote_result = self._remote_call(lambda c: c.record_pomodoro_completed())
+        if remote_result is not None:
+            return remote_result
         self._ensure_daily_quests()
         self._ensure_weekly_quests()
         self._bump_streak()
@@ -340,6 +460,9 @@ class Storage:
     def record_break_completed(self):
         """Call once per completed break. Breaks don't earn XP on their
         own, but they can satisfy a "take a break" quest."""
+        remote_result = self._remote_call(lambda c: c.record_break_completed())
+        if remote_result is not None:
+            return remote_result
         self._ensure_daily_quests()
         self._ensure_weekly_quests()
         completed_quests = self._advance_quests("breaks", 1)
@@ -350,6 +473,9 @@ class Storage:
         """Call whenever a checklist checkbox is toggled. `done=True`
         awards XP and progresses quests; `done=False` (unchecking) reverses
         the same XP so toggling back and forth nets to zero."""
+        remote_result = self._remote_call(lambda c: c.apply_task_xp(recurrence, done))
+        if remote_result is not None:
+            return remote_result
         self._ensure_daily_quests()
         self._ensure_weekly_quests()
         xp = gamification.XP_PER_TASK.get(recurrence, 10)

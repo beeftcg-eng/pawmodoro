@@ -8,12 +8,13 @@ Run: python3 main.py
 """
 import os
 import sys
+import threading
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QSystemTrayIcon, QMenu, QMessageBox,
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel
 )
 from PyQt6.QtGui import QIcon, QAction, QActionGroup
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, QObject, pyqtSignal
 
 from storage import Storage
 from notes_checklist_tab import NotesChecklistTab
@@ -24,12 +25,42 @@ from widget_window import WidgetWindow
 from player_bar import PlayerBar
 from spotify_client import SpotifyClient
 from toast import CelebrationToast
+from sync_settings_dialog import SyncSettingsDialog
+from supabase_sync import SyncError
 import notifier
 import theme
 import gamification
 from version import VERSION
 
 ICON_PATH = os.path.join(os.path.dirname(__file__), "resources", "icon.png")
+
+
+class _SyncPoller(QObject):
+    """Periodically checks the cloud for changes made elsewhere (e.g. the
+    phone web app). The network call runs on a background thread so a slow
+    or dead connection can't freeze the UI; `pulled` is a Qt signal, so
+    Qt safely queues its delivery back onto the main thread regardless of
+    which thread emitted it — the actual local-state update (in
+    MainWindow._on_remote_pulled) always runs on the main thread."""
+    pulled = pyqtSignal(dict)
+
+    def __init__(self, storage, parent=None):
+        super().__init__(parent)
+        self.storage = storage
+
+    def poll(self):
+        client = self.storage._sync_client
+        if not client:
+            return
+
+        def worker():
+            try:
+                remote = client.sync_pull()
+            except SyncError:
+                return
+            self.pulled.emit(remote)
+
+        threading.Thread(target=worker, daemon=True).start()
 
 
 class MainWindow(QMainWindow):
@@ -72,6 +103,9 @@ class MainWindow(QMainWindow):
         self.level_indicator = QLabel("")
         header_layout.addWidget(self.level_indicator)
         header_layout.addStretch()
+        self.sync_btn = QPushButton("☁️ Sync")
+        self.sync_btn.clicked.connect(self._open_sync_settings)
+        header_layout.addWidget(self.sync_btn)
         self.theme_btn = QPushButton("\U0001F3A8 Theme")
         header_layout.addWidget(self.theme_btn)
         central_layout.addWidget(header)
@@ -113,6 +147,15 @@ class MainWindow(QMainWindow):
         self.reminder_timer.timeout.connect(self._check_reminders)
         self.reminder_timer.start(20000)
 
+        # Cloud Sync: pick up changes made on the phone web app without
+        # needing a restart. A no-op (cheap, no network call) whenever sync
+        # isn't enabled.
+        self._sync_poller = _SyncPoller(self.storage, self)
+        self._sync_poller.pulled.connect(self._on_remote_pulled)
+        self.sync_timer = QTimer(self)
+        self.sync_timer.timeout.connect(self._sync_poller.poll)
+        self.sync_timer.start(30000)
+
         state = self.storage.get_window_state()
         if state.get("widget_mode"):
             self._enter_widget_mode(restore_position=True)
@@ -122,6 +165,26 @@ class MainWindow(QMainWindow):
         # changes) each time you switch to it, rather than only on load.
         if self.tabs.widget(index) is self.progress_tab:
             self.progress_tab.refresh()
+
+    def _on_remote_pulled(self, remote):
+        """Runs on the main thread (Qt queues the cross-thread signal
+        delivery), so this is the only place that actually mutates
+        storage.data from a cloud pull — the background thread itself
+        never touches it."""
+        self.storage.adopt_remote_state(remote)
+        self.checklist_tab.refresh()
+        self.progress_tab.refresh()
+        self._refresh_level_indicator()
+        self.widget_window.refresh_tasks()
+
+    def _open_sync_settings(self):
+        dialog = SyncSettingsDialog(self.storage, self)
+        dialog.exec()
+        # The dialog may have just connected and reconciled state.
+        self.checklist_tab.refresh()
+        self.progress_tab.refresh()
+        self.notes_checklist_tab.notes_tab.reload_from_storage()
+        self._refresh_level_indicator()
 
     def _check_reminders(self):
         for task in self.storage.check_due_reminders():
@@ -138,6 +201,10 @@ class MainWindow(QMainWindow):
         theme_menu = self._build_theme_menu()
         menu.addMenu(theme_menu)
         self.theme_btn.setMenu(theme_menu)
+
+        sync_action = QAction("Cloud Sync…", self)
+        sync_action.triggered.connect(self._open_sync_settings)
+        menu.addAction(sync_action)
 
         quit_action = QAction("Quit", self)
         quit_action.triggered.connect(self.close_app)

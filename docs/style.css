@@ -1,0 +1,255 @@
+/* Same "pen and paper" palette as the desktop app's default Paper theme. */
+:root {
+  --paper: #f4ecd8;
+  --paper-light: #fdf6e8;
+  --paper-edge: #c9b896;
+  --ink: #3a2f22;
+  --ink-soft: #6b5c46;
+  --accent: #96433a;
+  --accent-soft: #b98a83;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: Georgia, "Noto Serif", serif;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+}
+
+/* ---------- Setup / login ---------- */
+
+.centered-card {
+  margin: auto;
+  padding: 24px;
+  max-width: 360px;
+  width: 100%;
+  text-align: center;
+}
+
+.centered-card h1 { margin-bottom: 4px; }
+
+.centered-card input {
+  display: block;
+  width: 100%;
+  margin: 10px 0;
+  padding: 12px;
+  font-size: 16px;
+  border: 1px solid var(--paper-edge);
+  border-radius: 8px;
+  background: var(--paper-light);
+  color: var(--ink);
+}
+
+.centered-card button {
+  display: block;
+  width: 100%;
+  margin: 8px 0;
+  padding: 12px;
+  font-size: 15px;
+  border: none;
+  border-radius: 20px;
+  background: var(--accent);
+  color: var(--paper-light);
+  font-weight: bold;
+}
+
+.centered-card button.secondary {
+  background: transparent;
+  color: var(--ink-soft);
+  border: 1px solid var(--paper-edge);
+  font-weight: normal;
+}
+
+.error { color: var(--accent); font-size: 13px; min-height: 18px; }
+.hint { color: var(--ink-soft); font-size: 13px; }
+
+/* ---------- Shell ---------- */
+
+#header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 16px;
+  padding-top: max(10px, env(safe-area-inset-top));
+  border-bottom: 1px solid var(--paper-edge);
+}
+#level-badge { font-weight: bold; }
+#logout-btn {
+  background: none;
+  border: none;
+  font-size: 20px;
+  color: var(--ink-soft);
+}
+
+#view {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px;
+}
+
+.pane { max-width: 480px; margin: 0 auto; }
+
+#tabbar {
+  display: flex;
+  border-top: 1px solid var(--paper-edge);
+  padding-bottom: env(safe-area-inset-bottom);
+  background: var(--paper-light);
+}
+#tabbar button {
+  flex: 1;
+  background: none;
+  border: none;
+  padding: 10px 4px;
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+#tabbar button.active { color: var(--accent); font-weight: bold; }
+
+/* ---------- Notes ---------- */
+
+#notes-editor {
+  width: 100%;
+  height: 60vh;
+  padding: 12px;
+  font-family: inherit;
+  font-size: 15px;
+  border: 1px solid var(--paper-edge);
+  border-radius: 8px;
+  background: var(--paper-light);
+  color: var(--ink);
+  resize: none;
+}
+
+/* ---------- Checklist ---------- */
+
+.task-list { list-style: none; padding: 0; margin: 0 0 16px; }
+.task-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 8px;
+  border-bottom: 1px solid var(--paper-edge);
+}
+.task-item label { display: flex; align-items: center; gap: 10px; }
+.task-item input[type="checkbox"] { width: 20px; height: 20px; }
+.task-item.done span { color: var(--ink-soft); text-decoration: line-through; }
+.task-item em { font-style: normal; color: var(--ink-soft); font-size: 12px; }
+.remove-btn { background: none; border: none; color: var(--ink-soft); font-size: 16px; }
+
+.add-row { display: flex; gap: 6px; }
+.add-row input[type="text"] {
+  flex: 1;
+  padding: 10px;
+  border: 1px solid var(--paper-edge);
+  border-radius: 6px;
+  background: var(--paper-light);
+  font-size: 15px;
+}
+.add-row select {
+  padding: 10px;
+  border: 1px solid var(--paper-edge);
+  border-radius: 6px;
+  background: var(--paper-light);
+}
+.add-row button {
+  padding: 10px 16px;
+  border: none;
+  border-radius: 6px;
+  background: var(--accent);
+  color: var(--paper-light);
+  font-weight: bold;
+}
+
+/* ---------- Pomodoro ---------- */
+
+.pomodoro-pane { text-align: center; }
+.phase-label { font-size: 14px; color: var(--ink-soft); margin-bottom: 8px; }
+.timer-ring {
+  width: 220px;
+  height: 220px;
+  margin: 12px auto;
+  border-radius: 50%;
+  border: 10px solid var(--paper-edge);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+#timer-text { font-size: 40px; font-weight: bold; }
+.timer-controls { display: flex; gap: 10px; justify-content: center; margin: 16px 0; }
+.timer-controls button {
+  padding: 12px 28px;
+  border: none;
+  border-radius: 20px;
+  background: var(--accent);
+  color: var(--paper-light);
+  font-weight: bold;
+  font-size: 15px;
+}
+.timer-controls button.secondary {
+  background: transparent;
+  border: 1px solid var(--paper-edge);
+  color: var(--ink-soft);
+}
+
+.settings-details { text-align: left; margin-top: 12px; }
+.settings-details label { display: flex; justify-content: space-between; margin: 8px 0; font-size: 14px; }
+.settings-details input { width: 70px; padding: 4px; }
+.settings-details button {
+  margin-top: 8px;
+  padding: 8px 16px;
+  border: none;
+  border-radius: 6px;
+  background: var(--accent);
+  color: var(--paper-light);
+}
+
+/* ---------- Progress ---------- */
+
+.card {
+  border: 1px dashed var(--paper-edge);
+  border-radius: 8px;
+  padding: 14px;
+  margin-bottom: 14px;
+  background: var(--paper-light);
+}
+.card h2 { margin: 0 0 8px; font-size: 16px; color: var(--accent); }
+.xp-bar {
+  height: 18px;
+  border: 1px solid var(--paper-edge);
+  border-radius: 6px;
+  background: var(--paper);
+  overflow: hidden;
+}
+.xp-bar-fill { height: 100%; background: var(--accent); }
+.quest-list { list-style: none; padding: 0; margin: 8px 0 0; }
+.quest-list li { padding: 6px 0; font-size: 14px; }
+.quest-list li.done { color: var(--accent); font-weight: bold; }
+
+/* ---------- Toast ---------- */
+
+#toast {
+  position: fixed;
+  left: 16px;
+  right: 16px;
+  bottom: 76px;
+  padding: 12px 16px;
+  border-radius: 10px;
+  background: var(--ink);
+  color: var(--paper-light);
+  opacity: 0;
+  transform: translateY(10px);
+  transition: opacity 0.2s, transform 0.2s;
+  pointer-events: none;
+  z-index: 50;
+}
+#toast.show { opacity: 1; transform: translateY(0); }

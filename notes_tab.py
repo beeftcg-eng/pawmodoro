@@ -68,6 +68,18 @@ class NotesTab(QWidget):
         p = theme.current()
         self.status_label.setStyleSheet(f"color: {p['INK_SOFT']}; font-size: 11px;")
 
+    def reload_from_storage(self):
+        """Re-reads notes from storage (e.g. after a Cloud Sync connect
+        just replaced them) without re-triggering the autosave loop."""
+        stored = self.storage.get_notes()
+        self.editor.blockSignals(True)
+        if "<" in stored:
+            self.editor.setHtml(stored)
+        else:
+            self.editor.setPlainText(stored)
+        self.editor.blockSignals(False)
+        self.status_label.setText("Autosaved")
+
     def save_now(self):
         self.storage.set_notes(self.editor.toHtml())
         self.status_label.setText("Autosaved")
