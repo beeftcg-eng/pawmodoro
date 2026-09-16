@@ -29,7 +29,11 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, QUrl, QSize, pyqtSignal
 from PyQt6.QtGui import QDesktopServices
 
-import mpris
+import platform
+if platform.system() == "Windows":
+    import smtc_windows as mpris  # same function names/shapes as mpris.py, see that file
+else:
+    import mpris
 import theme
 import player_icons
 
@@ -252,13 +256,20 @@ class PlayerBar(QWidget):
 
     def _update_controls_for_selection(self):
         spotify = self._is_spotify()
-        self.volume_slider.setEnabled(True)
+        is_windows = platform.system() == "Windows"
+        self.volume_slider.setEnabled(spotify or not is_windows)
         self.shuffle_btn.setEnabled(True)
         self.loop_btn.setEnabled(True)
         if spotify:
             self.caveat_label.setText("(controls whatever Spotify Connect device is currently active)")
         elif not mpris.available():
-            self.caveat_label.setText("playerctl not found \u2014 install it to control a browser player")
+            self.caveat_label.setText(
+                "Windows media controls unavailable \u2014 reinstall Pawmodoro to fix this"
+                if is_windows else
+                "playerctl not found \u2014 install it to control a browser player"
+            )
+        elif is_windows:
+            self.caveat_label.setText("(no volume control on Windows \u2014 shuffle/loop only work with players that support them)")
         else:
             self.caveat_label.setText("(volume/shuffle only work with players that support them \u2014 browsers often don't)")
 

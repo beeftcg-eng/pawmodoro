@@ -12,8 +12,12 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QSize
 
+import platform
 import theme
-import mpris
+if platform.system() == "Windows":
+    import smtc_windows as mpris  # same function names/shapes as mpris.py, see that file
+else:
+    import mpris
 import player_icons
 import gamification
 from circular_timer import CircularTimer

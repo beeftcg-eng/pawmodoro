@@ -28,6 +28,7 @@ If someone's just handing you this zip to try (e.g. as a gift/shared app), this 
 3. Double-click **`install.bat`** inside the extracted folder.
 4. It sets up a private copy of everything under `%LOCALAPPDATA%\Pawmodoro` (doesn't touch system Python packages) and adds a **Pawmodoro** shortcut to your Desktop.
 5. Double-click that shortcut to launch. Closing the window tucks it into the system tray (bottom-right, may be under the ^ arrow) rather than quitting — right-click the tray icon → Quit to fully exit.
+6. Want it on your taskbar? Right-click the Desktop shortcut → **Pin to taskbar**.
 
 **Optional, for the best ambient-sound experience:** install ffmpeg (`winget install ffmpeg` in a Command Prompt, or download from ffmpeg.org and add it to your PATH). Without it, ambient sounds still work via a fallback, but ffmpeg gives fully gapless looping and support for non-WAV custom sound files.
 
@@ -103,11 +104,13 @@ If a file goes missing (moved or deleted after adding it), its row shows disable
 
 ## Controlling music from the player bar
 
-The player bar's dropdown lists Spotify (once connected) plus — on Linux — any real MPRIS players it finds via `playerctl` (a browser tab playing YouTube Music, etc.). There's no more "in-app" control path — that required embedding a full browser (QtWebEngine) in the app, which was removed for resource-usage reasons (see "What changed" above).
+The player bar's dropdown lists Spotify (once connected) plus any browser tab currently playing something — a YouTube Music tab, etc. There's no more "in-app" control path — that required embedding a full browser (QtWebEngine) in the app, which was removed for resource-usage reasons (see "What changed" above).
 
-On Windows, since there's no MPRIS equivalent, the dropdown will just show Spotify (once connected) — play/pause/next/previous for a browser tab aren't controllable from here on Windows, only via Spotify Connect.
+The mechanism differs per OS but the effect is the same — no extra setup, any browser that supports the web Media Session API (Chrome, Edge, Brave, Firefox) is picked up automatically once something's playing:
+- **Linux**: via `playerctl`/MPRIS (`mpris.py`) — see "Playback controls: installing playerctl" below.
+- **Windows**: via the same System Media Transport Controls API that powers the "Now Playing" flyout in the Windows volume/taskbar overlay (`smtc_windows.py`), no extra install needed. **Honest testing note**: written carefully against the documented WinRT API, but built without a live Windows machine to verify it against — if a browser tab isn't showing up or a control doesn't do anything, paste the exact behavior back and I'll fix it fast.
 
-**Volume/shuffle/loop work fully for Spotify** (its own Web API genuinely supports them) but are **best-effort for MPRIS browser players** — browsers only expose what the Media Session API supports, and volume/shuffle usually aren't part of that.
+**Volume/shuffle/loop work fully for Spotify** (its own Web API genuinely supports them) but are **best-effort for a browser tab** — browsers only expose what the Media Session API supports. On Windows specifically, **volume control isn't available at all for a browser tab** (Windows' media-control API doesn't expose it) — the volume slider there only works with Spotify selected.
 
 ## Ambient sounds
 

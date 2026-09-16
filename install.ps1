@@ -23,9 +23,15 @@ Start-Sleep -Seconds 1
 
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 
-# Clean file wipe (but keep the venv, so we don't reinstall deps every time)
-Get-ChildItem -Path $InstallDir -Filter "*.py" -ErrorAction SilentlyContinue | Remove-Item -Force
-Remove-Item -Recurse -Force -Path (Join-Path $InstallDir "resources") -ErrorAction SilentlyContinue
+# Full wipe of the previous install's app files (but keep the venv, so we
+# don't reinstall dependencies every time) - removes everything, including
+# any file/folder from an older version that no longer exists in this one,
+# so nothing stale from a previous install can linger. Safe: this is
+# %LOCALAPPDATA%\Pawmodoro (app code only) - actual data (notes, settings)
+# lives separately under %APPDATA%\Pawmodoro and is never touched here.
+Get-ChildItem -Path $InstallDir -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -ne "venv" } |
+    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 
 Copy-Item -Path (Join-Path $SrcDir "*.py") -Destination $InstallDir
 Copy-Item -Recurse -Path (Join-Path $SrcDir "resources") -Destination $InstallDir
@@ -60,11 +66,15 @@ cd /d "$InstallDir"
 pause
 "@ | Out-File -Encoding ascii -FilePath $RunConsoleScript -Force
 
-# Desktop shortcut
+# Desktop shortcut. Targets pythonw.exe directly (with main.py as an
+# argument) rather than run.bat - Windows only offers "Pin to taskbar" on
+# a shortcut's right-click menu when its target is a real executable, not
+# a batch script, so pointing at run.bat silently blocked pinning.
 $IconPath = Join-Path $InstallDir "resources\icon.ico"
 $Shell = New-Object -ComObject WScript.Shell
 $Shortcut = $Shell.CreateShortcut("$env:USERPROFILE\Desktop\Pawmodoro.lnk")
-$Shortcut.TargetPath = $RunScript
+$Shortcut.TargetPath = "$VenvDir\Scripts\pythonw.exe"
+$Shortcut.Arguments = "main.py"
 $Shortcut.WorkingDirectory = $InstallDir
 if (Test-Path $IconPath) {
     $Shortcut.IconLocation = $IconPath
@@ -75,6 +85,8 @@ Write-Host ""
 Write-Host "Done! A 'Pawmodoro' shortcut was added to your Desktop."
 Write-Host "Double-click it to launch. (If something looks wrong, run"
 Write-Host "$InstallDir\run_console.bat instead to see error output.)"
+Write-Host "Want it on your taskbar? Right-click the Desktop shortcut and choose"
+Write-Host "'Pin to taskbar'."
 
 if (-not (Get-Command ffplay -ErrorAction SilentlyContinue)) {
     Write-Host ""
