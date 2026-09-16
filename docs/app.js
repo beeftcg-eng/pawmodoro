@@ -6,6 +6,47 @@
 const CONFIG_KEY = "pawmodoro_config";       // { url, anonKey }
 const SESSION_KEY = "pawmodoro_session";     // supabase session, persisted by the client itself
 const SETTINGS_KEY = "pawmodoro_settings";   // { workMin, shortBreakMin, longBreakMin, sessionsBeforeLong }
+const THEME_KEY = "pawmodoro_theme";         // theme name, independent per device (matches desktop)
+
+// Same palettes as the desktop app's theme.py, minus the desktop-only
+// serif/mono font-fallback machinery — "mono" themes just use a plain
+// system monospace stack here.
+const THEMES = {
+  "Paper": { paper: "#f4ecd8", paperLight: "#fdf6e8", paperEdge: "#c9b896", ink: "#3a2f22", inkSoft: "#6b5c46", accent: "#96433a", accentSoft: "#b98a83", mono: false },
+  "Lavender Dusk": { paper: "#ece5f3", paperLight: "#f7f3fa", paperEdge: "#c1aad9", ink: "#392f4d", inkSoft: "#6d6086", accent: "#7d5ba6", accentSoft: "#b39cd0", mono: false },
+  "Deep Plum": { paper: "#e5dde6", paperLight: "#f3edf4", paperEdge: "#a98bb0", ink: "#2e2032", inkSoft: "#63506a", accent: "#5c3566", accentSoft: "#8f6b98", mono: false },
+  "Royal Purple": { paper: "#ece0f7", paperLight: "#f8f1fc", paperEdge: "#b98fd9", ink: "#2b1240", inkSoft: "#6b4a8a", accent: "#8e24aa", accentSoft: "#ba68c8", mono: false },
+  "Charcoal Grey": { paper: "#e6e7ea", paperLight: "#f4f5f6", paperEdge: "#a9b0b8", ink: "#282b30", inkSoft: "#585e66", accent: "#4d5a6b", accentSoft: "#8994a1", mono: false },
+  "Slate & Mauve": { paper: "#e8e4e8", paperLight: "#f5f2f5", paperEdge: "#ad9fac", ink: "#2f2a30", inkSoft: "#655c66", accent: "#6b4c63", accentSoft: "#a3899e", mono: false },
+  "Hacker Terminal": { paper: "#080c08", paperLight: "#0f150f", paperEdge: "#1f3d1f", ink: "#39ff14", inkSoft: "#2ea82e", accent: "#00ff9c", accentSoft: "#0d8a2e", mono: true },
+  "Arcade Neon": { paper: "#0d0221", paperLight: "#1a0933", paperEdge: "#4b1c73", ink: "#00f0ff", inkSoft: "#8a5cf6", accent: "#ff2fd6", accentSoft: "#b34fd1", mono: true },
+};
+
+function getTheme() {
+  return localStorage.getItem(THEME_KEY) || "Paper";
+}
+
+function applyTheme(name) {
+  const t = THEMES[name] || THEMES.Paper;
+  const root = document.documentElement.style;
+  root.setProperty("--paper", t.paper);
+  root.setProperty("--paper-light", t.paperLight);
+  root.setProperty("--paper-edge", t.paperEdge);
+  root.setProperty("--ink", t.ink);
+  root.setProperty("--ink-soft", t.inkSoft);
+  root.setProperty("--accent", t.accent);
+  root.setProperty("--accent-soft", t.accentSoft);
+  root.setProperty("--body-font", t.mono
+    ? "'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace"
+    : "Georgia, 'Noto Serif', serif");
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.setAttribute("content", t.paper);
+}
+
+function setTheme(name) {
+  localStorage.setItem(THEME_KEY, name);
+  applyTheme(name);
+}
 
 let supabaseClient = null;
 let state = null;         // last sync_pull() result
@@ -51,6 +92,7 @@ function saveSettings(s) {
 window.addEventListener("DOMContentLoaded", boot);
 
 async function boot() {
+  applyTheme(getTheme());
   const cfg = getConfig();
   if (!cfg || !cfg.url || !cfg.anonKey) {
     showSetupScreen();
@@ -142,15 +184,26 @@ async function doAuth(mode) {
 // ---------- Main app ----------
 
 async function enterApp() {
+  // Fetch state before building the shell — the shell's initial
+  // switchTab() renders a tab immediately, and pullAndRender() itself
+  // deliberately never re-renders the Notes tab afterward (so a later
+  // poll can't clobber text someone's actively typing), so if Notes is
+  // the tab shown on load, it needs real data on this very first render.
+  const { data, error } = await supabaseClient.rpc("sync_pull");
+  if (!error) state = data;
   renderShell();
-  await pullAndRender();
+  updateLevelBadge();
   setInterval(pullAndRender, 20000); // pick up changes made on the desktop app
 }
 
 function renderShell() {
+  const themeOptions = Object.keys(THEMES)
+    .map(name => `<option value="${name}"${name === getTheme() ? " selected" : ""}>${name}</option>`)
+    .join("");
   document.getElementById("app").innerHTML = `
     <header id="header">
       <span id="level-badge"></span>
+      <select id="theme-select" title="Theme">${themeOptions}</select>
       <button id="logout-btn" title="Log out">⏻</button>
     </header>
     <main id="view"></main>
@@ -164,13 +217,14 @@ function renderShell() {
     await supabaseClient.auth.signOut();
     showLoginScreen();
   });
+  document.getElementById("theme-select").addEventListener("change", e => setTheme(e.target.value));
   document.querySelectorAll("#tabbar button").forEach(btn => {
     btn.addEventListener("click", () => switchTab(btn.dataset.tab));
   });
-  switchTab("pomodoro");
+  switchTab("notes");
 }
 
-let activeTab = "pomodoro";
+let activeTab = "notes";
 
 function switchTab(tab) {
   activeTab = tab;
@@ -229,23 +283,53 @@ function updateLevelBadge() {
 
 let notesSaveTimer = null;
 
+// Simple contenteditable formatting toolbar. document.execCommand is
+// long-deprecated but still the only broadly-supported way to do basic
+// rich text (bold/underline/lists) in a plain contenteditable without
+// pulling in a whole editor library — good enough for parity with a
+// subset of the desktop notes toolbar. Saves as HTML, same as desktop's
+// QTextEdit.toHtml(), so formatting round-trips between the two.
+const NOTES_TOOLBAR = [
+  { cmd: "bold", label: "<b>B</b>", title: "Bold" },
+  { cmd: "underline", label: "<u>U</u>", title: "Underline" },
+  { cmd: "insertUnorderedList", label: "• List", title: "Bullet list" },
+  { cmd: "insertOrderedList", label: "1. List", title: "Numbered list" },
+  { cmd: "removeFormat", label: "Clear", title: "Clear formatting" },
+];
+
 function renderNotes() {
   const view = document.getElementById("view");
+  const toolbarHtml = NOTES_TOOLBAR
+    .map(b => `<button type="button" data-cmd="${b.cmd}" title="${b.title}">${b.label}</button>`)
+    .join("");
   view.innerHTML = `
     <div class="pane">
-      <textarea id="notes-editor" placeholder="Jot anything here. It saves itself.">${escapeHtml(state?.notes ?? "")}</textarea>
+      <div class="notes-toolbar">${toolbarHtml}</div>
+      <div id="notes-editor" class="notes-editor" contenteditable="true" data-placeholder="Jot anything here. It saves itself."></div>
       <p id="notes-status" class="hint">Autosaved</p>
     </div>`;
   const editor = document.getElementById("notes-editor");
-  editor.addEventListener("input", () => {
-    document.getElementById("notes-status").textContent = "Saving…";
-    clearTimeout(notesSaveTimer);
-    notesSaveTimer = setTimeout(async () => {
-      await supabaseClient.rpc("set_notes", { p_notes: editor.value });
-      document.getElementById("notes-status").textContent = "Autosaved";
-      if (state) state.notes = editor.value;
-    }, 800);
+  editor.innerHTML = state?.notes ?? "";
+
+  document.querySelectorAll(".notes-toolbar button").forEach(btn => {
+    btn.addEventListener("click", () => {
+      editor.focus();
+      document.execCommand(btn.dataset.cmd, false, null);
+      scheduleNotesSave(editor);
+    });
   });
+  editor.addEventListener("input", () => scheduleNotesSave(editor));
+}
+
+function scheduleNotesSave(editor) {
+  document.getElementById("notes-status").textContent = "Saving…";
+  clearTimeout(notesSaveTimer);
+  notesSaveTimer = setTimeout(async () => {
+    const html = editor.innerHTML;
+    await supabaseClient.rpc("set_notes", { p_notes: html });
+    document.getElementById("notes-status").textContent = "Autosaved";
+    if (state) state.notes = html;
+  }, 800);
 }
 
 // ---------- Checklist tab ----------

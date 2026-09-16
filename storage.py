@@ -113,6 +113,8 @@ class Storage:
                 self._sync_client.set_notes(text)
             except SyncError:
                 pass
+            finally:
+                self._persist_sync_token_if_changed()
 
     # ---------- Checklist ----------
     def _roll_recurring_tasks(self):
@@ -138,6 +140,8 @@ class Storage:
                 task_id = remote_task["id"]
             except SyncError:
                 pass
+            finally:
+                self._persist_sync_token_if_changed()
         task = {
             "id": task_id or uuid.uuid4().hex[:8],
             "text": text,
@@ -163,6 +167,8 @@ class Storage:
                 self._sync_client.set_task_reminder(task_id, reminder_time)
             except SyncError:
                 pass
+            finally:
+                self._persist_sync_token_if_changed()
 
     def check_due_reminders(self):
         """Returns the list of tasks whose reminder time matches right now
@@ -196,6 +202,8 @@ class Storage:
                 self._sync_client.remove_task(task_id)
             except SyncError:
                 pass
+            finally:
+                self._persist_sync_token_if_changed()
 
     def set_task_done(self, task_id, done):
         today = date.today().isoformat()
@@ -211,6 +219,8 @@ class Storage:
                 self._sync_client.set_task_completed_flag(task_id, done)
             except SyncError:
                 pass
+            finally:
+                self._persist_sync_token_if_changed()
 
     def get_checklist(self):
         return self.data.get("checklist", [])
@@ -286,12 +296,33 @@ class Storage:
         try:
             client.refresh_session()
             self._sync_client = client
+            # Supabase rotates the refresh token on every use — the one we
+            # just used is now dead. Persist the new one immediately, or
+            # the *next* restart fails with a now-invalid stored token even
+            # though this session is perfectly connected (this was a real
+            # bug: sync looked "enabled" in settings but silently stopped
+            # working after the very first restart).
+            self._persist_sync_token_if_changed()
         except SyncError:
             # Offline (or the session finally expired) at startup: the app
             # just runs local-only for this session, exactly like sync was
             # never turned on. Reopen Cloud Sync settings, or restart once
             # back online, to reconnect.
             pass
+
+    def _persist_sync_token_if_changed(self):
+        """Supabase's refresh token rotates on every use, so the client's
+        current token can drift from what's on disk after any call that
+        triggered a refresh (startup, or a mid-session 401 retry inside
+        supabase_sync._rpc). Called after every sync operation so the
+        stored token is never more than one call stale."""
+        if not self._sync_client:
+            return
+        cfg = self.data.get("sync", {})
+        if cfg.get("refresh_token") != self._sync_client.refresh_token:
+            cfg["refresh_token"] = self._sync_client.refresh_token
+            self.data["sync"] = cfg
+            self.save()
 
     def get_sync_config(self):
         return dict(self.data.get("sync", DEFAULT_DATA["sync"]))
@@ -352,6 +383,8 @@ class Storage:
             return result
         except SyncError:
             return None
+        finally:
+            self._persist_sync_token_if_changed()
 
     # ---------- Gamification: XP, levels, streaks, daily/weekly quests ----------
     def _ensure_daily_quests(self):
