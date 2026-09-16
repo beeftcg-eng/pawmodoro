@@ -10,6 +10,7 @@ A small desktop app (Python + PyQt6) with a pen-and-paper look, running natively
 6. **Pinnable, resizable desktop widget mode** — a small, frameless, always-on-top window showing today's pending tasks, the pomodoro countdown, and mini playback controls. Drag it anywhere, resize it from the corner; both are remembered.
 7. **App icon** — a paper-badge icon with a paw print and pen-nib accent, used for the window, taskbar, and tray (and a proper `.ico` for the Windows shortcut).
 8. **Gamification** — XP and levels, daily quests, and weekly quests that reset every Tuesday, tracked on the Progress tab alongside a quote that changes each time you visit it.
+9. **Optional cloud sync + a mobile web app** — notes, checklist, and quest/XP progress can sync through a Supabase backend, and a PWA at [beeftcg-eng.github.io/pawmodoro](https://beeftcg-eng.github.io/pawmodoro/) installs on a phone home screen (iOS or Android) for a lightweight mobile version. Off by default; see [MOBILE_SYNC.md](MOBILE_SYNC.md) for setup.
 
 All data lives in a single JSON file — `~/.local/share/pawmodoro/data.json` on Linux, `%APPDATA%\Pawmodoro\data.json` on Windows — easy to back up or inspect either way.
 
