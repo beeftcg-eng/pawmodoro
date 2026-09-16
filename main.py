@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QIcon, QAction, QActionGroup
 from PyQt6.QtCore import Qt, QTimer, QObject, pyqtSignal
+from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
 from storage import Storage
 from notes_checklist_tab import NotesChecklistTab
@@ -33,6 +34,13 @@ import gamification
 from version import VERSION
 
 ICON_PATH = os.path.join(os.path.dirname(__file__), "resources", "icon.png")
+
+# Single-instance guard: Pawmodoro hides to the system tray rather than
+# minimizing, so once that's happened there's no taskbar-visible window
+# left for Windows/the desktop to "just focus" when you click the icon
+# again - without this, a second click launches a whole second instance
+# (two processes fighting over the same data.json, two tray icons, etc).
+SINGLE_INSTANCE_KEY = "Pawmodoro-instance-lock"
 
 
 class _SyncPoller(QObject):
@@ -324,6 +332,17 @@ class MainWindow(QMainWindow):
         self.widget_window.show()
         self.hide()
 
+    def bring_to_front(self):
+        """Called when a second launch attempt pings us over the
+        single-instance IPC socket (see main()) - just surfaces whichever
+        window is currently the "real" one, without forcing widget mode
+        off the way restore_from_widget() deliberately does."""
+        state = self.storage.get_window_state()
+        target = self.widget_window if state.get("widget_mode") else self
+        target.show()
+        target.raise_()
+        target.activateWindow()
+
     def restore_from_widget(self):
         state = self.storage.get_window_state()
         state["widget_mode"] = False
@@ -356,10 +375,45 @@ def main():
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName("Pawmodoro")
 
+    # Single-instance guard: if another Pawmodoro is already listening on
+    # this name, ping it to surface its window and exit instead of
+    # starting a second full instance alongside it.
+    probe = QLocalSocket()
+    probe.connectToServer(SINGLE_INSTANCE_KEY)
+    if probe.waitForConnected(200):
+        print("Pawmodoro is already running — bringing its window to the front instead.")
+        probe.write(b"show")
+        probe.waitForBytesWritten(200)
+        probe.disconnectFromServer()
+        return
+    probe.abort()
+
+    # No existing instance responded. A stale registration from a
+    # previous crash can still block a fresh listen() on some platforms,
+    # so clear it first - harmless no-op if there wasn't one.
+    QLocalServer.removeServer(SINGLE_INSTANCE_KEY)
+    ipc_server = QLocalServer()
+    ipc_server.listen(SINGLE_INSTANCE_KEY)
+
     window = MainWindow()  # loads saved theme + builds widgets first
     app.setStyleSheet(theme.build_stylesheet())
     if os.path.exists(ICON_PATH):
         app.setWindowIcon(QIcon(ICON_PATH))
+
+    def _on_ipc_connection():
+        conn = ipc_server.nextPendingConnection()
+        if conn is None:
+            return
+
+        def _handle_ping():
+            conn.readAll()
+            window.bring_to_front()
+
+        conn.readyRead.connect(_handle_ping)
+        conn.disconnected.connect(conn.deleteLater)
+
+    ipc_server.newConnection.connect(_on_ipc_connection)
+    window._ipc_server = ipc_server  # keep it alive for the app's lifetime
 
     window.show()
 

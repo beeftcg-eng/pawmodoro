@@ -12,9 +12,9 @@ Write-Host "Installing Pawmodoro to $InstallDir ..."
 # Pawmodoro keeps running in the system tray after you close its window
 # (by design), so an old process can quietly keep running under the OLD
 # code even after you reinstall. Stop it first so an update actually
-# takes effect. Matches both the old-style bare pythonw.exe/python.exe
-# launch and the current Pawmodoro.exe-named copy (see $AppExe below) -
-# whichever an existing install happens to be running as.
+# takes effect. The actual long-running process is always pythonw.exe
+# (Pawmodoro.exe, see $AppExe below, just launches that and exits), but
+# match all three names for safety across install versions.
 Get-CimInstance Win32_Process -Filter "Name = 'pythonw.exe' OR Name = 'python.exe' OR Name = 'Pawmodoro.exe'" -ErrorAction SilentlyContinue |
     Where-Object { $_.CommandLine -like "*Pawmodoro*main.py*" } |
     ForEach-Object {
@@ -51,19 +51,21 @@ if (-not (Test-Path $VenvDir)) {
 & "$VenvDir\Scripts\python.exe" -m pip install --upgrade pip --quiet
 & "$VenvDir\Scripts\pip.exe" install -r (Join-Path $SrcDir "requirements.txt") --quiet
 
-# A same-folder copy of pythonw.exe renamed to Pawmodoro.exe. Windows
-# withholds "Pin to taskbar" not just for script/batch targets but also
-# for shortcuts pointing at a generic, recognized interpreter executable
-# by its own name (python.exe, pythonw.exe, wscript.exe, etc.) - this is
-# exactly why apps like Discord or Slack, which are also just a wrapped
-# runtime under the hood, ship as Discord.exe/Slack.exe rather than
-# pointing shortcuts at their actual runtime's generic binary. Copying
-# (not moving) keeps it in the same Scripts\ folder as the original, so
-# the venv is still found via the normal relative-path lookup Python
-# does based on the executable's own location - moving it to a different
-# folder would break that.
-$AppExe = Join-Path $VenvDir "Scripts\Pawmodoro.exe"
-Copy-Item -Path "$VenvDir\Scripts\pythonw.exe" -Destination $AppExe -Force
+# A real, custom-built Pawmodoro.exe (windows_launcher/, see build.sh)
+# that just launches venv\Scripts\pythonw.exe main.py and exits. Earlier
+# attempts pointed the shortcut at pythonw.exe directly, or a same-file
+# copy of it renamed to Pawmodoro.exe - Windows identifies a shortcut's
+# target partly by its embedded resources (icon, version info), not just
+# its filename, so a renamed copy of Python's own interpreter still
+# carried Python's identity and could get confused with an unrelated,
+# already-installed Python entry (reported: pinning it showed up as
+# "Idle Python"). This binary shares no bytes with any Python
+# interpreter and has its own embedded icon/version info, so it can't be
+# confused with one. It lives at the install root (not inside
+# venv\Scripts) since, unlike a renamed pythonw.exe, it doesn't need to
+# be colocated with the interpreter to work.
+$AppExe = Join-Path $InstallDir "Pawmodoro.exe"
+Copy-Item -Path (Join-Path $SrcDir "windows_launcher\Pawmodoro.exe") -Destination $AppExe -Force
 
 # Launcher: uses pythonw.exe (no console window) for double-click use
 $RunScript = Join-Path $InstallDir "run.bat"
@@ -82,14 +84,15 @@ cd /d "$InstallDir"
 pause
 "@ | Out-File -Encoding ascii -FilePath $RunConsoleScript -Force
 
-# Desktop shortcut. Targets the app-named Pawmodoro.exe (with main.py as
-# an argument) rather than run.bat or bare pythonw.exe - see the comment
-# above $AppExe for why both of those block "Pin to taskbar".
+# Desktop shortcut. Targets the custom Pawmodoro.exe launcher built above
+# (it takes no arguments - it hardcodes the venv\Scripts\pythonw.exe
+# main.py invocation itself) rather than run.bat or pythonw.exe directly
+# - see the comment above $AppExe for why both of those block "Pin to
+# taskbar" and/or get misidentified once pinned.
 $IconPath = Join-Path $InstallDir "resources\icon.ico"
 $Shell = New-Object -ComObject WScript.Shell
 $Shortcut = $Shell.CreateShortcut("$env:USERPROFILE\Desktop\Pawmodoro.lnk")
 $Shortcut.TargetPath = $AppExe
-$Shortcut.Arguments = "main.py"
 $Shortcut.WorkingDirectory = $InstallDir
 if (Test-Path $IconPath) {
     $Shortcut.IconLocation = $IconPath
