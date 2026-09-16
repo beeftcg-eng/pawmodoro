@@ -1,8 +1,11 @@
 """
-checklist_tab.py - Configurable checklist with repeatable (daily/weekly/once) tasks.
-Daily tasks automatically un-check themselves at the start of a new day;
-a "weekly" task tied to a specific weekday un-checks itself the next time
-that weekday comes around. Tasks can be dragged to reorder.
+checklist_tab.py - Configurable checklist with repeatable
+(daily/weekly/once/specific-day) tasks. Daily tasks automatically
+un-check themselves at the start of a new day; a "specific day" task
+(e.g. "take out the trash" on your collection day) un-checks itself the
+next time that weekday comes around - a distinct recurrence type from
+plain "weekly", which is unrelated and never auto-resets. Tasks can be
+dragged to reorder.
 """
 from datetime import date
 
@@ -59,15 +62,18 @@ class ChecklistTab(QWidget):
         add_row.addWidget(self.text_input)
 
         self.recurrence_box = QComboBox()
-        self.recurrence_box.addItems(["daily", "weekly", "once"])
-        self.recurrence_box.currentTextChanged.connect(self._on_recurrence_changed)
+        self.recurrence_box.addItem("daily", "daily")
+        self.recurrence_box.addItem("weekly", "weekly")
+        self.recurrence_box.addItem("once", "once")
+        self.recurrence_box.addItem("specific day", "weekday")
+        self.recurrence_box.currentIndexChanged.connect(self._on_recurrence_changed)
         add_row.addWidget(self.recurrence_box)
 
         self.weekday_box = QComboBox()
         self.weekday_box.addItems(WEEKDAY_NAMES)
         self.weekday_box.setCurrentIndex(date.today().weekday())
         self.weekday_box.setVisible(False)
-        self.weekday_box.setToolTip("Which day this weekly task resets on")
+        self.weekday_box.setToolTip("Which day of the week this task is for (e.g. trash collection day)")
         add_row.addWidget(self.weekday_box)
 
         add_btn = QPushButton("Add")
@@ -84,16 +90,17 @@ class ChecklistTab(QWidget):
         self.list_widget.model().rowsMoved.connect(self._on_rows_moved)
         self.refresh()
 
-    def _on_recurrence_changed(self, text):
-        self.weekday_box.setVisible(text == "weekly")
+    def _on_recurrence_changed(self, index=None):
+        self.weekday_box.setVisible(self.recurrence_box.currentData() == "weekday")
 
     def refresh(self):
         self.list_widget.blockSignals(True)
         self.list_widget.clear()
         for task in self.storage.get_checklist():
-            recurrence_label = task["recurrence"]
-            if task["recurrence"] == "weekly" and task.get("weekday") is not None:
-                recurrence_label = f"weekly: {WEEKDAY_NAMES[task['weekday']]}"
+            if task["recurrence"] == "weekday" and task.get("weekday") is not None:
+                recurrence_label = WEEKDAY_NAMES[task["weekday"]]
+            else:
+                recurrence_label = task["recurrence"]
             label = f"{task['text']}  \u2014  [{recurrence_label}]"
             if task.get("reminder_time"):
                 label += f"  \U0001F514 {task['reminder_time']}"
@@ -137,8 +144,8 @@ class ChecklistTab(QWidget):
         text = self.text_input.text().strip()
         if not text:
             return
-        recurrence = self.recurrence_box.currentText()
-        weekday = self.weekday_box.currentIndex() if recurrence == "weekly" else None
+        recurrence = self.recurrence_box.currentData()
+        weekday = self.weekday_box.currentIndex() if recurrence == "weekday" else None
         self.storage.add_task(text, recurrence, weekday=weekday)
         self.text_input.clear()
         self.refresh()

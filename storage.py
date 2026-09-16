@@ -119,10 +119,13 @@ class Storage:
     # ---------- Checklist ----------
     def _roll_recurring_tasks(self):
         """Resets 'completed_today': for daily tasks, whenever
-        last_completed isn't today; for a weekly task pinned to a
-        specific weekday, only on that weekday (so checking it off on,
-        say, Tuesday leaves it checked the rest of the week, and it
-        un-checks itself the next time Tuesday comes around)."""
+        last_completed isn't today; for a "weekday" task (e.g. "take out
+        the trash" pinned to your collection day), only on that specific
+        weekday (so checking it off on, say, Tuesday leaves it checked
+        the rest of the week, and it un-checks itself the next time
+        Tuesday comes around). Plain "weekly" tasks are a separate,
+        unrelated category and never auto-reset (unchanged, original
+        behavior)."""
         today_date = date.today()
         today = today_date.isoformat()
         changed = False
@@ -130,7 +133,7 @@ class Storage:
             recurrence = task.get("recurrence")
             should_reset = (
                 recurrence == "daily"
-                or (recurrence == "weekly" and task.get("weekday") is not None and today_date.weekday() == task["weekday"])
+                or (recurrence == "weekday" and task.get("weekday") is not None and today_date.weekday() == task["weekday"])
             )
             if should_reset and task.get("last_completed") != today:
                 if task.get("completed_today"):
@@ -155,11 +158,11 @@ class Storage:
         task = {
             "id": task_id or uuid.uuid4().hex[:8],
             "text": text,
-            "recurrence": recurrence,  # "daily", "weekly", "once"
+            "recurrence": recurrence,  # "daily", "weekly", "once", "weekday"
             "last_completed": None,
             "completed_today": False,
             "reminder_time": reminder_time,  # "HH:MM" or None
-            "weekday": weekday,  # 0=Monday..6=Sunday, only meaningful for "weekly"; local-only, doesn't sync yet
+            "weekday": weekday,  # 0=Monday..6=Sunday, only meaningful for recurrence="weekday"; local-only, doesn't sync yet
             "last_reminded": None,  # date isoformat, so a reminder fires at most once/day
         }
         self.data["checklist"].append(task)

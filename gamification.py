@@ -7,7 +7,7 @@ import random
 from datetime import timedelta
 
 XP_PER_WORK_SESSION = 20
-XP_PER_TASK = {"daily": 10, "weekly": 15, "once": 25}
+XP_PER_TASK = {"daily": 10, "weekly": 15, "once": 25, "weekday": 15}
 QUEST_BONUS_XP = 30
 ALL_QUESTS_BONUS_XP = 50
 QUESTS_PER_DAY = 3
