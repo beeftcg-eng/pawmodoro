@@ -12,8 +12,10 @@ Write-Host "Installing Pawmodoro to $InstallDir ..."
 # Pawmodoro keeps running in the system tray after you close its window
 # (by design), so an old process can quietly keep running under the OLD
 # code even after you reinstall. Stop it first so an update actually
-# takes effect.
-Get-CimInstance Win32_Process -Filter "Name = 'pythonw.exe' OR Name = 'python.exe'" -ErrorAction SilentlyContinue |
+# takes effect. Matches both the old-style bare pythonw.exe/python.exe
+# launch and the current Pawmodoro.exe-named copy (see $AppExe below) -
+# whichever an existing install happens to be running as.
+Get-CimInstance Win32_Process -Filter "Name = 'pythonw.exe' OR Name = 'python.exe' OR Name = 'Pawmodoro.exe'" -ErrorAction SilentlyContinue |
     Where-Object { $_.CommandLine -like "*Pawmodoro*main.py*" } |
     ForEach-Object {
         Write-Host "Stopping a running Pawmodoro instance (PID $($_.ProcessId))..."
@@ -49,6 +51,20 @@ if (-not (Test-Path $VenvDir)) {
 & "$VenvDir\Scripts\python.exe" -m pip install --upgrade pip --quiet
 & "$VenvDir\Scripts\pip.exe" install -r (Join-Path $SrcDir "requirements.txt") --quiet
 
+# A same-folder copy of pythonw.exe renamed to Pawmodoro.exe. Windows
+# withholds "Pin to taskbar" not just for script/batch targets but also
+# for shortcuts pointing at a generic, recognized interpreter executable
+# by its own name (python.exe, pythonw.exe, wscript.exe, etc.) - this is
+# exactly why apps like Discord or Slack, which are also just a wrapped
+# runtime under the hood, ship as Discord.exe/Slack.exe rather than
+# pointing shortcuts at their actual runtime's generic binary. Copying
+# (not moving) keeps it in the same Scripts\ folder as the original, so
+# the venv is still found via the normal relative-path lookup Python
+# does based on the executable's own location - moving it to a different
+# folder would break that.
+$AppExe = Join-Path $VenvDir "Scripts\Pawmodoro.exe"
+Copy-Item -Path "$VenvDir\Scripts\pythonw.exe" -Destination $AppExe -Force
+
 # Launcher: uses pythonw.exe (no console window) for double-click use
 $RunScript = Join-Path $InstallDir "run.bat"
 @"
@@ -66,14 +82,13 @@ cd /d "$InstallDir"
 pause
 "@ | Out-File -Encoding ascii -FilePath $RunConsoleScript -Force
 
-# Desktop shortcut. Targets pythonw.exe directly (with main.py as an
-# argument) rather than run.bat - Windows only offers "Pin to taskbar" on
-# a shortcut's right-click menu when its target is a real executable, not
-# a batch script, so pointing at run.bat silently blocked pinning.
+# Desktop shortcut. Targets the app-named Pawmodoro.exe (with main.py as
+# an argument) rather than run.bat or bare pythonw.exe - see the comment
+# above $AppExe for why both of those block "Pin to taskbar".
 $IconPath = Join-Path $InstallDir "resources\icon.ico"
 $Shell = New-Object -ComObject WScript.Shell
 $Shortcut = $Shell.CreateShortcut("$env:USERPROFILE\Desktop\Pawmodoro.lnk")
-$Shortcut.TargetPath = "$VenvDir\Scripts\pythonw.exe"
+$Shortcut.TargetPath = $AppExe
 $Shortcut.Arguments = "main.py"
 $Shortcut.WorkingDirectory = $InstallDir
 if (Test-Path $IconPath) {
