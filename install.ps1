@@ -13,9 +13,11 @@ Write-Host "Installing Pawmodoro to $InstallDir ..."
 # (by design), so an old process can quietly keep running under the OLD
 # code even after you reinstall. Stop it first so an update actually
 # takes effect. The actual long-running process is always pythonw.exe
-# (Pawmodoro.exe, see $AppExe below, just launches that and exits), but
-# match all three names for safety across install versions.
-Get-CimInstance Win32_Process -Filter "Name = 'pythonw.exe' OR Name = 'python.exe' OR Name = 'Pawmodoro.exe'" -ErrorAction SilentlyContinue |
+# (the launcher exe, see $AppExe below, just launches that and exits
+# immediately), but the LIKE match covers it too - its filename is
+# version-specific (Pawmodoro-X.Y.Z.exe), so an exact-name match would
+# silently stop matching on every single release.
+Get-CimInstance Win32_Process -Filter "Name = 'pythonw.exe' OR Name = 'python.exe' OR Name LIKE 'Pawmodoro%.exe'" -ErrorAction SilentlyContinue |
     Where-Object { $_.CommandLine -like "*Pawmodoro*main.py*" } |
     ForEach-Object {
         Write-Host "Stopping a running Pawmodoro instance (PID $($_.ProcessId))..."
@@ -84,10 +86,21 @@ $ErrorActionPreference = $PreviousErrorAction
 # already-installed Python entry (reported: pinning it showed up as
 # "Idle Python"). This binary shares no bytes with any Python
 # interpreter and has its own embedded icon/version info, so it can't be
-# confused with one. It lives at the install root (not inside
-# venv\Scripts) since, unlike a renamed pythonw.exe, it doesn't need to
-# be colocated with the interpreter to work.
-$AppExe = Join-Path $InstallDir "Pawmodoro.exe"
+# confused with one.
+#
+# The filename includes the version number rather than always being a
+# plain "Pawmodoro.exe": Windows' shell icon cache can key off a file's
+# path, and if an earlier install ever put something else at that exact
+# path (an old build, an interpreter copy, whatever), a stale cached icon
+# can keep showing there even after the file's actual content changes and
+# even after unpinning/re-pinning - a version-specific path can never
+# collide with whatever an older install left behind, sidestepping that
+# regardless of exactly how the caching was going wrong. The "wipe
+# everything except venv" step above already deletes any older version's
+# exe, so this doesn't accumulate stale files.
+$VersionText = Get-Content (Join-Path $SrcDir "version.py") -Raw
+$AppVersion = if ($VersionText -match '"([^"]+)"') { $Matches[1] } else { "0" }
+$AppExe = Join-Path $InstallDir "Pawmodoro-$AppVersion.exe"
 Copy-Item -Path (Join-Path $SrcDir "windows_launcher\Pawmodoro.exe") -Destination $AppExe -Force
 
 # Launcher: uses pythonw.exe (no console window) for double-click use

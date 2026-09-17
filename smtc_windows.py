@@ -38,8 +38,12 @@ try:
         GlobalSystemMediaTransportControlsSessionManager as _Manager,
     )
     _WINSDK_OK = True
-except ImportError:
+    print("[smtc] winsdk loaded OK — browser tab control available")
+except ImportError as e:
     _WINSDK_OK = False
+    print(f"[smtc] winsdk not available ({e}) — only Spotify Connect will show up as a player. "
+          "Run install.bat's console version (run_console.bat) to see this line; if it says "
+          "something other than a plain \"module not found\", paste it back.")
 
 _BROWSER_HINTS = ("firefox", "chrome", "msedge", "edge", "brave", "vivaldi", "opera")
 
@@ -55,13 +59,29 @@ def available():
     return _WINSDK_OK
 
 
+_last_error_logged = None
+
+
 def _run(coro):
     """Every entry point here is a synchronous, one-shot call (mirrors
     mpris.py's subprocess-per-call shape), so just spin up a fresh event
     loop each time rather than keeping one alive across the whole app."""
+    global _last_error_logged
+    if not _WINSDK_OK:
+        return None
     try:
         return asyncio.run(coro)
-    except Exception:
+    except Exception as e:
+        # Only the *first* occurrence of each distinct error is printed -
+        # this runs on every player_bar poll tick (every ~1.5s), and a
+        # real bug would otherwise flood run_console.bat's output. This
+        # is specifically what makes a genuine implementation bug
+        # distinguishable from "no browser session right now" instead of
+        # both looking identical from the outside.
+        message = f"{type(e).__name__}: {e}"
+        if message != _last_error_logged:
+            _last_error_logged = message
+            print(f"[smtc] unexpected error talking to Windows media session API: {message}")
         return None
 
 

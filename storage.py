@@ -6,6 +6,7 @@ Autosaves happen constantly; nothing is ever lost unless you delete the file.
 """
 import json
 import os
+import threading
 import uuid
 from datetime import date, datetime, timedelta
 
@@ -72,7 +73,13 @@ class Storage:
         self.data = self._load()
         self._roll_recurring_tasks()
         self._sync_client = None
-        self._init_sync_client()
+        # Runs the initial connect check (a blocking network call, up to
+        # supabase_sync.TIMEOUT) on a background thread so a slow or dead
+        # connection can't delay the window even appearing at startup.
+        # self._sync_client starts (and stays, until this finishes) None,
+        # which every "if self._sync_client:" guard elsewhere already
+        # treats as the normal not-connected-yet state.
+        threading.Thread(target=self._init_sync_client, daemon=True).start()
 
     def _load(self):
         if os.path.exists(DATA_FILE):
@@ -147,7 +154,11 @@ class Storage:
         # own, so this task and its cloud copy are recognized as the same
         # row on the next pull instead of showing up as a duplicate.
         task_id = None
-        if self._sync_client:
+        # "weekday" tasks are local-only (see _apply_remote_state) - the
+        # cloud's CHECK constraint doesn't allow that recurrence value, so
+        # this call would just fail every time. Skip it outright rather
+        # than eat a guaranteed-failed round trip.
+        if self._sync_client and recurrence != "weekday":
             try:
                 remote_task = self._sync_client.add_task(text, recurrence, reminder_time)
                 task_id = remote_task["id"]
@@ -368,6 +379,12 @@ class Storage:
         checklist, and gamification state (server is authoritative once
         connected)."""
         self.data["notes"] = remote["notes"]
+        # "weekday" (specific-day) tasks are local-only — the cloud
+        # schema's checklist_tasks.recurrence CHECK constraint doesn't
+        # allow that value, so they can never come back from the server.
+        # Preserve them across this replace instead of silently deleting
+        # them the next time any sync event pulls fresh server state.
+        local_weekday_tasks = [t for t in self.data.get("checklist", []) if t.get("recurrence") == "weekday"]
         self.data["checklist"] = [
             {
                 "id": t["id"],
@@ -379,7 +396,7 @@ class Storage:
                 "last_reminded": t.get("last_reminded"),
             }
             for t in remote["checklist"]
-        ]
+        ] + local_weekday_tasks
         g = self.data["gamification"]
         g["xp"] = remote["xp"]
         g["total_pomodoros"] = remote["total_pomodoros"]
@@ -534,7 +551,13 @@ class Storage:
         """Call whenever a checklist checkbox is toggled. `done=True`
         awards XP and progresses quests; `done=False` (unchecking) reverses
         the same XP so toggling back and forth nets to zero."""
-        remote_result = self._remote_call(lambda c: c.apply_task_xp(recurrence, done))
+        # "weekday" tasks are local-only (see add_task) - the server's
+        # apply_task_xp has no case for that recurrence and would award
+        # the wrong amount (its else-branch default) rather than reject
+        # it outright, so skip the remote path entirely instead of
+        # silently paying out an inconsistent XP amount depending on
+        # whether Cloud Sync happens to be connected at that moment.
+        remote_result = None if recurrence == "weekday" else self._remote_call(lambda c: c.apply_task_xp(recurrence, done))
         if remote_result is not None:
             return remote_result
         self._ensure_daily_quests()

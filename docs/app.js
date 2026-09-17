@@ -183,6 +183,8 @@ async function doAuth(mode) {
 
 // ---------- Main app ----------
 
+let pollIntervalId = null;
+
 async function enterApp() {
   // Fetch state before building the shell — the shell's initial
   // switchTab() renders a tab immediately, and pullAndRender() skips
@@ -193,7 +195,11 @@ async function enterApp() {
   if (!error) state = data;
   renderShell();
   updateLevelBadge();
-  setInterval(pullAndRender, 5000); // pick up changes made on the desktop app
+  // Logging out and back in within the same page session (no reload)
+  // would otherwise stack up a new poller on top of any still-running
+  // one from a previous login.
+  clearInterval(pollIntervalId);
+  pollIntervalId = setInterval(pullAndRender, 5000); // pick up changes made on the desktop app
 }
 
 function renderShell() {
@@ -214,6 +220,7 @@ function renderShell() {
       <button data-tab="progress">\u{1F3C6} Progress</button>
     </nav>`;
   document.getElementById("logout-btn").addEventListener("click", async () => {
+    clearInterval(pollIntervalId);
     await supabaseClient.auth.signOut();
     showLoginScreen();
   });
@@ -339,13 +346,22 @@ function renderNotes() {
 }
 
 function scheduleNotesSave(editor) {
-  document.getElementById("notes-status").textContent = "Saving…";
+  // #notes-status (and the editor itself) may no longer exist by the
+  // time this fires, or by the time the debounced save below completes,
+  // if the user has since switched to a different tab — switchTab()
+  // replaces #view's innerHTML entirely. Guard every DOM touch so the
+  // save (and updating in-memory `state`, which must happen regardless
+  // of whether the tab is still visible) can never be aborted by a null
+  // reference partway through.
+  const savingStatus = document.getElementById("notes-status");
+  if (savingStatus) savingStatus.textContent = "Saving…";
   clearTimeout(notesSaveTimer);
   notesSaveTimer = setTimeout(async () => {
     const html = editor.innerHTML;
     await supabaseClient.rpc("set_notes", { p_notes: html });
-    document.getElementById("notes-status").textContent = "Autosaved";
     if (state) state.notes = html;
+    const status = document.getElementById("notes-status");
+    if (status) status.textContent = "Autosaved";
   }, 800);
 }
 
