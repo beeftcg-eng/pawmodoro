@@ -448,15 +448,17 @@ language sql security invoker as $$
   delete from checklist_tasks where id = p_task_id and user_id = auth.uid();
 $$;
 
--- Persists a full reordering of the checklist: p_ordered_ids is the
--- complete list of this user's task ids in the desired new order. An id
--- that doesn't belong to (or no longer exists for) this user is simply
+-- Persists a full reordering of the checklist: p_ordered_ids is a JSON
+-- array of this user's task ids in the desired new order (a jsonb param
+-- rather than text[] — plain arrays need `[]` in the signature, which at
+-- least one SQL editor has been seen to mangle on paste). An id that
+-- doesn't belong to (or no longer exists for) this user is simply
 -- ignored, rather than erroring, so a stale list from a slow client can't
 -- fail the whole call.
-create or replace function reorder_tasks(p_ordered_ids text[]) returns void
+create or replace function reorder_tasks(p_ordered_ids jsonb) returns void
 language sql security invoker as $$
   update checklist_tasks t set sort_order = x.ord
-    from unnest(p_ordered_ids) with ordinality as x(id, ord)
+    from jsonb_array_elements_text(p_ordered_ids) with ordinality as x(id, ord)
     where t.id = x.id and t.user_id = auth.uid();
 $$;
 
