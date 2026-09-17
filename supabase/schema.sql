@@ -360,7 +360,7 @@ $$;
 create or replace function apply_task_xp(p_recurrence text, p_done boolean) returns jsonb
 language plpgsql security invoker as $$
 declare
-  xp int;
+  task_xp int;
   old_lvl record;
   new_lvl record;
   completed jsonb := '[]'::jsonb;
@@ -371,7 +371,7 @@ begin
   perform ensure_daily_quests();
   perform ensure_weekly_quests();
 
-  xp := case p_recurrence when 'daily' then 10 when 'weekly' then 15 when 'once' then 25 else 10 end;
+  task_xp := case p_recurrence when 'daily' then 10 when 'weekly' then 15 when 'once' then 25 else 10 end;
 
   if p_done then
     perform bump_streak();
@@ -380,7 +380,7 @@ begin
     select xp into cur_xp from app_state where user_id = auth.uid();
     select * into old_lvl from level_from_xp(cur_xp);
 
-    perform add_xp(xp);
+    perform add_xp(task_xp);
     completed := advance_quests('tasks', 1);
 
     select count(*), count(*) filter (where completed_today) into total_tasks_count, done_tasks_count
@@ -392,10 +392,10 @@ begin
     select xp into cur_xp from app_state where user_id = auth.uid();
     select * into new_lvl from level_from_xp(cur_xp);
 
-    return jsonb_build_object('xp_gained', xp, 'old_level', old_lvl.level, 'new_level', new_lvl.level, 'completed_quests', completed);
+    return jsonb_build_object('xp_gained', task_xp, 'old_level', old_lvl.level, 'new_level', new_lvl.level, 'completed_quests', completed);
   else
     update app_state set total_tasks = greatest(0, total_tasks - 1), updated_at = now() where user_id = auth.uid();
-    perform add_xp(-xp);
+    perform add_xp(-task_xp);
     return jsonb_build_object('completed_quests', '[]'::jsonb);
   end if;
 end;
