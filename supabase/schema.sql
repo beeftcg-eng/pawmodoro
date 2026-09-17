@@ -73,7 +73,10 @@ create policy "own app_state row"
   using (auth.uid() = user_id)
   with check (auth.uid() = user_id);
 
--- Many rows per user: the recurring checklist.
+-- Many rows per user: the recurring checklist. `source` separates cards
+-- pushed from the Deckbuilder wishlist from the regular checklist, so
+-- they can be shown in their own section without mixing into (or
+-- counting toward) the regular list.
 create table checklist_tasks (
   id text primary key default encode(gen_random_bytes(6), 'hex'),
   user_id uuid not null references auth.users(id) on delete cascade,
@@ -84,6 +87,7 @@ create table checklist_tasks (
   reminder_time text,
   last_reminded date,
   sort_order double precision not null default 0,
+  source text not null default 'checklist' check (source in ('checklist', 'wishlist')),
   created_at timestamptz not null default now()
 );
 
@@ -92,6 +96,13 @@ create policy "own checklist rows"
   on checklist_tasks for all
   using (auth.uid() = user_id)
   with check (auth.uid() = user_id);
+
+-- Migration for a project that already ran this file before `source`
+-- existed — a no-op on a fresh install where the column already came
+-- from the create table above.
+alter table checklist_tasks add column if not exists source text not null default 'checklist';
+alter table checklist_tasks drop constraint if exists checklist_tasks_source_check;
+alter table checklist_tasks add constraint checklist_tasks_source_check check (source in ('checklist', 'wishlist'));
 
 -- ============================================================
 -- Pure helper functions (mirror gamification.py exactly)
@@ -385,7 +396,7 @@ begin
     completed := advance_quests('tasks', 1);
 
     select count(*), count(*) filter (where completed_today) into total_tasks_count, done_tasks_count
-      from checklist_tasks where user_id = auth.uid();
+      from checklist_tasks where user_id = auth.uid() and source = 'checklist';
     if total_tasks_count > 0 and total_tasks_count = done_tasks_count then
       completed := completed || advance_quests('clear_checklist', 1);
     end if;
@@ -428,7 +439,7 @@ language sql security invoker set search_path = public, extensions as $$
   update app_state set notes = p_notes, updated_at = now() where user_id = auth.uid();
 $$;
 
-create or replace function add_task(p_text text, p_recurrence text, p_reminder_time text default null)
+create or replace function add_task(p_text text, p_recurrence text, p_reminder_time text default null, p_source text default 'checklist')
 returns checklist_tasks
 language plpgsql security invoker set search_path = public, extensions as $$
 declare
@@ -436,8 +447,8 @@ declare
   next_order double precision;
 begin
   select coalesce(max(sort_order), 0) + 1 into next_order from checklist_tasks where user_id = auth.uid();
-  insert into checklist_tasks (user_id, text, recurrence, reminder_time, sort_order)
-    values (auth.uid(), p_text, p_recurrence, p_reminder_time, next_order)
+  insert into checklist_tasks (user_id, text, recurrence, reminder_time, sort_order, source)
+    values (auth.uid(), p_text, p_recurrence, p_reminder_time, next_order, p_source)
     returning * into t;
   return t;
 end;

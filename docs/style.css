@@ -112,6 +112,14 @@ html, body {
 
 .pane { max-width: 480px; margin: 0 auto; }
 
+.section-heading {
+  font-size: 15px;
+  color: var(--ink-soft);
+  margin: 4px 0 10px;
+  padding-top: 12px;
+  border-top: 1px solid var(--paper-edge);
+}
+
 #tabbar {
   display: flex;
   border-top: 1px solid var(--paper-edge);

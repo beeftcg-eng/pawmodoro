@@ -149,7 +149,7 @@ class Storage:
         if changed:
             self.save()
 
-    def add_task(self, text, recurrence="daily", reminder_time=None, weekday=None):
+    def add_task(self, text, recurrence="daily", reminder_time=None, weekday=None, source="checklist"):
         # When synced, use the server-assigned id rather than generating our
         # own, so this task and its cloud copy are recognized as the same
         # row on the next pull instead of showing up as a duplicate.
@@ -160,7 +160,7 @@ class Storage:
         # than eat a guaranteed-failed round trip.
         if self._sync_client and recurrence != "weekday":
             try:
-                remote_task = self._sync_client.add_task(text, recurrence, reminder_time)
+                remote_task = self._sync_client.add_task(text, recurrence, reminder_time, source)
                 task_id = remote_task["id"]
             except SyncError:
                 pass
@@ -175,6 +175,7 @@ class Storage:
             "reminder_time": reminder_time,  # "HH:MM" or None
             "weekday": weekday,  # 0=Monday..6=Sunday, only meaningful for recurrence="weekday"; local-only, doesn't sync yet
             "last_reminded": None,  # date isoformat, so a reminder fires at most once/day
+            "source": source,  # "checklist" (default) or "wishlist" (pushed from Deckbuilder)
         }
         self.data["checklist"].append(task)
         self.save()
@@ -405,6 +406,7 @@ class Storage:
                 "completed_today": t.get("completed_today", False),
                 "reminder_time": t.get("reminder_time"),
                 "last_reminded": t.get("last_reminded"),
+                "source": t.get("source", "checklist"),
             }
             for t in remote["checklist"]
         ] + local_weekday_tasks
@@ -582,7 +584,8 @@ class Storage:
             old_level, _, _ = gamification.level_from_xp(g["xp"])
             self.add_xp(xp)
             completed_quests = self._advance_quests("tasks", 1)
-            if self.data["checklist"] and all(t.get("completed_today") for t in self.data["checklist"]):
+            real_tasks = [t for t in self.data["checklist"] if t.get("source", "checklist") == "checklist"]
+            if real_tasks and all(t.get("completed_today") for t in real_tasks):
                 completed_quests += self._advance_quests("clear_checklist", 1)
             new_level, _, _ = gamification.level_from_xp(g["xp"])
             result.update(xp_gained=xp, old_level=old_level, new_level=new_level,

@@ -115,8 +115,10 @@ class SupabaseSync:
     def set_notes(self, text):
         return self._rpc("set_notes", {"p_notes": text})
 
-    def add_task(self, text, recurrence, reminder_time=None):
-        return self._rpc("add_task", {"p_text": text, "p_recurrence": recurrence, "p_reminder_time": reminder_time})
+    def add_task(self, text, recurrence, reminder_time=None, source="checklist"):
+        return self._rpc("add_task", {
+            "p_text": text, "p_recurrence": recurrence, "p_reminder_time": reminder_time, "p_source": source,
+        })
 
     def remove_task(self, task_id):
         return self._rpc("remove_task", {"p_task_id": task_id})

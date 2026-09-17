@@ -6,6 +6,12 @@ un-check themselves at the start of a new day; a "specific day" task
 next time that weekday comes around - a distinct recurrence type from
 plain "weekly", which is unrelated and never auto-resets. Tasks can be
 dragged to reorder.
+
+Also renders a separate, non-reorderable "Card Wishlist" section (hidden
+when empty) for tasks pushed here from the Deckbuilder app's card
+wishlist — same tab, same underlying checklist_tasks table, kept apart
+by a "source" field so it neither mixes into the regular list nor counts
+toward the "clear your whole checklist" quest.
 """
 from datetime import date
 
@@ -86,17 +92,39 @@ class ChecklistTab(QWidget):
         remove_btn.clicked.connect(self.remove_selected)
         layout.addWidget(remove_btn)
 
+        # Cards pushed from the Deckbuilder wishlist (see storage's
+        # "source" field) — a separate section within this same tab, not a
+        # new tab, so it can't be mixed up with (or count toward) the
+        # regular checklist above. Hidden entirely when there's nothing in
+        # it, so it stays invisible to anyone not using Deckbuilder.
+        self.wishlist_label = QLabel("\U0001F0CF Card Wishlist")
+        layout.addWidget(self.wishlist_label)
+
+        self.wishlist_list_widget = QListWidget()
+        layout.addWidget(self.wishlist_list_widget)
+
+        wishlist_remove_btn = QPushButton("Remove selected")
+        wishlist_remove_btn.clicked.connect(self.remove_selected_wishlist)
+        layout.addWidget(wishlist_remove_btn)
+        self.wishlist_remove_btn = wishlist_remove_btn
+
         self.list_widget.itemChanged.connect(self._on_item_changed)
         self.list_widget.model().rowsMoved.connect(self._on_rows_moved)
+        self.wishlist_list_widget.itemChanged.connect(self._on_item_changed)
         self.refresh()
 
     def _on_recurrence_changed(self, index=None):
         self.weekday_box.setVisible(self.recurrence_box.currentData() == "weekday")
 
     def refresh(self):
+        tasks = self.storage.get_checklist()
+        wishlist_tasks = [t for t in tasks if t.get("source") == "wishlist"]
+
         self.list_widget.blockSignals(True)
         self.list_widget.clear()
-        for task in self.storage.get_checklist():
+        for task in tasks:
+            if task.get("source") == "wishlist":
+                continue
             if task["recurrence"] == "weekday" and task.get("weekday") is not None:
                 recurrence_label = WEEKDAY_NAMES[task["weekday"]]
             else:
@@ -112,6 +140,23 @@ class ChecklistTab(QWidget):
             )
             self.list_widget.addItem(item)
         self.list_widget.blockSignals(False)
+
+        self.wishlist_list_widget.blockSignals(True)
+        self.wishlist_list_widget.clear()
+        for task in wishlist_tasks:
+            item = QListWidgetItem(task["text"])
+            item.setData(Qt.ItemDataRole.UserRole, task["id"])
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Checked if task.get("completed_today") else Qt.CheckState.Unchecked
+            )
+            self.wishlist_list_widget.addItem(item)
+        self.wishlist_list_widget.blockSignals(False)
+
+        has_wishlist = len(wishlist_tasks) > 0
+        self.wishlist_label.setVisible(has_wishlist)
+        self.wishlist_list_widget.setVisible(has_wishlist)
+        self.wishlist_remove_btn.setVisible(has_wishlist)
 
     def _on_rows_moved(self):
         ordered_ids = [
@@ -152,6 +197,13 @@ class ChecklistTab(QWidget):
 
     def remove_selected(self):
         item = self.list_widget.currentItem()
+        if item:
+            task_id = item.data(Qt.ItemDataRole.UserRole)
+            self.storage.remove_task(task_id)
+            self.refresh()
+
+    def remove_selected_wishlist(self):
+        item = self.wishlist_list_widget.currentItem()
         if item:
             task_id = item.data(Qt.ItemDataRole.UserRole)
             self.storage.remove_task(task_id)

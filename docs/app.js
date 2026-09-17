@@ -368,7 +368,12 @@ function scheduleNotesSave(editor) {
 
 function renderChecklist() {
   const view = document.getElementById("view");
-  const tasks = state?.checklist ?? [];
+  const allTasks = state?.checklist ?? [];
+  // Cards pushed from the Deckbuilder wishlist get their own section below
+  // (same tab, not a new one) so they don't mix into, or get counted
+  // toward, the regular checklist.
+  const tasks = allTasks.filter(t => t.source !== "wishlist");
+  const wishlistTasks = allTasks.filter(t => t.source === "wishlist");
   view.innerHTML = `
     <div class="pane">
       <ul id="task-list" class="task-list"></ul>
@@ -381,6 +386,10 @@ function renderChecklist() {
         </select>
         <button id="task-add">Add</button>
       </div>
+      ${wishlistTasks.length ? `
+        <h3 class="section-heading">\u{1F0CF} Card Wishlist</h3>
+        <ul id="wishlist-task-list" class="task-list"></ul>
+      ` : ""}
     </div>`;
 
   const list = document.getElementById("task-list");
@@ -408,6 +417,26 @@ function renderChecklist() {
       btn.addEventListener("click", () => moveTask(tasks, index, btn.dataset.dir === "up" ? -1 : 1));
     });
     list.appendChild(li);
+  });
+
+  const wishlistList = document.getElementById("wishlist-task-list");
+  wishlistTasks.forEach(task => {
+    const li = document.createElement("li");
+    li.className = "task-item" + (task.completed_today ? " done" : "");
+    li.innerHTML = `
+      <label>
+        <input type="checkbox" ${task.completed_today ? "checked" : ""}>
+        <span>${escapeHtml(task.text)}</span>
+      </label>
+      <button class="remove-btn" title="Remove">✕</button>`;
+    li.querySelector("input").addEventListener("change", async e => {
+      await toggleTask(task.id, e.target.checked);
+    });
+    li.querySelector(".remove-btn").addEventListener("click", async () => {
+      await supabaseClient.rpc("remove_task", { p_task_id: task.id });
+      await pullAndRender();
+    });
+    wishlistList.appendChild(li);
   });
 
   document.getElementById("task-add").addEventListener("click", async () => {
