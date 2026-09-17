@@ -366,6 +366,37 @@ function scheduleNotesSave(editor) {
 
 // ---------- Checklist tab ----------
 
+// Shared row renderer for both the regular checklist and the wishlist
+// section below it — identical markup/behavior except the regular list
+// also shows each task's recurrence tag.
+function renderTaskList(container, tasks, { showRecurrence = false } = {}) {
+  tasks.forEach((task, index) => {
+    const li = document.createElement("li");
+    li.className = "task-item" + (task.completed_today ? " done" : "");
+    li.innerHTML = `
+      <div class="reorder-col">
+        <button class="reorder-btn" data-dir="up" title="Move up" ${index === 0 ? "disabled" : ""}>▲</button>
+        <button class="reorder-btn" data-dir="down" title="Move down" ${index === tasks.length - 1 ? "disabled" : ""}>▼</button>
+      </div>
+      <label>
+        <input type="checkbox" ${task.completed_today ? "checked" : ""}>
+        <span>${escapeHtml(task.text)}${showRecurrence ? ` <em>[${task.recurrence}]</em>` : ""}</span>
+      </label>
+      <button class="remove-btn" title="Remove">✕</button>`;
+    li.querySelector("input").addEventListener("change", async e => {
+      await toggleTask(task.id, e.target.checked);
+    });
+    li.querySelector(".remove-btn").addEventListener("click", async () => {
+      await supabaseClient.rpc("remove_task", { p_task_id: task.id });
+      await pullAndRender();
+    });
+    li.querySelectorAll(".reorder-btn").forEach(btn => {
+      btn.addEventListener("click", () => moveTask(tasks, index, btn.dataset.dir === "up" ? -1 : 1));
+    });
+    container.appendChild(li);
+  });
+}
+
 function renderChecklist() {
   const view = document.getElementById("view");
   const allTasks = state?.checklist ?? [];
@@ -392,59 +423,9 @@ function renderChecklist() {
       ` : ""}
     </div>`;
 
-  const list = document.getElementById("task-list");
-  tasks.forEach((task, index) => {
-    const li = document.createElement("li");
-    li.className = "task-item" + (task.completed_today ? " done" : "");
-    li.innerHTML = `
-      <div class="reorder-col">
-        <button class="reorder-btn" data-dir="up" title="Move up" ${index === 0 ? "disabled" : ""}>▲</button>
-        <button class="reorder-btn" data-dir="down" title="Move down" ${index === tasks.length - 1 ? "disabled" : ""}>▼</button>
-      </div>
-      <label>
-        <input type="checkbox" ${task.completed_today ? "checked" : ""}>
-        <span>${escapeHtml(task.text)} <em>[${task.recurrence}]</em></span>
-      </label>
-      <button class="remove-btn" title="Remove">✕</button>`;
-    li.querySelector("input").addEventListener("change", async e => {
-      await toggleTask(task.id, e.target.checked);
-    });
-    li.querySelector(".remove-btn").addEventListener("click", async () => {
-      await supabaseClient.rpc("remove_task", { p_task_id: task.id });
-      await pullAndRender();
-    });
-    li.querySelectorAll(".reorder-btn").forEach(btn => {
-      btn.addEventListener("click", () => moveTask(tasks, index, btn.dataset.dir === "up" ? -1 : 1));
-    });
-    list.appendChild(li);
-  });
-
+  renderTaskList(document.getElementById("task-list"), tasks, { showRecurrence: true });
   const wishlistList = document.getElementById("wishlist-task-list");
-  wishlistTasks.forEach((task, index) => {
-    const li = document.createElement("li");
-    li.className = "task-item" + (task.completed_today ? " done" : "");
-    li.innerHTML = `
-      <div class="reorder-col">
-        <button class="reorder-btn" data-dir="up" title="Move up" ${index === 0 ? "disabled" : ""}>▲</button>
-        <button class="reorder-btn" data-dir="down" title="Move down" ${index === wishlistTasks.length - 1 ? "disabled" : ""}>▼</button>
-      </div>
-      <label>
-        <input type="checkbox" ${task.completed_today ? "checked" : ""}>
-        <span>${escapeHtml(task.text)}</span>
-      </label>
-      <button class="remove-btn" title="Remove">✕</button>`;
-    li.querySelector("input").addEventListener("change", async e => {
-      await toggleTask(task.id, e.target.checked);
-    });
-    li.querySelector(".remove-btn").addEventListener("click", async () => {
-      await supabaseClient.rpc("remove_task", { p_task_id: task.id });
-      await pullAndRender();
-    });
-    li.querySelectorAll(".reorder-btn").forEach(btn => {
-      btn.addEventListener("click", () => moveTask(wishlistTasks, index, btn.dataset.dir === "up" ? -1 : 1));
-    });
-    wishlistList.appendChild(li);
-  });
+  if (wishlistList) renderTaskList(wishlistList, wishlistTasks);
 
   document.getElementById("task-add").addEventListener("click", async () => {
     const text = document.getElementById("task-text").value.trim();

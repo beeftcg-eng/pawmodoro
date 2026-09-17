@@ -1,7 +1,11 @@
 -- Pawmodoro cloud sync schema for Supabase.
 --
--- Run this ONCE in your Supabase project's SQL Editor (Supabase dashboard
--- -> SQL Editor -> New query -> paste this whole file -> Run).
+-- Run this in your Supabase project's SQL Editor (Supabase dashboard ->
+-- SQL Editor -> New query -> paste this whole file -> Run). Safe to
+-- re-run in full any time (e.g. to pick up a migration added below) —
+-- every statement is idempotent (if-not-exists / drop-then-create), so
+-- an existing project won't error out partway through and skip later
+-- statements like it used to.
 --
 -- This mirrors the exact XP/level/quest math from gamification.py and
 -- storage.py, so the desktop app and the web app behave identically
@@ -17,7 +21,7 @@ create extension if not exists pgcrypto;
 -- Reference data: the pool of possible daily/weekly quests. Read-only at
 -- runtime; ensure_daily_quests()/ensure_weekly_quests() pick 3 at random
 -- from here, same as gamification.QUEST_POOL / WEEKLY_QUEST_POOL.
-create table quest_templates (
+create table if not exists quest_templates (
   id text primary key,
   list_type text not null check (list_type in ('daily', 'weekly')),
   kind text not null,
@@ -42,16 +46,18 @@ insert into quest_templates (id, list_type, kind, target, description) values
   ('week_tasks_25', 'weekly', 'tasks', 25, 'Finish 25 checklist tasks this week'),
   ('week_breaks_5', 'weekly', 'breaks', 5, 'Take 5 breaks this week'),
   ('week_breaks_8', 'weekly', 'breaks', 8, 'Take 8 breaks this week'),
-  ('week_clear_checklist_3', 'weekly', 'clear_checklist', 3, 'Clear your whole checklist 3 times this week');
+  ('week_clear_checklist_3', 'weekly', 'clear_checklist', 3, 'Clear your whole checklist 3 times this week')
+on conflict (id) do nothing;
 
 alter table quest_templates enable row level security;
+drop policy if exists "quest_templates readable by anyone signed in" on quest_templates;
 create policy "quest_templates readable by anyone signed in"
   on quest_templates for select
   using (auth.role() = 'authenticated');
 
 -- One row per logged-in user: XP, streaks, notes, and the two active quest
 -- lists (stored as JSON arrays, same shape as the desktop app's data.json).
-create table app_state (
+create table if not exists app_state (
   user_id uuid primary key references auth.users(id) on delete cascade,
   notes text not null default '',
   xp int not null default 0,
@@ -68,6 +74,7 @@ create table app_state (
 );
 
 alter table app_state enable row level security;
+drop policy if exists "own app_state row" on app_state;
 create policy "own app_state row"
   on app_state for all
   using (auth.uid() = user_id)
@@ -77,7 +84,7 @@ create policy "own app_state row"
 -- pushed from the Deckbuilder wishlist from the regular checklist, so
 -- they can be shown in their own section without mixing into (or
 -- counting toward) the regular list.
-create table checklist_tasks (
+create table if not exists checklist_tasks (
   id text primary key default encode(gen_random_bytes(6), 'hex'),
   user_id uuid not null references auth.users(id) on delete cascade,
   text text not null,
@@ -92,6 +99,7 @@ create table checklist_tasks (
 );
 
 alter table checklist_tasks enable row level security;
+drop policy if exists "own checklist rows" on checklist_tasks;
 create policy "own checklist rows"
   on checklist_tasks for all
   using (auth.uid() = user_id)

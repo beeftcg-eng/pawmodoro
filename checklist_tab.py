@@ -205,19 +205,18 @@ class ChecklistTab(QWidget):
         self.text_input.clear()
         self.refresh()
 
-    def remove_selected(self):
-        item = self.list_widget.currentItem()
+    def _remove_selected(self, list_widget):
+        item = list_widget.currentItem()
         if item:
             task_id = item.data(Qt.ItemDataRole.UserRole)
             self.storage.remove_task(task_id)
             self.refresh()
 
+    def remove_selected(self):
+        self._remove_selected(self.list_widget)
+
     def remove_selected_wishlist(self):
-        item = self.wishlist_list_widget.currentItem()
-        if item:
-            task_id = item.data(Qt.ItemDataRole.UserRole)
-            self.storage.remove_task(task_id)
-            self.refresh()
+        self._remove_selected(self.wishlist_list_widget)
 
     def set_reminder(self):
         item = self.list_widget.currentItem()

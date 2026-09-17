@@ -131,7 +131,9 @@ class SyncSettingsDialog(QDialog):
                 g["current_streak"], g["longest_streak"], g.get("last_active_date"),
             )
             for task in self.storage.get_checklist():
-                client.add_task(task["text"], task["recurrence"], task.get("reminder_time"))
+                client.add_task(
+                    task["text"], task["recurrence"], task.get("reminder_time"), task.get("source", "checklist"),
+                )
             QMessageBox.information(
                 self, "Cloud Sync",
                 "No existing cloud data found — uploaded this computer's current "
