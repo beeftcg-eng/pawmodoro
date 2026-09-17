@@ -131,7 +131,7 @@ $$;
 -- ============================================================
 
 create or replace function ensure_app_state() returns app_state
-language plpgsql security invoker as $$
+language plpgsql security invoker set search_path = public, extensions as $$
 declare
   s app_state;
 begin
@@ -144,7 +144,7 @@ end;
 $$;
 
 create or replace function ensure_daily_quests() returns void
-language plpgsql security invoker as $$
+language plpgsql security invoker set search_path = public, extensions as $$
 declare
   s app_state;
   today date := current_date;
@@ -164,7 +164,7 @@ end;
 $$;
 
 create or replace function ensure_weekly_quests() returns void
-language plpgsql security invoker as $$
+language plpgsql security invoker set search_path = public, extensions as $$
 declare
   s app_state;
   wk date := week_start_for(current_date);
@@ -184,7 +184,7 @@ end;
 $$;
 
 create or replace function add_xp(amount int) returns void
-language plpgsql security invoker as $$
+language plpgsql security invoker set search_path = public, extensions as $$
 begin
   perform ensure_daily_quests();
   perform ensure_weekly_quests();
@@ -194,7 +194,7 @@ end;
 $$;
 
 create or replace function bump_streak() returns void
-language plpgsql security invoker as $$
+language plpgsql security invoker set search_path = public, extensions as $$
 declare
   s app_state;
   today date := current_date;
@@ -252,7 +252,7 @@ $$;
 -- bonus, only on the call that finishes it), returns the combined list of
 -- newly-completed quests. Mirrors Storage._advance_quests.
 create or replace function advance_quests(p_kind text, p_amount int) returns jsonb
-language plpgsql security invoker as $$
+language plpgsql security invoker set search_path = public, extensions as $$
 declare
   s app_state;
   daily_result record;
@@ -287,7 +287,7 @@ end;
 $$;
 
 create or replace function record_pomodoro_completed() returns jsonb
-language plpgsql security invoker as $$
+language plpgsql security invoker set search_path = public, extensions as $$
 declare
   s app_state;
   old_lvl record;
@@ -320,7 +320,7 @@ end;
 $$;
 
 create or replace function record_break_completed() returns jsonb
-language plpgsql security invoker as $$
+language plpgsql security invoker set search_path = public, extensions as $$
 declare
   completed jsonb;
 begin
@@ -337,7 +337,7 @@ $$;
 -- through to the same two steps remotely instead of needing one combined
 -- RPC with a different shape than its existing code.
 create or replace function set_task_completed_flag(p_task_id text, p_done boolean) returns checklist_tasks
-language plpgsql security invoker as $$
+language plpgsql security invoker set search_path = public, extensions as $$
 declare
   t checklist_tasks;
 begin
@@ -359,7 +359,7 @@ $$;
 -- check reads current checklist_tasks state. Mirrors
 -- Storage.record_task_event exactly.
 create or replace function apply_task_xp(p_recurrence text, p_done boolean) returns jsonb
-language plpgsql security invoker as $$
+language plpgsql security invoker set search_path = public, extensions as $$
 declare
   task_xp int;
   old_lvl record;
@@ -405,7 +405,7 @@ $$;
 -- Convenience single call combining both steps above, for clients (the
 -- web app) that don't need to split them.
 create or replace function complete_task(p_task_id text, p_done boolean) returns jsonb
-language plpgsql security invoker as $$
+language plpgsql security invoker set search_path = public, extensions as $$
 declare
   t checklist_tasks;
 begin
@@ -415,7 +415,7 @@ end;
 $$;
 
 create or replace function roll_recurring_tasks() returns void
-language sql security invoker as $$
+language sql security invoker set search_path = public, extensions as $$
   update checklist_tasks set completed_today = false
   where user_id = auth.uid()
     and recurrence = 'daily'
@@ -424,13 +424,13 @@ language sql security invoker as $$
 $$;
 
 create or replace function set_notes(p_notes text) returns void
-language sql security invoker as $$
+language sql security invoker set search_path = public, extensions as $$
   update app_state set notes = p_notes, updated_at = now() where user_id = auth.uid();
 $$;
 
 create or replace function add_task(p_text text, p_recurrence text, p_reminder_time text default null)
 returns checklist_tasks
-language plpgsql security invoker as $$
+language plpgsql security invoker set search_path = public, extensions as $$
 declare
   t checklist_tasks;
   next_order double precision;
@@ -444,7 +444,7 @@ end;
 $$;
 
 create or replace function remove_task(p_task_id text) returns void
-language sql security invoker as $$
+language sql security invoker set search_path = public, extensions as $$
   delete from checklist_tasks where id = p_task_id and user_id = auth.uid();
 $$;
 
@@ -456,14 +456,14 @@ $$;
 -- ignored, rather than erroring, so a stale list from a slow client can't
 -- fail the whole call.
 create or replace function reorder_tasks(p_ordered_ids jsonb) returns void
-language sql security invoker as $$
+language sql security invoker set search_path = public, extensions as $$
   update checklist_tasks t set sort_order = x.ord
     from jsonb_array_elements_text(p_ordered_ids) with ordinality as x(id, ord)
     where t.id = x.id and t.user_id = auth.uid();
 $$;
 
 create or replace function set_task_reminder(p_task_id text, p_reminder_time text) returns void
-language sql security invoker as $$
+language sql security invoker set search_path = public, extensions as $$
   update checklist_tasks set reminder_time = p_reminder_time, last_reminded = null
   where id = p_task_id and user_id = auth.uid();
 $$;
@@ -475,7 +475,7 @@ create or replace function import_state(
   p_notes text, p_xp int, p_total_pomodoros int, p_total_tasks int,
   p_current_streak int, p_longest_streak int, p_last_active_date date
 ) returns void
-language plpgsql security invoker as $$
+language plpgsql security invoker set search_path = public, extensions as $$
 begin
   perform ensure_app_state();
   update app_state set
@@ -494,7 +494,7 @@ $$;
 -- One call to fetch everything the web app / desktop app needs, after
 -- rolling over daily tasks and making sure quest lists are fresh.
 create or replace function sync_pull() returns jsonb
-language plpgsql security invoker as $$
+language plpgsql security invoker set search_path = public, extensions as $$
 declare
   s app_state;
   tasks jsonb;
