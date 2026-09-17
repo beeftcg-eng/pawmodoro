@@ -184,7 +184,7 @@ class MainWindow(QMainWindow):
         # Re-rolls the Progress tab's quote (and picks up any XP/quest
         # changes) each time you switch to it, rather than only on load.
         if self.tabs.widget(index) is self.progress_tab:
-            self.progress_tab.refresh()
+            self.progress_tab.refresh(new_quote=True)
 
     def _on_remote_pulled(self, remote):
         """Runs on the main thread (Qt queues the cross-thread signal

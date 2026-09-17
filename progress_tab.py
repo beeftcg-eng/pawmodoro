@@ -101,7 +101,7 @@ class ProgressTab(QWidget):
 
         self.refresh_theme()
 
-    def refresh(self):
+    def refresh(self, new_quote=False):
         g = self.storage.get_gamification()
         level, xp_into, xp_needed = gamification.level_from_xp(g["xp"])
         title = gamification.title_for_level(level)
@@ -119,9 +119,14 @@ class ProgressTab(QWidget):
         self.pomodoro_stat_label.setText(f"\U0001F345 {g.get('total_pomodoros', 0)} sessions completed")
         self.task_stat_label.setText(f"✅ {g.get('total_tasks', 0)} tasks completed")
 
-        quote, source = quotes.random_quote()
-        self.quote_label.setText(f"“{quote}”")
-        self.quote_source_label.setText(f"— {source}")
+        # Only actually rolls a new quote when asked to (tab switch) or on
+        # first load — refresh() itself also runs on every 5s cloud-sync
+        # poll and other data updates, which would otherwise flip the quote
+        # far faster than "each time you switch to the tab".
+        if new_quote or not self.quote_label.text():
+            quote, source = quotes.random_quote()
+            self.quote_label.setText(f"“{quote}”")
+            self.quote_source_label.setText(f"— {source}")
 
         self._rebuild_quests(self.quests_layout, g.get("quests", []), "No quests today.")
 

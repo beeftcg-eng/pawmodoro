@@ -242,36 +242,35 @@ function switchTab(tab) {
   else if (tab === "progress") renderProgress();
 }
 
-let pullInFlight = false;
+let pullRequestId = 0;
 
 async function pullAndRender() {
-  // Skip this tick if the previous poll hasn't returned yet — at a 5s
-  // interval that can happen on a slow connection, and an overlapping
-  // call risks a slower, older response landing (and overwriting state)
-  // after a faster, newer one already applied.
-  if (pullInFlight) return;
-  pullInFlight = true;
-  try {
-    const { data, error } = await supabaseClient.rpc("sync_pull");
-    if (error) {
-      console.error("sync_pull failed", error);
-      return;
-    }
-    state = data;
-    updateLevelBadge();
-    if (activeTab === "notes") {
-      // Only refresh if the editor doesn't currently have focus, so a
-      // poll landing mid-keystroke can never clobber text being typed
-      // right now — it picks up on the next poll after you tap away.
-      const editor = document.getElementById("notes-editor");
-      if (editor && document.activeElement !== editor) {
-        editor.innerHTML = state.notes ?? "";
-      }
-    } else if (activeTab === "checklist") renderChecklist();
-    else if (activeTab === "progress") renderProgress();
-  } finally {
-    pullInFlight = false;
+  // Every call actually fires the request — an action like checking off a
+  // task needs its own follow-up pull to always go through, never get
+  // silently skipped because a periodic poll happened to be in flight.
+  // What's guarded against instead is a *stale* response landing after a
+  // newer one already applied: each call gets an id, and a response is
+  // only applied if its id is still the most recent one issued, so a slow
+  // older request can never overwrite state a faster newer one already set.
+  const requestId = ++pullRequestId;
+  const { data, error } = await supabaseClient.rpc("sync_pull");
+  if (requestId !== pullRequestId) return;
+  if (error) {
+    console.error("sync_pull failed", error);
+    return;
   }
+  state = data;
+  updateLevelBadge();
+  if (activeTab === "notes") {
+    // Only refresh if the editor doesn't currently have focus, so a
+    // poll landing mid-keystroke can never clobber text being typed
+    // right now — it picks up on the next poll after you tap away.
+    const editor = document.getElementById("notes-editor");
+    if (editor && document.activeElement !== editor) {
+      editor.innerHTML = state.notes ?? "";
+    }
+  } else if (activeTab === "checklist") renderChecklist();
+  else if (activeTab === "progress") renderProgress();
 }
 
 function levelFromXp(totalXp) {
