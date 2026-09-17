@@ -7,11 +7,11 @@ next time that weekday comes around - a distinct recurrence type from
 plain "weekly", which is unrelated and never auto-resets. Tasks can be
 dragged to reorder.
 
-Also renders a separate, non-reorderable "Card Wishlist" section (hidden
-when empty) for tasks pushed here from the Deckbuilder app's card
-wishlist — same tab, same underlying checklist_tasks table, kept apart
-by a "source" field so it neither mixes into the regular list nor counts
-toward the "clear your whole checklist" quest.
+Also renders a separate, independently-reorderable "Card Wishlist"
+section (hidden when empty) for tasks pushed here from the Deckbuilder
+app's card wishlist — same tab, same underlying checklist_tasks table,
+kept apart by a "source" field so it neither mixes into the regular
+list nor counts toward the "clear your whole checklist" quest.
 """
 from datetime import date
 
@@ -101,6 +101,8 @@ class ChecklistTab(QWidget):
         layout.addWidget(self.wishlist_label)
 
         self.wishlist_list_widget = QListWidget()
+        self.wishlist_list_widget.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.wishlist_list_widget.setDefaultDropAction(Qt.DropAction.MoveAction)
         layout.addWidget(self.wishlist_list_widget)
 
         wishlist_remove_btn = QPushButton("Remove selected")
@@ -111,6 +113,7 @@ class ChecklistTab(QWidget):
         self.list_widget.itemChanged.connect(self._on_item_changed)
         self.list_widget.model().rowsMoved.connect(self._on_rows_moved)
         self.wishlist_list_widget.itemChanged.connect(self._on_item_changed)
+        self.wishlist_list_widget.model().rowsMoved.connect(self._on_wishlist_rows_moved)
         self.refresh()
 
     def _on_recurrence_changed(self, index=None):
@@ -162,6 +165,13 @@ class ChecklistTab(QWidget):
         ordered_ids = [
             self.list_widget.item(i).data(Qt.ItemDataRole.UserRole)
             for i in range(self.list_widget.count())
+        ]
+        self.storage.reorder_tasks(ordered_ids)
+
+    def _on_wishlist_rows_moved(self):
+        ordered_ids = [
+            self.wishlist_list_widget.item(i).data(Qt.ItemDataRole.UserRole)
+            for i in range(self.wishlist_list_widget.count())
         ]
         self.storage.reorder_tasks(ordered_ids)
 

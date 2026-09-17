@@ -420,10 +420,14 @@ function renderChecklist() {
   });
 
   const wishlistList = document.getElementById("wishlist-task-list");
-  wishlistTasks.forEach(task => {
+  wishlistTasks.forEach((task, index) => {
     const li = document.createElement("li");
     li.className = "task-item" + (task.completed_today ? " done" : "");
     li.innerHTML = `
+      <div class="reorder-col">
+        <button class="reorder-btn" data-dir="up" title="Move up" ${index === 0 ? "disabled" : ""}>▲</button>
+        <button class="reorder-btn" data-dir="down" title="Move down" ${index === wishlistTasks.length - 1 ? "disabled" : ""}>▼</button>
+      </div>
       <label>
         <input type="checkbox" ${task.completed_today ? "checked" : ""}>
         <span>${escapeHtml(task.text)}</span>
@@ -435,6 +439,9 @@ function renderChecklist() {
     li.querySelector(".remove-btn").addEventListener("click", async () => {
       await supabaseClient.rpc("remove_task", { p_task_id: task.id });
       await pullAndRender();
+    });
+    li.querySelectorAll(".reorder-btn").forEach(btn => {
+      btn.addEventListener("click", () => moveTask(wishlistTasks, index, btn.dataset.dir === "up" ? -1 : 1));
     });
     wishlistList.appendChild(li);
   });
