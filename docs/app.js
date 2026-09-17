@@ -415,7 +415,10 @@ function renderChecklist() {
 
 async function toggleTask(taskId, done) {
   const { data, error } = await supabaseClient.rpc("complete_task", { p_task_id: taskId, p_done: done });
-  if (!error && done && data) {
+  if (error) {
+    console.error("complete_task failed", error);
+    toast("⚠️ Couldn't save", error.message || "Check your connection and try again.");
+  } else if (done && data) {
     let detail = `+${data.xp_gained ?? 0} XP`;
     if (data.new_level > data.old_level) detail += ` — Level up! Now level ${data.new_level}`;
     toast("✅ Nice work!", detail);

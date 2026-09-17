@@ -20,7 +20,19 @@ self.addEventListener("fetch", event => {
   if (event.request.method !== "GET") return;
   const url = new URL(event.request.url);
   if (url.origin !== location.origin) return; // never intercept Supabase/API calls
+  // Network-first: always prefer a live copy of the shell when there's a
+  // connection, only falling back to the cached copy if the network fails
+  // outright (genuinely offline). A cache-first strategy here previously
+  // meant a deployed fix could sit unused on a phone indefinitely — this
+  // app needs network for Supabase anyway, so there's no offline-first
+  // case worth trading staleness for.
   event.respondWith(
-    caches.match(event.request).then(cached => cached || fetch(event.request))
+    fetch(event.request)
+      .then(response => {
+        const copy = response.clone();
+        caches.open(CACHE).then(cache => cache.put(event.request, copy));
+        return response;
+      })
+      .catch(() => caches.match(event.request))
   );
 });
