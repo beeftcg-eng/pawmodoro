@@ -83,6 +83,7 @@ create table checklist_tasks (
   completed_today boolean not null default false,
   reminder_time text,
   last_reminded date,
+  sort_order double precision not null default 0,
   created_at timestamptz not null default now()
 );
 
@@ -432,9 +433,11 @@ returns checklist_tasks
 language plpgsql security invoker as $$
 declare
   t checklist_tasks;
+  next_order double precision;
 begin
-  insert into checklist_tasks (user_id, text, recurrence, reminder_time)
-    values (auth.uid(), p_text, p_recurrence, p_reminder_time)
+  select coalesce(max(sort_order), 0) + 1 into next_order from checklist_tasks where user_id = auth.uid();
+  insert into checklist_tasks (user_id, text, recurrence, reminder_time, sort_order)
+    values (auth.uid(), p_text, p_recurrence, p_reminder_time, next_order)
     returning * into t;
   return t;
 end;
@@ -443,6 +446,18 @@ $$;
 create or replace function remove_task(p_task_id text) returns void
 language sql security invoker as $$
   delete from checklist_tasks where id = p_task_id and user_id = auth.uid();
+$$;
+
+-- Persists a full reordering of the checklist: p_ordered_ids is the
+-- complete list of this user's task ids in the desired new order. An id
+-- that doesn't belong to (or no longer exists for) this user is simply
+-- ignored, rather than erroring, so a stale list from a slow client can't
+-- fail the whole call.
+create or replace function reorder_tasks(p_ordered_ids text[]) returns void
+language sql security invoker as $$
+  update checklist_tasks t set sort_order = x.ord
+    from unnest(p_ordered_ids) with ordinality as x(id, ord)
+    where t.id = x.id and t.user_id = auth.uid();
 $$;
 
 create or replace function set_task_reminder(p_task_id text, p_reminder_time text) returns void
@@ -487,7 +502,7 @@ begin
   perform ensure_weekly_quests();
 
   select * into s from app_state where user_id = auth.uid();
-  select coalesce(jsonb_agg(to_jsonb(c) - 'user_id' order by c.created_at), '[]'::jsonb) into tasks
+  select coalesce(jsonb_agg(to_jsonb(c) - 'user_id' order by c.sort_order, c.created_at), '[]'::jsonb) into tasks
     from checklist_tasks c where user_id = auth.uid();
 
   return jsonb_build_object(

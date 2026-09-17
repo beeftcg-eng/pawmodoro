@@ -232,17 +232,28 @@ class Storage:
 
     def reorder_tasks(self, ordered_ids):
         """Reorders the checklist to match `ordered_ids` (a list of task
-        ids in the desired order). Local-only for now - the cloud side
-        doesn't track an order, so a synced task list always comes back
-        sorted by creation date on the phone regardless of how it's been
-        reordered on desktop. Any id not in the current checklist is
-        ignored; any current task not present in `ordered_ids` is kept,
-        appended at the end, so a stale/partial list can't drop tasks."""
+        ids in the desired order), and persists that order to the cloud
+        when synced, so a reorder made here also shows up on the phone
+        (and vice versa) rather than staying desktop-only. Any id not in
+        the current checklist is ignored; any current task not present in
+        `ordered_ids` is kept, appended at the end, so a stale/partial
+        list can't drop tasks."""
         by_id = {t["id"]: t for t in self.data["checklist"]}
         new_order = [by_id[i] for i in ordered_ids if i in by_id]
         remaining = [t for t in self.data["checklist"] if t["id"] not in ordered_ids]
         self.data["checklist"] = new_order + remaining
         self.save()
+        if self._sync_client:
+            # "weekday" tasks are local-only (see add_task) and never have
+            # a remote row, so passing their ids would be a no-op anyway —
+            # skipped outright to keep the payload meaningful.
+            remote_ids = [t["id"] for t in self.data["checklist"] if t["recurrence"] != "weekday"]
+            try:
+                self._sync_client.reorder_tasks(remote_ids)
+            except SyncError:
+                pass
+            finally:
+                self._persist_sync_token_if_changed()
 
     def set_task_done(self, task_id, done):
         today = date.today().isoformat()

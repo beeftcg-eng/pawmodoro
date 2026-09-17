@@ -384,10 +384,14 @@ function renderChecklist() {
     </div>`;
 
   const list = document.getElementById("task-list");
-  tasks.forEach(task => {
+  tasks.forEach((task, index) => {
     const li = document.createElement("li");
     li.className = "task-item" + (task.completed_today ? " done" : "");
     li.innerHTML = `
+      <div class="reorder-col">
+        <button class="reorder-btn" data-dir="up" title="Move up" ${index === 0 ? "disabled" : ""}>▲</button>
+        <button class="reorder-btn" data-dir="down" title="Move down" ${index === tasks.length - 1 ? "disabled" : ""}>▼</button>
+      </div>
       <label>
         <input type="checkbox" ${task.completed_today ? "checked" : ""}>
         <span>${escapeHtml(task.text)} <em>[${task.recurrence}]</em></span>
@@ -400,6 +404,9 @@ function renderChecklist() {
       await supabaseClient.rpc("remove_task", { p_task_id: task.id });
       await pullAndRender();
     });
+    li.querySelectorAll(".reorder-btn").forEach(btn => {
+      btn.addEventListener("click", () => moveTask(tasks, index, btn.dataset.dir === "up" ? -1 : 1));
+    });
     list.appendChild(li);
   });
 
@@ -411,6 +418,15 @@ function renderChecklist() {
     document.getElementById("task-text").value = "";
     await pullAndRender();
   });
+}
+
+async function moveTask(tasks, index, delta) {
+  const target = index + delta;
+  if (target < 0 || target >= tasks.length) return;
+  const reordered = tasks.map(t => t.id);
+  [reordered[index], reordered[target]] = [reordered[target], reordered[index]];
+  await supabaseClient.rpc("reorder_tasks", { p_ordered_ids: reordered });
+  await pullAndRender();
 }
 
 async function toggleTask(taskId, done) {

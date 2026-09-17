@@ -124,6 +124,9 @@ class SupabaseSync:
     def set_task_reminder(self, task_id, reminder_time):
         return self._rpc("set_task_reminder", {"p_task_id": task_id, "p_reminder_time": reminder_time})
 
+    def reorder_tasks(self, ordered_ids):
+        return self._rpc("reorder_tasks", {"p_ordered_ids": ordered_ids})
+
     def complete_task(self, task_id, done):
         return self._rpc("complete_task", {"p_task_id": task_id, "p_done": done})
 
