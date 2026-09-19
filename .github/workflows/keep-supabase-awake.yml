@@ -6,16 +6,19 @@ name: Keep Supabase project awake
 # all talk to the one project. A cheap GET every couple of days counts as
 # activity and keeps that from happening again.
 #
-# Pings GoTrue's public health-check endpoint (/auth/v1/health) rather
-# than PostgREST -- it needs no API key at all and always replies 200, so
-# there's nothing here to misconfigure. (An earlier version hit
-# /rest/v1/ instead, which always 401s for a non-service_role key since
-# that path serves the full OpenAPI schema -- a real response, just not
-# the "it's working" signal it looked like.)
+# Pings GoTrue's health-check endpoint (/auth/v1/health) rather than
+# PostgREST's schema root -- PostgREST's root always 401s for a
+# non-service_role key ("Only the service_role API key can be used for
+# this endpoint"), a real response but not the "it's working" signal it
+# looked like. Every route still goes through Supabase's gateway (Kong),
+# which requires an apikey header regardless of which route it is, so
+# the anon key is still needed here.
 #
-# Requires one repo secret, the same Project URL used to set up the
-# desktop app / phone (Settings -> Secrets and variables -> Actions):
-#   SUPABASE_URL   e.g. https://xxxxxxxx.supabase.co
+# Requires two repo secrets, the same Project URL + anon public key used
+# to set up the desktop app / phone (Settings -> Secrets and variables ->
+# Actions):
+#   SUPABASE_URL        e.g. https://xxxxxxxx.supabase.co
+#   SUPABASE_ANON_KEY    the "anon public" key from Project Settings -> API
 
 on:
   schedule:
@@ -30,7 +33,9 @@ jobs:
         run: |
           url="${{ secrets.SUPABASE_URL }}"
           url="${url%/}"  # strip a trailing slash, in case the secret has one
-          code=$(curl -s -o /tmp/resp.txt -w "%{http_code}" "$url/auth/v1/health")
+          code=$(curl -s -o /tmp/resp.txt -w "%{http_code}" \
+            -H "apikey: ${{ secrets.SUPABASE_ANON_KEY }}" \
+            "$url/auth/v1/health")
           echo "HTTP $code"
           cat /tmp/resp.txt
           if [ "$code" != "200" ]; then
