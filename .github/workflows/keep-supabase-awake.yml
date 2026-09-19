@@ -3,16 +3,19 @@ name: Keep Supabase project awake
 # Supabase's free tier auto-pauses a project after about a week with no
 # API/database activity, which is what silently broke the mobile app (and
 # would've broken desktop sync too) on every device at once, since they
-# all talk to the one project. A cheap, harmless GET against PostgREST
-# every couple of days counts as activity and keeps that from happening
-# again, without touching any real data (it hits the schema root, not a
-# table or RPC).
+# all talk to the one project. A cheap GET every couple of days counts as
+# activity and keeps that from happening again.
 #
-# Requires two repo secrets, the same Project URL + anon public key used
-# to set up the desktop app / phone (Settings -> Secrets and variables ->
-# Actions):
-#   SUPABASE_URL       e.g. https://xxxxxxxx.supabase.co
-#   SUPABASE_ANON_KEY   the "anon public" key from Project Settings -> API
+# Pings GoTrue's public health-check endpoint (/auth/v1/health) rather
+# than PostgREST -- it needs no API key at all and always replies 200, so
+# there's nothing here to misconfigure. (An earlier version hit
+# /rest/v1/ instead, which always 401s for a non-service_role key since
+# that path serves the full OpenAPI schema -- a real response, just not
+# the "it's working" signal it looked like.)
+#
+# Requires one repo secret, the same Project URL used to set up the
+# desktop app / phone (Settings -> Secrets and variables -> Actions):
+#   SUPABASE_URL   e.g. https://xxxxxxxx.supabase.co
 
 on:
   schedule:
@@ -23,22 +26,14 @@ jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - name: Ping Supabase REST endpoint
+      - name: Ping Supabase auth health endpoint
         run: |
           url="${{ secrets.SUPABASE_URL }}"
           url="${url%/}"  # strip a trailing slash, in case the secret has one
-          code=$(curl -s -o /tmp/resp.txt -w "%{http_code}" \
-            -H "apikey: ${{ secrets.SUPABASE_ANON_KEY }}" \
-            -H "Authorization: Bearer ${{ secrets.SUPABASE_ANON_KEY }}" \
-            "$url/rest/v1/")
+          code=$(curl -s -o /tmp/resp.txt -w "%{http_code}" "$url/auth/v1/health")
           echo "HTTP $code"
           cat /tmp/resp.txt
-          # PostgREST's root replies 200 (OpenAPI schema); a bare 401 with
-          # an empty/misconfigured project can still count as activity, so
-          # only genuinely failed requests (couldn't connect at all) should
-          # fail this job -- an HTTP error response still reached and
-          # touched the project, which is all this workflow needs to do.
-          if [ "$code" -eq 000 ]; then
-            echo "Could not reach $url at all"
+          if [ "$code" != "200" ]; then
+            echo "Expected HTTP 200 from $url/auth/v1/health"
             exit 1
           fi
