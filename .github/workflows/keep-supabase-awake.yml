@@ -25,6 +25,20 @@ jobs:
     steps:
       - name: Ping Supabase REST endpoint
         run: |
-          curl -sf -o /dev/null \
+          url="${{ secrets.SUPABASE_URL }}"
+          url="${url%/}"  # strip a trailing slash, in case the secret has one
+          code=$(curl -s -o /tmp/resp.txt -w "%{http_code}" \
             -H "apikey: ${{ secrets.SUPABASE_ANON_KEY }}" \
-            "${{ secrets.SUPABASE_URL }}/rest/v1/"
+            -H "Authorization: Bearer ${{ secrets.SUPABASE_ANON_KEY }}" \
+            "$url/rest/v1/")
+          echo "HTTP $code"
+          cat /tmp/resp.txt
+          # PostgREST's root replies 200 (OpenAPI schema); a bare 401 with
+          # an empty/misconfigured project can still count as activity, so
+          # only genuinely failed requests (couldn't connect at all) should
+          # fail this job -- an HTTP error response still reached and
+          # touched the project, which is all this workflow needs to do.
+          if [ "$code" -eq 000 ]; then
+            echo "Could not reach $url at all"
+            exit 1
+          fi
