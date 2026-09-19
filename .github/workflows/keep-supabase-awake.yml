@@ -1,0 +1,30 @@
+name: Keep Supabase project awake
+
+# Supabase's free tier auto-pauses a project after about a week with no
+# API/database activity, which is what silently broke the mobile app (and
+# would've broken desktop sync too) on every device at once, since they
+# all talk to the one project. A cheap, harmless GET against PostgREST
+# every couple of days counts as activity and keeps that from happening
+# again, without touching any real data (it hits the schema root, not a
+# table or RPC).
+#
+# Requires two repo secrets, the same Project URL + anon public key used
+# to set up the desktop app / phone (Settings -> Secrets and variables ->
+# Actions):
+#   SUPABASE_URL       e.g. https://xxxxxxxx.supabase.co
+#   SUPABASE_ANON_KEY   the "anon public" key from Project Settings -> API
+
+on:
+  schedule:
+    - cron: "0 12 */2 * *"  # every 2 days at 12:00 UTC
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Supabase REST endpoint
+        run: |
+          curl -sf -o /dev/null \
+            -H "apikey: ${{ secrets.SUPABASE_ANON_KEY }}" \
+            "${{ secrets.SUPABASE_URL }}/rest/v1/"

@@ -99,13 +99,52 @@ async function boot() {
     return;
   }
   initSupabase(cfg);
+  showConnectingScreen();
 
-  const { data: { session } } = await supabaseClient.auth.getSession();
-  if (session) {
-    await enterApp();
-  } else {
-    showLoginScreen();
+  // Everything below talks to Supabase. Unguarded, a dead/unreachable
+  // project (or just a slow mobile connection) left the page stuck on a
+  // permanently blank <div id="app"> with nothing telling the user why —
+  // wrapped in try/catch + a timeout so a failure always ends in a visible
+  // retry screen instead of silence.
+  try {
+    const { data: { session }, error } = await withTimeout(
+      supabaseClient.auth.getSession(), 10000, "Timed out waiting for a response."
+    );
+    if (error) throw error;
+    if (session) {
+      await enterApp();
+    } else {
+      showLoginScreen();
+    }
+  } catch (err) {
+    showConnectionErrorScreen(err);
   }
+}
+
+function withTimeout(promise, ms, message) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(message)), ms)),
+  ]);
+}
+
+function showConnectingScreen() {
+  document.getElementById("app").innerHTML = `
+    <div class="centered-card">
+      <h1>\u{1F43E} Pawmodoro</h1>
+      <p class="hint">Connecting…</p>
+    </div>`;
+}
+
+function showConnectionErrorScreen(err) {
+  document.getElementById("app").innerHTML = `
+    <div class="centered-card">
+      <h1>\u{1F43E} Pawmodoro</h1>
+      <p class="error">Couldn't connect: ${escapeHtml(err?.message || String(err))}</p>
+      <p class="hint">Check your connection and that the Supabase project is reachable, then try again.</p>
+      <button id="retry-btn">Retry</button>
+    </div>`;
+  document.getElementById("retry-btn").addEventListener("click", boot);
 }
 
 function initSupabase(cfg) {
