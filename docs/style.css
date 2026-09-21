@@ -318,6 +318,17 @@ html, body {
   font-weight: bold;
 }
 .shared-actions { margin-top: 12px; }
+.shared-schedule { flex-wrap: wrap; margin-top: 8px; }
+.shared-schedule select, .shared-schedule input {
+  padding: 8px;
+  border: 1px solid var(--paper-edge);
+  border-radius: 6px;
+  background: var(--paper-light);
+  font-size: 14px;
+  min-width: 0;
+}
+.shared-schedule input[type="number"] { width: 72px; }
+.shared-schedule [hidden] { display: none; }
 .add-row button.secondary-btn {
   flex: 1;
   background: none;

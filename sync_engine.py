@@ -246,7 +246,11 @@ class SyncEngine:
         elif name == "break":
             c.record_break_completed()
         elif name == "shared_add":
-            c.shared_add_task(a["text"], a["id"])
+            c.shared_add_task(a["text"], a["id"], a.get("schedule"))
+        elif name == "shared_schedule":
+            c.shared_set_schedule(a["id"], a["schedule"])
+        elif name == "shared_reorder":
+            c.shared_reorder(a["ids"])
         elif name == "shared_done":
             c.shared_set_done(a["id"], a["done"])
         elif name == "shared_remove":

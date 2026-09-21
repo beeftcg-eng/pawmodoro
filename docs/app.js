@@ -930,6 +930,64 @@ async function reloadShared() {
   if (activeTab === "shared") renderShared();
 }
 
+// Schedule of a shared item: "once" (optionally with a date/time), or it repeats
+// daily / weekly on a weekday ("every Tuesday") / monthly on a day of the month.
+// Same rules as shared_schedule.py and shared_last_occurrence() in schema.sql.
+const WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+const SHARED_SCHEDULE_DEFAULT = { recurrence: "once", weekday: 1, month_day: 1, due_date: "", due_time: "" };
+let sharedDraftSchedule = { ...SHARED_SCHEDULE_DEFAULT };
+
+function ordinal(n) {
+  const suffix = (n % 100 >= 11 && n % 100 <= 13) ? "th" : ({ 1: "st", 2: "nd", 3: "rd" }[n % 10] || "th");
+  return `${n}${suffix}`;
+}
+
+function sharedScheduleLabel(task) {
+  const at = task.due_time ? ` at ${task.due_time}` : "";
+  switch (task.recurrence) {
+    case "daily": return `\u{1F501} Every day${at}`;
+    case "weekly": return task.weekday == null ? "" : `\u{1F501} Every ${WEEKDAY_NAMES[task.weekday]}${at}`;
+    case "monthly": return task.month_day == null ? "" : `\u{1F501} Monthly on the ${ordinal(task.month_day)}${at}`;
+    default:
+      if (!task.due_date) return "";
+      const [y, m, d] = task.due_date.split("-").map(Number);
+      const day = new Date(y, m - 1, d).toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short", year: y === new Date().getFullYear() ? undefined : "numeric" });
+      return `\u{1F4C5} ${day}${at}`;
+  }
+}
+
+function sharedIsOverdue(task) {
+  if (task.done || task.recurrence !== "once" || !task.due_date) return false;
+  const [y, m, d] = task.due_date.split("-").map(Number);
+  const [hh, mm] = (task.due_time || "23:59").split(":").map(Number);
+  return new Date() > new Date(y, m - 1, d, hh, mm);
+}
+
+// The parameters shared_add_task takes for a schedule. Empty for a plain item,
+// so plain items still work against a cloud schema that predates schedules.
+function sharedScheduleParams(sch) {
+  const plain = sch.recurrence === "once" && !sch.due_date && !sch.due_time;
+  if (plain) return {};
+  const once = sch.recurrence === "once";
+  return {
+    p_recurrence: sch.recurrence,
+    p_weekday: sch.recurrence === "weekly" ? Number(sch.weekday) : null,
+    p_month_day: sch.recurrence === "monthly" ? Number(sch.month_day) : null,
+    // a time on its own means "today"
+    p_due_date: once ? (sch.due_date || (sch.due_time ? new Date().toLocaleDateString("sv") : null)) : null,
+    p_due_time: sch.due_time || null,
+  };
+}
+
+async function moveSharedTask(tasks, index, delta) {
+  const target = index + delta;
+  if (target < 0 || target >= tasks.length) return;
+  const ids = tasks.map(t => t.id);
+  [ids[index], ids[target]] = [ids[target], ids[index]];
+  await sharedCall("shared_reorder", { p_ordered_ids: ids });
+  await reloadShared();
+}
+
 function renderShared() {
   const restoreDraft = keepDraft("shared-text");
   renderKeys.shared = sharedKey();
@@ -990,19 +1048,38 @@ function renderShared() {
         <input id="shared-text" type="text" placeholder="e.g. Milk">
         <button id="shared-add">Add</button>
       </div>
+      <div class="add-row shared-schedule">
+        <select id="shared-repeat" title="Repeat">
+          <option value="once">One time</option>
+          <option value="daily">Every day</option>
+          <option value="weekly">Every week</option>
+          <option value="monthly">Every month</option>
+        </select>
+        <select id="shared-weekday" title="Day of the week">
+          ${WEEKDAY_NAMES.map((n, i) => `<option value="${i}">on ${n}</option>`).join("")}
+        </select>
+        <input id="shared-monthday" type="number" min="1" max="31" title="Day of the month" placeholder="day">
+        <input id="shared-date" type="date" title="Date (optional)">
+        <input id="shared-time" type="time" title="Time (optional)">
+      </div>
       <div class="add-row shared-actions">
         <button id="shared-clear" class="secondary-btn">Clear completed</button>
         <button id="shared-leave" class="secondary-btn">Leave household</button>
       </div>
     </div>`;
   const list = document.getElementById("shared-list");
-  for (const task of h.tasks) {
+  h.tasks.forEach((task, index) => {
     const li = document.createElement("li");
     li.className = "task-item" + (task.done ? " done" : "");
+    const schedule = sharedScheduleLabel(task);
     li.innerHTML = `
+      <div class="reorder-col">
+        <button class="reorder-btn" data-dir="up" title="Move up" ${index === 0 ? "disabled" : ""}>▲</button>
+        <button class="reorder-btn" data-dir="down" title="Move down" ${index === h.tasks.length - 1 ? "disabled" : ""}>▼</button>
+      </div>
       <label>
         <input type="checkbox" ${task.done ? "checked" : ""}>
-        <span>${escapeHtml(task.text)}${task.done && task.done_by_name ? ` <em>✓ ${escapeHtml(task.done_by_name)}</em>` : ""}</span>
+        <span>${escapeHtml(task.text)}${schedule ? ` <em>${escapeHtml(schedule)}${sharedIsOverdue(task) ? " ⚠ overdue" : ""}</em>` : ""}${task.done && task.done_by_name ? ` <em>✓ ${escapeHtml(task.done_by_name)}</em>` : ""}</span>
       </label>
       <button class="remove-btn" title="Remove">✕</button>`;
     li.querySelector("input").addEventListener("change", async e => {
@@ -1013,14 +1090,37 @@ function renderShared() {
       await sharedCall("shared_remove_task", { p_id: task.id });
       await reloadShared();
     });
+    li.querySelectorAll(".reorder-btn").forEach(btn => {
+      btn.addEventListener("click", () => moveSharedTask(h.tasks, index, btn.dataset.dir === "up" ? -1 : 1));
+    });
     list.appendChild(li);
+  });
+
+  // The schedule pickers keep their values across re-renders (a poll can redraw
+  // the tab while you're still choosing), so they live in sharedDraftSchedule.
+  const pickers = {
+    recurrence: document.getElementById("shared-repeat"), weekday: document.getElementById("shared-weekday"),
+    month_day: document.getElementById("shared-monthday"), due_date: document.getElementById("shared-date"),
+    due_time: document.getElementById("shared-time"),
+  };
+  const syncPickers = () => {
+    pickers.weekday.hidden = sharedDraftSchedule.recurrence !== "weekly";
+    pickers.month_day.hidden = sharedDraftSchedule.recurrence !== "monthly";
+    pickers.due_date.hidden = sharedDraftSchedule.recurrence !== "once";
+  };
+  for (const [key, el] of Object.entries(pickers)) {
+    el.value = sharedDraftSchedule[key] ?? "";
+    el.addEventListener("input", () => { sharedDraftSchedule[key] = el.value; syncPickers(); });
   }
+  syncPickers();
   const add = async () => {
     const input = document.getElementById("shared-text");
     const text = input.value.trim();
     if (!text) return;
     input.value = "";
-    await sharedCall("shared_add_task", { p_text: text });
+    const params = { p_text: text, ...sharedScheduleParams(sharedDraftSchedule) };
+    sharedDraftSchedule = { ...SHARED_SCHEDULE_DEFAULT };  // a one-off grocery shouldn't inherit the last chore's schedule
+    await sharedCall("shared_add_task", params);
     await reloadShared();
     document.getElementById("shared-text")?.focus();
   };

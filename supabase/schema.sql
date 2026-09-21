@@ -174,6 +174,27 @@ create table if not exists shared_tasks (
   created_at timestamptz not null default now()
 );
 
+-- v2.11 migrations (no-ops when already applied): scheduled shared items.
+--  * recurrence: 'once' (optionally with an exact date + time), 'daily',
+--    'weekly' (on `weekday`, 0=Monday..6=Sunday -- "every Tuesday") or
+--    'monthly' (on `month_day`; short months use their last day).
+--  * due_time: "HH:MM", the time of day the item is for (all recurrences).
+-- A ticked repeating item un-ticks itself once it comes due again; see
+-- shared_last_occurrence() / roll_shared_tasks() below (mirrors
+-- shared_schedule.py).
+alter table shared_tasks add column if not exists recurrence text not null default 'once';
+alter table shared_tasks add column if not exists weekday int;
+alter table shared_tasks add column if not exists month_day int;
+alter table shared_tasks add column if not exists due_date date;
+alter table shared_tasks add column if not exists due_time text;
+alter table shared_tasks drop constraint if exists shared_tasks_schedule_check;
+alter table shared_tasks add constraint shared_tasks_schedule_check check (
+  recurrence in ('once', 'daily', 'weekly', 'monthly')
+  and (weekday is null or weekday between 0 and 6)
+  and (month_day is null or month_day between 1 and 31)
+  and (due_time is null or due_time ~ '^([01][0-9]|2[0-3]):[0-5][0-9]$')
+);
+
 -- security definer so the membership lookup inside the RLS policies below
 -- doesn't itself trip over household_members' own RLS (infinite recursion).
 create or replace function is_household_member(hid uuid) returns boolean
@@ -729,6 +750,76 @@ $$;
 -- Household functions
 -- ============================================================
 
+-- The most recent day on or before p_today that a repeating shared item came
+-- due (null for a one-off). Mirrors shared_schedule.last_occurrence().
+create or replace function shared_last_occurrence(p_recurrence text, p_weekday int, p_month_day int, p_today date)
+returns date
+language plpgsql immutable set search_path = public, extensions as $$
+declare
+  this_first date := date_trunc('month', p_today::timestamp)::date;
+  prev_first date := (date_trunc('month', p_today::timestamp) - interval '1 month')::date;
+  candidate date;
+begin
+  if p_recurrence = 'daily' then
+    return p_today;
+  elsif p_recurrence = 'weekly' and p_weekday is not null then
+    return p_today - (((extract(isodow from p_today)::int - 1) - p_weekday + 7) % 7);
+  elsif p_recurrence = 'monthly' and p_month_day is not null then
+    candidate := this_first + (least(p_month_day, (this_first + interval '1 month - 1 day')::date - this_first + 1) - 1);
+    if candidate <= p_today then
+      return candidate;
+    end if;
+    return prev_first + (least(p_month_day, this_first - prev_first) - 1);
+  end if;
+  return null;
+end;
+$$;
+
+-- Un-ticks the household's repeating items that have come due again since
+-- they were ticked (in the caller's local day, see user_today()). Runs at
+-- the start of every household_pull, so there is no scheduled job. One-off
+-- items are never touched.
+create or replace function roll_shared_tasks(hid uuid) returns void
+language plpgsql security definer set search_path = public, extensions as $$
+declare
+  today date := user_today();
+  offset_min int := coalesce((select tz_offset_min from app_state where user_id = auth.uid()), 0);
+begin
+  -- callable as an RPC, so never act on a household that isn't the caller's
+  if hid is distinct from my_household_id() then
+    return;
+  end if;
+  update shared_tasks t set done = false, done_by = null, done_at = null
+  where t.household_id = hid and t.done and t.recurrence <> 'once'
+    and (
+      t.done_at is null
+      or ((t.done_at at time zone 'utc') + offset_min * interval '1 minute')::date
+         < shared_last_occurrence(t.recurrence, t.weekday, t.month_day, today)
+    );
+end;
+$$;
+
+-- Rejects a schedule the CHECK constraint or the UI would never produce, with
+-- a readable message.
+create or replace function shared_check_schedule(p_recurrence text, p_weekday int, p_month_day int, p_due_time text)
+returns void
+language plpgsql immutable set search_path = public, extensions as $$
+begin
+  if p_recurrence not in ('once', 'daily', 'weekly', 'monthly') then
+    raise exception 'invalid repeat: %', p_recurrence;
+  end if;
+  if p_recurrence = 'weekly' and (p_weekday is null or p_weekday not between 0 and 6) then
+    raise exception 'pick a day of the week';
+  end if;
+  if p_recurrence = 'monthly' and (p_month_day is null or p_month_day not between 1 and 31) then
+    raise exception 'pick a day of the month';
+  end if;
+  if p_due_time is not null and p_due_time !~ '^([01][0-9]|2[0-3]):[0-5][0-9]$' then
+    raise exception 'invalid time: %', p_due_time;
+  end if;
+end;
+$$;
+
 -- Everything the household UI needs in one call: the roster (with each
 -- member's level inputs, streak and this-week totals) plus the shared list.
 -- Returns null when the caller isn't in a household. security definer
@@ -749,6 +840,7 @@ begin
     return null;
   end if;
   wk := week_start_for(user_today());
+  perform roll_shared_tasks(hid);
 
   select jsonb_build_object(
     'id', h.id,
@@ -775,6 +867,8 @@ begin
     'tasks', (
       select coalesce(jsonb_agg(jsonb_build_object(
           'id', t.id, 'text', t.text, 'done', t.done, 'done_at', t.done_at,
+          'recurrence', t.recurrence, 'weekday', t.weekday, 'month_day', t.month_day,
+          'due_date', t.due_date, 'due_time', t.due_time,
           'done_by_name', (select display_name from household_members where user_id = t.done_by)
         ) order by t.sort_order, t.created_at), '[]'::jsonb)
       from shared_tasks t where t.household_id = h.id
@@ -855,7 +949,14 @@ $$;
 -- The shared-list functions run as the caller (security invoker); the RLS
 -- policy on shared_tasks is what actually limits them to the caller's own
 -- household.
-create or replace function shared_add_task(p_text text, p_id text default null) returns shared_tasks
+-- v2.11 gave this function schedule parameters; drop the old signature so
+-- the two overloads don't become ambiguous to PostgREST.
+drop function if exists shared_add_task(text, text);
+create or replace function shared_add_task(
+  p_text text, p_id text default null,
+  p_recurrence text default 'once', p_weekday int default null, p_month_day int default null,
+  p_due_date date default null, p_due_time text default null
+) returns shared_tasks
 language plpgsql security invoker set search_path = public, extensions as $$
 declare
   hid uuid := my_household_id();
@@ -871,11 +972,54 @@ begin
       return t;
     end if;
   end if;
+  perform shared_check_schedule(p_recurrence, p_weekday, p_month_day, p_due_time);
   select coalesce(max(sort_order), 0) + 1 into next_order from shared_tasks where household_id = hid;
-  insert into shared_tasks (id, household_id, text, sort_order, created_by)
-    values (coalesce(p_id, encode(gen_random_bytes(6), 'hex')), hid, p_text, next_order, auth.uid())
+  insert into shared_tasks (id, household_id, text, sort_order, created_by,
+                            recurrence, weekday, month_day, due_date, due_time)
+    values (coalesce(p_id, encode(gen_random_bytes(6), 'hex')), hid, p_text, next_order, auth.uid(),
+            p_recurrence,
+            case when p_recurrence = 'weekly' then p_weekday end,
+            case when p_recurrence = 'monthly' then p_month_day end,
+            case when p_recurrence = 'once' then p_due_date end,
+            p_due_time)
     returning * into t;
   return t;
+end;
+$$;
+
+create or replace function shared_set_schedule(
+  p_id text, p_recurrence text, p_weekday int default null, p_month_day int default null,
+  p_due_date date default null, p_due_time text default null
+) returns void
+language plpgsql security invoker set search_path = public, extensions as $$
+begin
+  perform shared_check_schedule(p_recurrence, p_weekday, p_month_day, p_due_time);
+  update shared_tasks set
+    recurrence = p_recurrence,
+    weekday = case when p_recurrence = 'weekly' then p_weekday end,
+    month_day = case when p_recurrence = 'monthly' then p_month_day end,
+    due_date = case when p_recurrence = 'once' then p_due_date end,
+    due_time = p_due_time
+  where id = p_id and household_id = my_household_id();
+  if not found then
+    raise exception 'task not found';
+  end if;
+end;
+$$;
+
+-- p_ordered_ids: every shared item's id, in the new order. An item missing
+-- from the list (one a partner added a moment ago) is pushed to the end.
+create or replace function shared_reorder(p_ordered_ids jsonb) returns void
+language plpgsql security invoker set search_path = public, extensions as $$
+declare
+  hid uuid := my_household_id();
+  n int := jsonb_array_length(p_ordered_ids);
+begin
+  update shared_tasks t set sort_order = x.ord
+    from jsonb_array_elements_text(p_ordered_ids) with ordinality as x(id, ord)
+    where t.id = x.id and t.household_id = hid;
+  update shared_tasks set sort_order = sort_order + n
+    where household_id = hid and id not in (select jsonb_array_elements_text(p_ordered_ids));
 end;
 $$;
 
@@ -898,7 +1042,9 @@ language sql security invoker set search_path = public, extensions as $$
   delete from shared_tasks where id = p_id and household_id = my_household_id();
 $$;
 
+-- Only one-off items: a repeating item that's ticked is just waiting to come
+-- due again.
 create or replace function shared_clear_done() returns void
 language sql security invoker set search_path = public, extensions as $$
-  delete from shared_tasks where household_id = my_household_id() and done;
+  delete from shared_tasks where household_id = my_household_id() and done and recurrence = 'once';
 $$;

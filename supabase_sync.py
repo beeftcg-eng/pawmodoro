@@ -211,11 +211,27 @@ class SupabaseSync:
     def household_leave(self):
         return self._rpc("household_leave")
 
-    def shared_add_task(self, text, task_id=None):
+    @staticmethod
+    def _schedule_params(schedule):
+        return {
+            "p_recurrence": schedule["recurrence"], "p_weekday": schedule["weekday"],
+            "p_month_day": schedule["month_day"], "p_due_date": schedule["due_date"],
+            "p_due_time": schedule["due_time"],
+        }
+
+    def shared_add_task(self, text, task_id=None, schedule=None):
         params = {"p_text": text}
         if task_id:
             params["p_id"] = task_id
+        if schedule:  # only sent when there is one, so plain items still work on an older schema
+            params.update(self._schedule_params(schedule))
         return self._rpc("shared_add_task", params)
+
+    def shared_set_schedule(self, task_id, schedule):
+        return self._rpc("shared_set_schedule", {"p_id": task_id, **self._schedule_params(schedule)})
+
+    def shared_reorder(self, ordered_ids):
+        return self._rpc("shared_reorder", {"p_ordered_ids": ordered_ids})
 
     def shared_set_done(self, task_id, done):
         return self._rpc("shared_set_done", {"p_id": task_id, "p_done": done})

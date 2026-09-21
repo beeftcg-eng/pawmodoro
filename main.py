@@ -185,6 +185,7 @@ class MainWindow(QMainWindow):
     def _check_new_day(self):
         if self.storage.roll_day_if_needed():
             self.checklist_tab.refresh()
+            self.shared_tab.refresh()
             self.progress_tab.refresh()
             self._refresh_level_indicator()
             self.widget_window.refresh_tasks()
@@ -222,6 +223,9 @@ class MainWindow(QMainWindow):
     def _check_reminders(self):
         for task in self.storage.check_due_reminders():
             notifier.send("Task reminder", task["text"])
+        for task in self.storage.check_due_shared_reminders():
+            notifier.send("Shared list reminder", task["text"])
+        self.shared_tab.refresh()  # cheap; picks up "overdue" markers as time passes
 
     # ---------- Menu ----------
     def _build_menu(self):

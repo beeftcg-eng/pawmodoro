@@ -51,13 +51,16 @@ way on Android too.
 ## Updating an existing project (v2.9.0 and later)
 
 If you set this up with an older version, do this **once, before** updating
-the desktop app or relying on the phone:
+the desktop app or relying on the phone (and again for **v2.11.0**, which
+adds scheduled shared items — until you re-run it, plain shared items still
+sync, but scheduling or re-ordering one is held in the upload queue):
 
 1. Open your Supabase project → **SQL Editor → New query**.
 2. Paste the *entire* current `supabase/schema.sql` and click **Run**. It's
    safe to re-run: it only adds what's new (a timezone setting, focus-time
-   history, the shared household list, one-time-per-period task XP, and
-   weekly task resets) and leaves your data alone.
+   history, the shared household list, one-time-per-period task XP, weekly
+   task resets, and — new in v2.11.0 — scheduled/repeating shared items and
+   re-ordering them) and leaves your data alone.
 3. Update the desktop app (re-run `install.sh` / `install.bat`). On the
    phone, close the app and reopen it (twice, if it still shows the old
    version — phones cache web apps aggressively).
@@ -81,7 +84,24 @@ totals on the Progress tab.
 3. The other opens **🏠 Shared** → **Join with an invite code…** → enter the
    code and their name. (Codes aren't case-sensitive.)
 4. That's it — the list appears on every desktop app and phone signed in to
-   either account. Tick items off, add, remove, or **Clear completed**.
+   either account. Tick items off, add, remove, drag (desktop) or ▲▼ (phone)
+   to re-order, or **Clear completed**.
+
+**Scheduled and repeating items.** Give an item a schedule when you add it
+(the "New item" row on desktop, the row under the text box on the phone), or
+double-click an item on the desktop / use **Schedule selected…** to change
+one later:
+
+- **One time** — optionally on an exact date and/or at a time.
+- **Every day**, **Every week** on a chosen weekday ("every Tuesday"), or
+  **Every month** on a chosen day of the month (in a shorter month, the last
+  day is used) — each optionally *at* a time of day.
+
+A repeating item un-ticks itself when it comes due again (a Tuesday chore
+ticked on Tuesday stays ticked until next Tuesday), and **Clear completed**
+leaves repeating items alone. An item with a time pops up a desktop
+notification once when that time arrives (the phone app has no background
+notifications). A one-time item past its date shows **⚠ overdue**.
 
 A household holds up to 4 people; **Leave household** removes just you (the
 last person out deletes the list).
