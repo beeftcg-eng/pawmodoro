@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel
 )
 from PyQt6.QtGui import QIcon, QAction, QActionGroup
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QTimer, pyqtSignal
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
 from storage import Storage
@@ -29,6 +29,7 @@ from spotify_client import SpotifyClient
 from toast import CelebrationToast
 from sync_settings_dialog import SyncSettingsDialog
 import notifier
+import shared_activity
 import theme
 import update_checker
 from update_dialog import UpdateDialog
@@ -195,14 +196,29 @@ class MainWindow(QMainWindow):
         waiting to upload, so a pull can never overwrite fresh work; the next
         poll simply tries again."""
         notes_tab = self.notes_checklist_tab.notes_tab
+        before = self.storage.get_household()
+        before_id = before.get("id") if before else None
+        before_tasks = [dict(t) for t in (before or {}).get("tasks", [])]
         if not self.storage.adopt_remote_state(remote, household, rev, keep_notes=notes_tab.is_busy()):
             return
+        self._notify_shared_activity(before_id, before_tasks, household)
         self.checklist_tab.refresh()
         self.progress_tab.refresh()
         self._refresh_level_indicator()
         self.widget_window.refresh_tasks()
         self.shared_tab.refresh()
         notes_tab.maybe_reload_from_remote()
+
+    def _notify_shared_activity(self, before_id, before_tasks, household):
+        """Tells you when another household member added or ticked off a shared
+        item. Only when the list was already cached for this same household
+        (joining one, or signing in fresh, isn't "new activity"), and only if
+        the setting is on (Shared tab)."""
+        if not household or not before_id or household.get("id") != before_id or not self.storage.get_shared_notify():
+            return
+        changes = shared_activity.detect(before_tasks, household.get("tasks", []), self.storage.household_my_name())
+        for title, message in shared_activity.notifications(changes):
+            notifier.send(title, message)
 
     def _check_new_day(self):
         if self.storage.roll_day_if_needed():

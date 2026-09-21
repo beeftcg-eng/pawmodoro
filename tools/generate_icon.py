@@ -5,7 +5,6 @@ print and a pen nib accent, matching the app's pen-and-paper theme.
 Run once at build time; the output PNG is what actually ships with the app.
 Requires Pillow (only needed here, not at app runtime).
 """
-import math
 import os
 from PIL import Image, ImageDraw
 

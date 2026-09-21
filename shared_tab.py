@@ -193,6 +193,12 @@ class SharedTab(QWidget):
         header.addWidget(copy_btn)
         list_layout.addLayout(header)
 
+        self.notify_check = QCheckBox("\U0001F514 Notify me when someone else adds or ticks off an item")
+        self.notify_check.setToolTip("A desktop notification (from the taskbar / system tray) when another member adds or completes a shared item")
+        self.notify_check.setChecked(self.storage.get_shared_notify())
+        self.notify_check.toggled.connect(self.storage.set_shared_notify)
+        list_layout.addWidget(self.notify_check)
+
         self.list_widget = QListWidget()
         self.list_widget.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.list_widget.setDefaultDropAction(Qt.DropAction.MoveAction)

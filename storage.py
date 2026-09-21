@@ -91,6 +91,7 @@ DEFAULT_DATA = {
         "auto_check": True,  # look for a newer release at startup (see update_checker.py); never installs by itself
         "notified_version": None,  # the newest version we've already sent a notification about
     },
+    "shared_notify": True,  # notify when another household member adds or completes a shared item (see shared_activity.py)
     "shared_reminded": {},  # shared task id -> occurrence date its reminder already fired for (local-only)
 }
 
@@ -674,6 +675,13 @@ class Storage:
         after leaving)."""
         self.data["household"] = household
         self._bump_rev()
+        self.save()
+
+    def get_shared_notify(self):
+        return bool(self.data.get("shared_notify", True))
+
+    def set_shared_notify(self, enabled):
+        self.data["shared_notify"] = bool(enabled)
         self.save()
 
     def household_my_name(self):

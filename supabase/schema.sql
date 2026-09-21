@@ -869,7 +869,12 @@ begin
           'id', t.id, 'text', t.text, 'done', t.done, 'done_at', t.done_at,
           'recurrence', t.recurrence, 'weekday', t.weekday, 'month_day', t.month_day,
           'due_date', t.due_date, 'due_time', t.due_time,
-          'done_by_name', (select display_name from household_members where user_id = t.done_by)
+          'done_by_name', (select display_name from household_members where user_id = t.done_by),
+          -- v2.13: who added / ticked an item, so the desktop app can notify you about the
+          -- OTHER members' changes (shared_activity.py). Older clients ignore the extra keys.
+          'created_by_name', (select display_name from household_members where user_id = t.created_by),
+          'created_by_me', coalesce(t.created_by = auth.uid(), false),
+          'done_by_me', coalesce(t.done_by = auth.uid(), false)
         ) order by t.sort_order, t.created_at), '[]'::jsonb)
       from shared_tasks t where t.household_id = h.id
     )

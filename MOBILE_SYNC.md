@@ -53,14 +53,19 @@ way on Android too.
 If you set this up with an older version, do this **once, before** updating
 the desktop app or relying on the phone (and again for **v2.11.0**, which
 adds scheduled shared items — until you re-run it, plain shared items still
-sync, but scheduling or re-ordering one is held in the upload queue):
+sync, but scheduling or re-ordering one is held in the upload queue; and once
+more for **v2.13.0**, which lets the desktop app say *who* added or ticked off
+a shared item in its notifications — without it you still get the
+notifications, just without the person's name, and an item you add from your
+own phone may notify your desktop too):
 
 1. Open your Supabase project → **SQL Editor → New query**.
 2. Paste the *entire* current `supabase/schema.sql` and click **Run**. It's
    safe to re-run: it only adds what's new (a timezone setting, focus-time
    history, the shared household list, one-time-per-period task XP, weekly
-   task resets, and — new in v2.11.0 — scheduled/repeating shared items and
-   re-ordering them) and leaves your data alone.
+   task resets, scheduled/repeating shared items and re-ordering them, and —
+   new in v2.13.0 — who added / ticked each shared item) and leaves your data
+   alone.
 3. Update the desktop app (re-run `install.sh` / `install.bat`). On the
    phone, close the app and reopen it (twice, if it still shows the old
    version — phones cache web apps aggressively).

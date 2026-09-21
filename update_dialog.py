@@ -11,7 +11,7 @@ If anything fails, the reason is shown here and the app carries on unchanged.
 import os
 import shutil
 
-from PyQt6.QtCore import Qt, QThread, QUrl, pyqtSignal
+from PyQt6.QtCore import QThread, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QTextBrowser, QProgressBar, QPushButton

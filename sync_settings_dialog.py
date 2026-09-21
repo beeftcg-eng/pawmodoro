@@ -18,7 +18,6 @@ from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QFormLayout, QLineEdit, QPushButton, QLabel,
     QHBoxLayout, QMessageBox, QCheckBox, QWidget
 )
-from PyQt6.QtCore import Qt
 
 from cloud_defaults import DEFAULT_URL, DEFAULT_ANON_KEY
 from supabase_sync import SupabaseSync, SyncError
