@@ -35,11 +35,31 @@ If someone's just handing you this zip to try (e.g. as a gift/shared app), this 
 
 **If something goes wrong:** run `%LOCALAPPDATA%\Pawmodoro\run_console.bat` instead of the Desktop shortcut — it opens a console window showing any error output (the normal shortcut deliberately hides the console for a cleaner double-click experience, which also means errors are invisible there).
 
-**Updating later:** re-run `install.bat` from a fresh copy of the new zip — it detects and stops any running instance first, then updates in place.
+**Updating later:** from v2.12.0 the app tells you when a newer release exists — a **⬆ Update to vX** button appears in the window header (and you get one notification per version). Click it to see what's new, then **Update now**: it downloads the release, checks its checksum, unpacks it, runs the installer and restarts itself. Nothing installs without that click. *(View menu → **Check for updates…** checks on demand, and **Check for updates automatically** turns the startup check off.)* A copy run straight from a source folder shows the button but can't replace itself — use `git pull` there.
+
+Or by hand: re-run `install.bat` from a fresh copy of the new zip — it detects and stops any running instance first, then updates in place. From PowerShell, one paste does the download and install:
+
+```powershell
+$ProgressPreference = 'SilentlyContinue'   # otherwise Windows PowerShell downloads very slowly
+$r = Invoke-RestMethod 'https://api.github.com/repos/beeftcg-eng/pawmodoro/releases/latest'
+$a = $r.assets | Where-Object { $_.name -like '*-windows.zip' } | Select-Object -First 1
+$zip = Join-Path $env:TEMP $a.name
+Invoke-WebRequest $a.browser_download_url -OutFile $zip
+$dir = Join-Path $env:TEMP 'pawmodoro-update'
+if (Test-Path $dir) { Remove-Item $dir -Recurse -Force }
+Expand-Archive $zip $dir
+powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $dir 'pawmodoro\install.ps1') -Relaunch
+```
 
 **Honest note on this port:** I built and tested this on Linux (no Windows machine available to me), so while the Windows-specific code (paths, process handling, the install script) follows documented, standard patterns and I verified everything I could without a live Windows environment, the install script itself hasn't been run on real Windows. If `install.bat` hits an error, run it once more and copy the exact message back to me — that's usually enough to pinpoint and fix.
 
 ## What changed from the first version
+
+**v2.12.0 — check-and-click updates.** No schema change.
+- **Update button** (`update_checker.py`, `update_dialog.py`, `main.py`): a few seconds after launch, and every six hours while the app sits in the tray, a background thread asks GitHub for the latest release. If it's newer, a **⬆ Update to vX** button appears in the header and one notification is sent per version. Clicking it shows the release notes; **Update now** downloads the release zip (with a progress bar and Cancel), verifies its size and the SHA-256 GitHub lists for it, unpacks it (refusing any unsafe path), runs the installer script detached, and quits so the installer can replace the app and start the new version. Every step after the check is behind that click, and any failure leaves the running version untouched with the reason shown. The check needs only a short GET to `api.github.com` and sends nothing about you but a `Pawmodoro/<version>` user agent.
+- **View menu**: **Check for updates…** and a **Check for updates automatically** switch (saved in `data.json`). `PAWMODORO_DISABLE_UPDATE_CHECK=1` disables the whole thing.
+- **Installers**: `install.ps1 -Relaunch` and `install.sh --relaunch` restart Pawmodoro when they finish (used by the button; running them by hand is unchanged). A copy run from a source folder gets the button but can't replace itself.
+- **Honest testing note**: the update logic was tested against the real GitHub API (the real release's checksum is read and used) and a local download server (checksum mismatch, truncation, cancel, zip-slip and not-a-zip all refused with nothing left behind); the whole click flow was driven in the real `MainWindow` headless (found → button → notify once → dialog → download → unpack → installer launched → app told to quit, plus the failure and cancel paths); and the real `install.sh --relaunch` was run in a throwaway `HOME` and did install 2.12.0 and bring the app back up. **Not exercised: the Windows side** — `install.ps1 -Relaunch` was only parsed (no errors, parameter recognised) and the PowerShell wrapper that runs it was checked with stub scripts under PowerShell on Linux, but nothing ran on a real Windows machine. Also not run: an update over your real install, or the notification popup appearing.
 
 **v2.11.0 — schedule and re-order the shared list.** *(Needs a one-time re-run of `supabase/schema.sql` — see MOBILE_SYNC.md.)*
 - **Re-order**: drag items on the desktop Shared tab (▲▼ on the phone); the order syncs to everyone in the household.

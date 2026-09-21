@@ -87,6 +87,10 @@ DEFAULT_DATA = {
     },
     "sync_outbox": [],  # changes waiting to be uploaded, oldest first (see sync_engine.py)
     "household": None,  # cached shared-list state: {id, invite_code, members, tasks} (see schema.sql)
+    "updates": {
+        "auto_check": True,  # look for a newer release at startup (see update_checker.py); never installs by itself
+        "notified_version": None,  # the newest version we've already sent a notification about
+    },
     "shared_reminded": {},  # shared task id -> occurrence date its reminder already fired for (local-only)
 }
 
@@ -645,6 +649,21 @@ class Storage:
                 for key in totals:
                     totals[key] += row.get(key, 0)
         return totals
+
+    # ---------- Updates (see update_checker.py) ----------
+    def get_update_auto_check(self):
+        return bool(self.data.get("updates", {}).get("auto_check", True))
+
+    def set_update_auto_check(self, enabled):
+        self.data.setdefault("updates", {})["auto_check"] = bool(enabled)
+        self.save()
+
+    def get_update_notified(self):
+        return self.data.get("updates", {}).get("notified_version")
+
+    def set_update_notified(self, version):
+        self.data.setdefault("updates", {})["notified_version"] = version
+        self.save()
 
     # ---------- Household (shared list; see schema.sql) ----------
     def get_household(self):

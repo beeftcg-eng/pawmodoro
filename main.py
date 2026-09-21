@@ -8,6 +8,7 @@ Run: python3 main.py
 """
 import os
 import sys
+import threading
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QSystemTrayIcon, QMenu, QMessageBox,
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel
@@ -29,6 +30,8 @@ from toast import CelebrationToast
 from sync_settings_dialog import SyncSettingsDialog
 import notifier
 import theme
+import update_checker
+from update_dialog import UpdateDialog
 import gamification
 from version import VERSION
 
@@ -41,12 +44,20 @@ ICON_PATH = os.path.join(os.path.dirname(__file__), "resources", "icon.png")
 # (two processes fighting over the same data.json, two tray icons, etc).
 SINGLE_INSTANCE_KEY = "Pawmodoro-instance-lock"
 
+# "Check and click" updates (update_checker.py): look shortly after launch, then
+# every few hours -- the app can sit in the tray for days.
+UPDATE_FIRST_CHECK_MS = 10_000
+UPDATE_RECHECK_MS = 6 * 60 * 60 * 1000
+UPDATE_CLEANUP_MS = 60_000
+
 
 class MainWindow(QMainWindow):
     # Carries a cloud pull (remote state, household, local revision) from the
     # sync thread to the UI thread; Qt queues the delivery, so the slot always
     # runs on the main thread. See sync_engine.py.
     remote_pulled = pyqtSignal(object, object, int)
+    # (release or None, error text or None, was it a manual check) from the update-check thread.
+    update_checked = pyqtSignal(object, object, bool)
 
     def __init__(self):
         super().__init__()
@@ -89,6 +100,12 @@ class MainWindow(QMainWindow):
         self.level_indicator = QLabel("")
         header_layout.addWidget(self.level_indicator)
         header_layout.addStretch()
+        # Only shown when a newer release exists; clicking it opens the update dialog.
+        self.update_btn = QPushButton("⬆ Update")
+        self.update_btn.setStyleSheet("font-weight: bold;")
+        self.update_btn.setVisible(False)
+        self.update_btn.clicked.connect(self._open_update_dialog)
+        header_layout.addWidget(self.update_btn)
         self.sync_btn = QPushButton("☁️ Sync")
         self.sync_btn.clicked.connect(self._open_sync_settings)
         header_layout.addWidget(self.sync_btn)
@@ -156,6 +173,11 @@ class MainWindow(QMainWindow):
         self.sync_status_timer.start(2000)
         self._refresh_sync_status()
 
+        self._available_update = None
+        self._update_check_running = False
+        self.update_checked.connect(self._on_update_checked)
+        self._schedule_update_checks()
+
         state = self.storage.get_window_state()
         if state.get("widget_mode"):
             self._enter_widget_mode(restore_position=True)
@@ -220,6 +242,61 @@ class MainWindow(QMainWindow):
         self.widget_window.refresh_tasks()
         self._refresh_sync_status()
 
+    # ---------- Updates (see update_checker.py) ----------
+    def _schedule_update_checks(self):
+        # PAWMODORO_DISABLE_UPDATE_CHECK: for packagers and tests; the menu switch is for people.
+        if os.environ.get("PAWMODORO_DISABLE_UPDATE_CHECK"):
+            return
+        self._update_timer = QTimer(self)
+        self._update_timer.timeout.connect(self._check_for_update)
+        self._update_timer.start(UPDATE_RECHECK_MS)
+        QTimer.singleShot(UPDATE_FIRST_CHECK_MS, self._check_for_update)
+        QTimer.singleShot(UPDATE_CLEANUP_MS, lambda: threading.Thread(target=update_checker.cleanup_stale_files, daemon=True).start())
+
+    def _check_for_update(self, manual=False):
+        """Asks GitHub for a newer release on a background thread (never blocks the UI); the answer
+        comes back through `update_checked`. A manual check ignores the automatic-check switch."""
+        if self._update_check_running or (not manual and not self.storage.get_update_auto_check()):
+            return
+        self._update_check_running = True
+
+        def work():
+            try:
+                release, error = update_checker.fetch_latest(), None
+            except update_checker.UpdateError as e:
+                release, error = None, str(e)
+            except Exception as e:  # nothing here may ever take the app down
+                release, error = None, f"unexpected error ({e})"
+            self.update_checked.emit(release, error, bool(manual))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_update_checked(self, release, error, manual):
+        self._update_check_running = False
+        if error:
+            if manual:
+                QMessageBox.warning(self, "Check for updates", f"Couldn't check for updates: {error}.")
+            return
+        self._available_update = release
+        self.update_btn.setVisible(release is not None)
+        if release is None:
+            if manual:
+                QMessageBox.information(self, "Check for updates", f"You're up to date (Pawmodoro v{VERSION}).")
+            return
+        self.update_btn.setText(f"⬆ Update to v{release.version}")
+        if self.storage.get_update_notified() != release.version:
+            self.storage.set_update_notified(release.version)  # once per version, not every six hours
+            notifier.send("Pawmodoro update available", f"Version {release.version} is ready. Click ⬆ Update in the window header to install it.")
+        if manual:
+            self._open_update_dialog()
+
+    def _open_update_dialog(self):
+        if self._available_update is None:
+            return
+        dialog = UpdateDialog(self._available_update, update_checker.is_installed_copy(), self)
+        dialog.install_started.connect(self.close_app)  # the installer is running: get out of its way
+        dialog.exec()
+
     def _check_reminders(self):
         for task in self.storage.check_due_reminders():
             notifier.send("Task reminder", task["text"])
@@ -242,6 +319,14 @@ class MainWindow(QMainWindow):
         sync_action = QAction("Cloud Sync…", self)
         sync_action.triggered.connect(self._open_sync_settings)
         menu.addAction(sync_action)
+
+        update_action = QAction("Check for updates…", self)
+        update_action.triggered.connect(lambda: self._check_for_update(manual=True))
+        menu.addAction(update_action)
+        auto_update_action = QAction("Check for updates automatically", self, checkable=True)
+        auto_update_action.setChecked(self.storage.get_update_auto_check())
+        auto_update_action.toggled.connect(self.storage.set_update_auto_check)
+        menu.addAction(auto_update_action)
 
         quit_action = QAction("Quit", self)
         quit_action.triggered.connect(self.close_app)

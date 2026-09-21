@@ -1,6 +1,11 @@
 # install.ps1 - Sets up Pawmodoro on Windows: creates a private virtual
 # environment under %LOCALAPPDATA%\Pawmodoro, installs dependencies, and
 # adds a Desktop shortcut. Safe to re-run to update to a newer version.
+#
+# -Relaunch: start Pawmodoro again once the install is done. Used by the app's
+# own "Update" button (update_checker.py), which quits, runs this, and expects
+# the new version to come back up by itself.
+param([switch]$Relaunch)
 
 $ErrorActionPreference = "Stop"
 $SrcDir = $PSScriptRoot
@@ -148,4 +153,10 @@ if (-not (Get-Command ffplay -ErrorAction SilentlyContinue)) {
     Write-Host "via a fallback audio backend, but for the smoothest/gapless looping"
     Write-Host "and support for non-WAV custom sound files, install ffmpeg:"
     Write-Host "  winget install ffmpeg"
+}
+
+if ($Relaunch) {
+    Write-Host ""
+    Write-Host "Restarting Pawmodoro..."
+    Start-Process -FilePath $AppExe -WorkingDirectory $InstallDir
 }

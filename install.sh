@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Installs Pawmodoro into ~/.local/share/pawmodoro-app using a Python venv.
+# With --relaunch it starts Pawmodoro again when done (used by the app's own
+# "Update" button, see update_checker.py).
 # Safe on Bazzite/immutable systems: never touches system packages, no
 # rpm-ostree layering required.
 set -euo pipefail
@@ -70,3 +72,9 @@ fi
 echo ""
 echo "Optional: to autostart it on login, run:"
 echo "  mkdir -p ~/.config/autostart && cp $DESKTOP_DIR/pawmodoro.desktop ~/.config/autostart/"
+
+if [ "${1:-}" = "--relaunch" ]; then
+    echo ""
+    echo "Restarting Pawmodoro..."
+    nohup "$INSTALL_DIR/run.sh" > /dev/null 2>&1 &
+fi
