@@ -13,6 +13,18 @@ from PyQt6.QtGui import QFont
 SERIF_FALLBACKS = ["Noto Serif", "DejaVu Serif", "Liberation Serif", "Georgia", "serif"]
 MONO_FALLBACKS = ["JetBrains Mono", "Fira Code", "Cascadia Code", "DejaVu Sans Mono", "Liberation Mono", "Consolas", "monospace"]
 
+# Fonts to draw emoji with, tried after the text font and before the generic family. On Linux, Qt's own
+# fallback picks "Noto Color Emoji", and where that is the newer COLRv1 build (Fedora 44, for one) Qt can't draw it,
+# so 🏆 🏠 ☁️ and friends came out as blank gaps in tabs and buttons. Twemoji (COLRv0) draws everywhere Qt does, so it is
+# tried first. A family that isn't installed (Windows, macOS: they have their own emoji fonts that Qt already
+# finds) is skipped, so this changes nothing there.
+EMOJI_FALLBACKS = ["Twemoji"]
+
+
+def _with_emoji(stack):
+    """`stack` with the emoji fonts slipped in before its final generic family ("serif" / "monospace")."""
+    return stack[:-1] + EMOJI_FALLBACKS + stack[-1:]
+
 # Each palette: PAPER (main bg), PAPER_LIGHT (card/input bg), PAPER_EDGE
 # (borders), INK (main text), INK_SOFT (secondary text), ACCENT (highlight),
 # ACCENT_SOFT (hover/selection tint), FONT ("serif" or "mono" - picks which
@@ -86,11 +98,11 @@ def set_current(name):
 def font_family_stack():
     """The font fallback list for the current theme (mono for the gamer
     themes, serif for the pen-and-paper ones)."""
-    return MONO_FALLBACKS if current().get("FONT") == "mono" else SERIF_FALLBACKS
+    return _with_emoji(MONO_FALLBACKS if current().get("FONT") == "mono" else SERIF_FALLBACKS)
 
 
 def _css_font_family(font_key):
-    stack = MONO_FALLBACKS if font_key == "mono" else SERIF_FALLBACKS
+    stack = _with_emoji(MONO_FALLBACKS if font_key == "mono" else SERIF_FALLBACKS)
     return ", ".join(f if f in ("serif", "monospace") else f'"{f}"' for f in stack)
 
 

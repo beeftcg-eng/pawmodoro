@@ -33,6 +33,7 @@ import shared_activity
 import theme
 import update_checker
 from update_dialog import UpdateDialog
+from mobile_app_dialog import MobileAppDialog
 import gamification
 from version import VERSION
 
@@ -107,6 +108,10 @@ class MainWindow(QMainWindow):
         self.update_btn.setVisible(False)
         self.update_btn.clicked.connect(self._open_update_dialog)
         header_layout.addWidget(self.update_btn)
+        self.mobile_btn = QPushButton("\U0001F4F1 Get the mobile app")
+        self.mobile_btn.setToolTip("Put Pawmodoro on your phone")
+        self.mobile_btn.clicked.connect(self._open_mobile_app_dialog)
+        header_layout.addWidget(self.mobile_btn)
         self.sync_btn = QPushButton("☁️ Sync")
         self.sync_btn.clicked.connect(self._open_sync_settings)
         header_layout.addWidget(self.sync_btn)
@@ -306,6 +311,9 @@ class MainWindow(QMainWindow):
         if manual:
             self._open_update_dialog()
 
+    def _open_mobile_app_dialog(self):
+        MobileAppDialog(self).exec()
+
     def _open_update_dialog(self):
         if self._available_update is None:
             return
@@ -335,6 +343,10 @@ class MainWindow(QMainWindow):
         sync_action = QAction("Cloud Sync…", self)
         sync_action.triggered.connect(self._open_sync_settings)
         menu.addAction(sync_action)
+
+        mobile_action = QAction("Get the mobile app…", self)
+        mobile_action.triggered.connect(self._open_mobile_app_dialog)
+        menu.addAction(mobile_action)
 
         update_action = QAction("Check for updates…", self)
         update_action.triggered.connect(lambda: self._check_for_update(manual=True))
