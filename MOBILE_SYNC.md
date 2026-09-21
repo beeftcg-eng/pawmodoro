@@ -10,8 +10,9 @@ phone and desktop) — see Step 2 if that's ever useful, but the setup below
 defaults to keeping each person's data theirs alone.
 
 **Phone app, live right now:** https://beeftcg-eng.github.io/pawmodoro/
-(nothing will work on it until step 1 below is done and the Supabase
-details are entered into it once)
+(it, the desktop app and Deckbuilder all connect to the shared Pawmodoro
+project automatically — friends just create an account with an email and
+password. Step 1 below is only for running **your own** Supabase project.)
 
 ---
 
@@ -85,10 +86,20 @@ totals on the Progress tab.
 A household holds up to 4 people; **Leave household** removes just you (the
 last person out deletes the list).
 
-## Lock down sign-ups once you're both in
+## Sharing the app with friends — and locking sign-ups later
 
-The "Create account" button works for anyone who has the project URL and
-anon key. Once you and your partner have your accounts: Supabase dashboard →
+The desktop app, phone app and Deckbuilder ship with this project's URL and
+anon key built in (`cloud_defaults.py`, `docs/app.js`, Deckbuilder's
+`src/shared/pawmodoroDefaults.ts`), so a friend only has to press **Create
+account** with their own email and password. That key is *meant* to be
+public — it can only do what the row-level security in `schema.sql` allows,
+and every account's data stays private to it — but it does mean **anyone who
+gets a copy of the app can sign up**. For this to work, keep **Authentication
+→ Providers → Email → "Confirm email"** turned **off** (otherwise each
+friend has to click an emailed link first, and Supabase's built-in mailer is
+heavily rate-limited), and **"Allow new users to sign up"** turned **on**.
+
+If you'd rather stop new accounts (say, once everyone you wanted is in): Supabase dashboard →
 **Authentication → Sign In / Providers** → turn **off** "Allow new users to
 sign up". Existing logins keep working.
 
@@ -122,9 +133,9 @@ a browser reset, etc.).
 
 If you want your *own* desktop notes/checklist/progress backed up too
 (e.g. to later add a second device of your own), click the **☁️ Sync**
-button next to Theme in the header of the desktop app, paste in the
-Project URL + anon key from Step 1, and create an account with your own
-email.
+button next to Theme in the header of the desktop app and create an
+account with your own email. (It's already pointed at the shared project;
+tick **Use a different Supabase project** only if you run your own.)
 
 ---
 
@@ -132,9 +143,8 @@ email.
 
 1. On the phone, open Safari (or Chrome on Android) and go to:
    **https://beeftcg-eng.github.io/pawmodoro/**
-2. The first time, it'll ask for the **Project URL** and **anon key** — same
-   two values from Step 1 (this is the shared *project*, not a shared
-   account). Saved on that phone only, once.
+2. It connects to the shared project by itself (a small **Use a different
+   Supabase project** link on the login screen is there if you run your own).
 3. Tap **"First time — create account"** and pick a personal email +
    password — this is what keeps that account's data private to it.
 4. Tap the **Share** icon (square with an arrow) → **Add to Home Screen** →

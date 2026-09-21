@@ -70,14 +70,26 @@ const renderKeys = {};         // per tab: what the last render was built from, 
 
 const QUEST_ICONS = { pomodoros: "\u{1F43E}", tasks: "✅", breaks: "☕", clear_checklist: "\u{1F9F9}" };
 
-// ---------- Setup (Supabase URL + anon key, entered once) ----------
+// ---------- Setup (which Supabase project to talk to) ----------
+
+// The shared Pawmodoro project, used unless someone opted into their own via
+// "Use a different Supabase project". The anon key is meant to ship in client
+// code (it's the `anon` role; row-level security in supabase/schema.sql is
+// what protects data) — never put a service_role key here. Keep in sync with
+// cloud_defaults.py and Deckbuilder's src/shared/pawmodoroDefaults.ts.
+const DEFAULT_CONFIG = {
+  url: "https://cinxclbsgamdprftcbek.supabase.co",
+  anonKey: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNpbnhjbGJzZ2FtZHByZnRjYmVrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODk1NTc4OTIsImV4cCI6MjEwNTEzMzg5Mn0.1hpyBV2ZO3MeQUSnx3K5-XG6BbzY-gXb-4uG6Ls7Fr0",
+};
 
 function getConfig() {
   try {
-    return JSON.parse(localStorage.getItem(CONFIG_KEY) || "null");
+    const saved = JSON.parse(localStorage.getItem(CONFIG_KEY) || "null");
+    if (saved && saved.url && saved.anonKey) return saved;
   } catch {
-    return null;
+    // fall through to the shared project
   }
+  return DEFAULT_CONFIG;
 }
 
 function saveConfig(url, anonKey) {
@@ -168,14 +180,20 @@ function initSupabase(cfg) {
 function showSetupScreen() {
   document.getElementById("app").innerHTML = `
     <div class="centered-card">
-      <h1>\u{1F43E} Pawmodoro setup</h1>
-      <p class="hint">One-time setup: paste the Project URL and anon public key from your
-      Supabase project (Project Settings &rarr; API).</p>
+      <h1>\u{1F43E} Use a different project</h1>
+      <p class="hint">Only needed if you run your own Supabase project: paste its Project URL and
+      anon public key (Project Settings &rarr; API).</p>
       <input id="setup-url" type="text" placeholder="https://xxxx.supabase.co" autocapitalize="off" autocorrect="off">
       <input id="setup-key" type="text" placeholder="anon public key" autocapitalize="off" autocorrect="off">
       <button id="setup-save">Save &amp; continue</button>
+      <button id="setup-default" class="secondary">Use the shared Pawmodoro project</button>
       <p id="setup-error" class="error"></p>
     </div>`;
+  document.getElementById("setup-default").addEventListener("click", () => {
+    localStorage.removeItem(CONFIG_KEY);
+    initSupabase(DEFAULT_CONFIG);
+    showLoginScreen();
+  });
   document.getElementById("setup-save").addEventListener("click", () => {
     const url = document.getElementById("setup-url").value.trim();
     const key = document.getElementById("setup-key").value.trim();
@@ -200,8 +218,13 @@ function showLoginScreen() {
       <button id="login-btn">Log in</button>
       <button id="signup-btn" class="secondary">First time — create account</button>
       <p id="login-error" class="error"></p>
+      <p class="hint"><a href="#" id="custom-project-link">Use a different Supabase project</a></p>
     </div>`;
 
+  document.getElementById("custom-project-link").addEventListener("click", (e) => {
+    e.preventDefault();
+    showSetupScreen();
+  });
   document.getElementById("login-btn").addEventListener("click", () => doAuth("login"));
   document.getElementById("signup-btn").addEventListener("click", () => doAuth("signup"));
 }

@@ -41,6 +41,10 @@ If someone's just handing you this zip to try (e.g. as a gift/shared app), this 
 
 ## What changed from the first version
 
+**v2.10.0 — connects to the shared project by itself.** No schema change.
+- **Zero-setup sync**: the desktop app, the phone app and Deckbuilder now come with the shared Pawmodoro Supabase project's URL and anon key built in (`cloud_defaults.py`, `docs/app.js`), so a friend only enters an email and password (**Create account** the first time). The project fields are tucked behind **Use a different Supabase project** for anyone running their own, and an install that already saved its own project keeps it.
+- **Honest testing note**: the desktop dialog was exercised headless, and the built-in URL/key were confirmed to be accepted by the live project (a deliberately wrong login gets a normal "Invalid login credentials"). Not exercised: creating a brand-new account through each app, and the phone app in a real browser.
+
 **v2.9.0 — sync you can trust, plus a shared list.** *(Needs a one-time re-run of `supabase/schema.sql` — see MOBILE_SYNC.md.)*
 - **Offline-safe sync** (`sync_engine.py`, `storage.py`): edits apply locally at once and go into a persistent upload queue instead of blocking on the network. Previously an edit made while offline was silently overwritten by the next cloud pull, and every autosave/checkbox click could freeze the window for seconds on a bad connection. A stale pull is now refused rather than applied over fresh work, phone edits never overwrite text you're typing, and the checklist no longer rebuilds itself every 5 seconds (which used to drop your selection).
 - **Days roll over at *your* midnight** — daily tasks, quests and streaks now reset while the app sits in the tray (they only reset at launch before), and the cloud uses your local day instead of UTC (which reset everything at 6pm for a UTC-6 timezone).

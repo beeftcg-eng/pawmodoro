@@ -3,6 +3,11 @@ sync_settings_dialog.py - "Cloud Sync" settings dialog: lets you point the
 desktop app at a Supabase project and log in, so notes/checklist/XP/quests
 stay in sync with the phone web app. Reachable from View -> Cloud Sync...
 
+The shared project from cloud_defaults.py is used unless the person opts
+into "Use a different Supabase project", so friends only enter an email
+and password. A config already saved for some other project is kept and
+shown as-is.
+
 First connect policy (see _reconcile): if the cloud side is empty, this
 desktop's current local progress is uploaded to seed it. If the cloud side
 already has data, it's pulled down and replaces the local copy (the cloud
@@ -11,10 +16,11 @@ a one-time thing at connect time, not a repeated merge.
 """
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QFormLayout, QLineEdit, QPushButton, QLabel,
-    QHBoxLayout, QMessageBox
+    QHBoxLayout, QMessageBox, QCheckBox, QWidget
 )
 from PyQt6.QtCore import Qt
 
+from cloud_defaults import DEFAULT_URL, DEFAULT_ANON_KEY
 from supabase_sync import SupabaseSync, SyncError
 
 
@@ -29,17 +35,17 @@ class SyncSettingsDialog(QDialog):
 
         intro = QLabel(
             "Sync notes, checklist, shared list, and quest/XP progress with the phone web app.\n"
-            "Get the URL and anon key from your Supabase project's\n"
-            "Project Settings → API page."
+            "New here? Enter an email and password and press “Create account”. "
+            "Already have one (on your phone, say)? Use the same details and press “Log in”."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
         form = QFormLayout()
         cfg = self.storage.get_sync_config()
-        self.url_edit = QLineEdit(cfg.get("url", ""))
+        self.url_edit = QLineEdit(cfg.get("url") or DEFAULT_URL)
         self.url_edit.setPlaceholderText("https://xxxx.supabase.co")
-        self.key_edit = QLineEdit(cfg.get("anon_key", ""))
+        self.key_edit = QLineEdit(cfg.get("anon_key") or DEFAULT_ANON_KEY)
         self.key_edit.setPlaceholderText("anon public key")
         self.email_edit = QLineEdit(cfg.get("email", ""))
         self.email_edit.setPlaceholderText("you@example.com")
@@ -49,11 +55,24 @@ class SyncSettingsDialog(QDialog):
             "(already saved)" if cfg.get("enabled") else "password"
         )
 
-        form.addRow("Project URL:", self.url_edit)
-        form.addRow("Anon key:", self.key_edit)
         form.addRow("Email:", self.email_edit)
         form.addRow("Password:", self.password_edit)
         layout.addLayout(form)
+
+        # The project fields are tucked away unless this install already
+        # points somewhere other than the shared project.
+        custom = (self.url_edit.text(), self.key_edit.text()) != (DEFAULT_URL, DEFAULT_ANON_KEY)
+        self.custom_check = QCheckBox("Use a different Supabase project")
+        self.custom_check.setChecked(custom)
+        layout.addWidget(self.custom_check)
+        self.project_box = QWidget()
+        project_form = QFormLayout(self.project_box)
+        project_form.setContentsMargins(0, 0, 0, 0)
+        project_form.addRow("Project URL:", self.url_edit)
+        project_form.addRow("Anon key:", self.key_edit)
+        self.project_box.setVisible(custom)
+        self.custom_check.toggled.connect(self._toggle_custom)
+        layout.addWidget(self.project_box)
 
         engine = self.storage.sync
         self.status_label = QLabel(
@@ -81,13 +100,20 @@ class SyncSettingsDialog(QDialog):
         close_btn.clicked.connect(self.accept)
         layout.addWidget(close_btn)
 
+    def _toggle_custom(self, on):
+        self.project_box.setVisible(on)
+        if not on:
+            self.url_edit.setText(DEFAULT_URL)
+            self.key_edit.setText(DEFAULT_ANON_KEY)
+        self.adjustSize()
+
     def _connect(self, sign_up):
         url = self.url_edit.text().strip()
         anon_key = self.key_edit.text().strip()
         email = self.email_edit.text().strip()
         password = self.password_edit.text()
         if not url or not anon_key or not email or not password:
-            self.status_label.setText("All four fields are required.")
+            self.status_label.setText("Email and password are required (plus the URL and key, for a custom project).")
             return
 
         client = SupabaseSync(url, anon_key)

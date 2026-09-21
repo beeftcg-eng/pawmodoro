@@ -73,6 +73,21 @@ Platform differences are isolated behind small dedicated modules rather than sca
 - `chime.py` — phase-end chime, synthesized to a WAV in the app data dir on first use (stdlib only), played via the same CLI player as ambient sounds (or `winsound` on Windows).
 - `mpris.py` (Linux, via `playerctl`) / `smtc_windows.py` (Windows, via System Media Transport Controls) — external media player control for the player bar, both feeding the same `PlayerBar`/`WidgetWindow` UI.
 
+### Shared Supabase project defaults
+
+The shared project's URL + anon key are baked in so friends only enter email/password: `cloud_defaults.py` (desktop, used by `sync_settings_dialog.py`), `DEFAULT_CONFIG` in `docs/app.js` (PWA), and `src/shared/pawmodoroDefaults.ts` in the separate Deckbuilder repo (`~/Desktop/deckbuilder`, Electron/TS; its Pawmodoro sync lives in `electron/ipc/pawmodoro.ts` + `WishlistPanel.tsx`). Keep the three copies identical. The key must stay the `anon` role (decode the JWT's `role` claim to check) — never a `service_role` key. The project needs "Allow new users to sign up" on and "Confirm email" off for friends to self-register.
+
+### Persistence details worth knowing
+
+- `Storage._load` deep-merges the file on disk over `DEFAULT_DATA` (`_deep_merge`), so a new setting only needs a default added to `DEFAULT_DATA` — old `data.json` files pick it up without a migration. Read new keys with `.get`/`setdefault` against that default rather than assuming they exist.
+- A dated copy of `data.json` is kept daily in `backups/` next to it; a corrupt file is restored from the newest backup automatically (`_load_newest_backup`).
+
+### Release / deploy conventions
+
+- App version is the single `VERSION` string in `version.py` (shown in the window title). The README's "What changed" section is the changelog — add a new entry at the top of it for user-visible changes, including an "honest testing note" for anything that couldn't be exercised live.
+- The PWA in `docs/` is cached by `docs/sw.js`. When you change `docs/app.js`, `style.css` or `index.html`, bump **both** the `CACHE` name and the `?v=N` query strings in `SHELL` (and the matching `?v=` references in `index.html`), or installed phones keep serving the old shell.
+- `.github/workflows/keep-supabase-awake.yml` pings Supabase every two days so the free-tier project doesn't auto-pause; it needs the `SUPABASE_URL` / `SUPABASE_ANON_KEY` repo secrets. `MOBILE_SYNC.md` is the user-facing setup/upgrade guide for sync — update it when a schema change requires users to re-run `schema.sql`.
+
 ### Windows packaging
 
 `windows_launcher/` contains a small C launcher (`launcher.c`, built via `build.sh`) that produces `Pawmodoro.exe` — used so the Windows Desktop shortcut can launch without a visible console window, distinct from `install.ps1`/`install.bat` which set up the actual Python venv.
