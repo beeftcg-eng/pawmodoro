@@ -8,9 +8,11 @@ widget without needing a full KDE Plasmoid/QML package. It behaves the
 way KDE "Keep above others" + "Skip taskbar" windows do.
 """
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QLabel, QPushButton, QHBoxLayout, QFrame, QSizeGrip
+    QWidget, QVBoxLayout, QLabel, QPushButton, QHBoxLayout, QFrame, QSizeGrip,
+    QScrollArea, QCheckBox
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QSize
+from PyQt6.QtGui import QGuiApplication
 
 import platform
 import theme
@@ -20,6 +22,7 @@ else:
     import mpris
 import player_icons
 import gamification
+import quotes
 from circular_timer import CircularTimer
 
 ICON_SIZE = 16
@@ -32,12 +35,17 @@ GEOMETRY_SAVE_DELAY_MS = 300
 
 class WidgetWindow(QWidget):
     restore_requested = pyqtSignal()
+    # something worth celebrating happened from ticking a task here (title, detail)
+    celebrate = pyqtSignal(str, str)
+    # a task was ticked here, so the main window's checklist should refresh
+    task_toggled = pyqtSignal()
     _spotify_status_ready = pyqtSignal(object, object)
 
     def __init__(self, storage, parent=None):
         super().__init__(parent)
         self.storage = storage
         self._drag_pos = None
+        self._task_signature = None
 
         # Created up front: setMinimumSize()/layout below can trigger a
         # resizeEvent before the rest of __init__ runs, and that handler
@@ -77,9 +85,20 @@ class WidgetWindow(QWidget):
         frame_layout.addWidget(self.circular_timer, alignment=Qt.AlignmentFlag.AlignHCenter)
 
         frame_layout.addWidget(QLabel("Today:"))
-        self.tasks_label = QLabel("")
-        self.tasks_label.setWordWrap(True)
-        frame_layout.addWidget(self.tasks_label)
+        # Tick tasks off right here without opening the main window.
+        self.tasks_scroll = QScrollArea()
+        self.tasks_scroll.setObjectName("widget_tasks_scroll")
+        self.tasks_scroll.setWidgetResizable(True)
+        self.tasks_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.tasks_scroll.setMinimumHeight(50)
+        self.tasks_container = QWidget()
+        self.tasks_container.setObjectName("widget_tasks_container")
+        self.tasks_layout = QVBoxLayout(self.tasks_container)
+        self.tasks_layout.setContentsMargins(0, 0, 0, 0)
+        self.tasks_layout.setSpacing(2)
+        self.tasks_layout.addStretch()
+        self.tasks_scroll.setWidget(self.tasks_container)
+        frame_layout.addWidget(self.tasks_scroll, 1)
 
         # --- Compact music controls, so they're always at hand ---
         player_row = QHBoxLayout()
@@ -143,6 +162,12 @@ class WidgetWindow(QWidget):
             f"QFrame {{ background-color: {p['PAPER_LIGHT']}; border: 1px solid {p['PAPER_EDGE']};"
             f" border-radius: 10px; }}"
             f"QLabel {{ color: {p['INK']}; }}"
+            f"QCheckBox {{ color: {p['INK']}; background: transparent; spacing: 6px; }}"
+            f"QCheckBox::indicator {{ width: 13px; height: 13px; border: 1px solid {p['INK_SOFT']};"
+            f" border-radius: 3px; background: {p['PAPER']}; }}"
+            f"QCheckBox::indicator:checked {{ background: {p['ACCENT']}; border-color: {p['ACCENT']}; }}"
+            f"QScrollArea#widget_tasks_scroll {{ border: none; background: transparent; }}"
+            f"QWidget#widget_tasks_container {{ background: transparent; }}"
             f"QLabel#mini_track_label {{ color: {p['INK_SOFT']}; font-size: 10px; }}"
         )
         self.title_label.setFont(theme.serif_font(11, bold=True))
@@ -161,13 +186,47 @@ class WidgetWindow(QWidget):
     def refresh_tasks(self):
         storage = self.storage
         pending = [t for t in storage.get_checklist() if not t.get("completed_today")]
-        if not pending:
-            self.tasks_label.setText("\u2705 All done for today")
-        else:
-            self.tasks_label.setText("\n".join(f"\u2022 {t['text']}" for t in pending))
 
         level, _, _ = gamification.level_from_xp(storage.get_gamification()["xp"])
         self.title_label.setText(f"\U0001F43E Pawmodoro \u2014 Lv.{level}")
+
+        # Called often (every cloud poll, every celebration); only rebuild
+        # the checkbox list when the pending tasks actually changed.
+        signature = [(t["id"], t["text"]) for t in pending]
+        if signature == self._task_signature:
+            return
+        self._task_signature = signature
+
+        while self.tasks_layout.count():
+            item = self.tasks_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()  # safe even if we're inside this widget's own signal
+        if not pending:
+            self.tasks_layout.addWidget(QLabel("\u2705 All done for today"))
+        for task in pending:
+            box = QCheckBox(task["text"])
+            box.toggled.connect(lambda checked, tid=task["id"], text=task["text"]: self._on_task_toggled(tid, text, checked))
+            self.tasks_layout.addWidget(box)
+        self.tasks_layout.addStretch()
+
+    def _on_task_toggled(self, task_id, text, checked):
+        result = self.storage.set_task_done(task_id, checked)
+        if checked and "xp_gained" in result:
+            detail = f"{text}  \u2022  +{result['xp_gained']} XP"
+            if result["new_level"] > result["old_level"]:
+                detail += f"  \u2022 Level up! Now level {result['new_level']}"
+            self.celebrate.emit(f"\u2705 {quotes.random_task_congrats()}", detail)
+            for quest in result.get("completed_quests", []):
+                self.celebrate.emit("\U0001F31F Quest complete!", f"{quest['desc']}  \u2022 +{quest['bonus_xp']} XP")
+        # Let the tick land visibly, then drop it from the list and tell the
+        # main window's checklist to catch up.
+        QTimer.singleShot(250, self._after_task_toggled)
+
+    def _after_task_toggled(self):
+        self.refresh_tasks()
+        self.task_toggled.emit()
 
     def update_pomodoro(self, time_text, phase_text, fraction, phase_key):
         p = theme.current()
@@ -233,6 +292,13 @@ class WidgetWindow(QWidget):
     # --- make the frameless window draggable ---
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            # Ask the window system to run the move: the only way that works
+            # on Wayland (where an app can't position its own windows), and
+            # fine on X11/Windows too. Fall back to a manual drag if refused.
+            handle = self.windowHandle()
+            if handle is not None and handle.startSystemMove():
+                self._drag_pos = None
+                return
             self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
 
     def mouseMoveEvent(self, event):
@@ -243,6 +309,11 @@ class WidgetWindow(QWidget):
         self._drag_pos = None
         self._save_geometry()
 
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        # A system-driven move doesn't deliver a mouse release to us.
+        self._geometry_save_timer.start(GEOMETRY_SAVE_DELAY_MS)
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         # Debounced: an interactive drag on the size grip fires this
@@ -250,10 +321,13 @@ class WidgetWindow(QWidget):
         self._geometry_save_timer.start(GEOMETRY_SAVE_DELAY_MS)
 
     def _save_geometry(self):
-        pos = self.pos()
         state = self.storage.get_window_state()
-        state["widget_x"] = pos.x()
-        state["widget_y"] = pos.y()
+        # Wayland doesn't tell (or let) an app know/set its position, so
+        # only remember it where it's real.
+        if QGuiApplication.platformName() != "wayland":
+            pos = self.pos()
+            state["widget_x"] = pos.x()
+            state["widget_y"] = pos.y()
         state["widget_w"] = self.width()
         state["widget_h"] = self.height()
         self.storage.set_window_state(state)

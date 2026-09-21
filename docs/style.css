@@ -189,6 +189,7 @@ html, body {
 .task-item.done span { color: var(--ink-soft); text-decoration: line-through; }
 .task-item em { font-style: normal; color: var(--ink-soft); font-size: 12px; }
 .remove-btn { background: none; border: none; color: var(--ink-soft); font-size: 16px; flex-shrink: 0; }
+.rename-btn { background: none; border: none; color: var(--ink-soft); font-size: 15px; flex-shrink: 0; padding: 0 6px; }
 .reorder-col { display: flex; flex-direction: column; margin-right: 6px; flex-shrink: 0; }
 .reorder-btn {
   background: none;
@@ -288,6 +289,42 @@ html, body {
 .quest-list { list-style: none; padding: 0; margin: 8px 0 0; }
 .quest-list li { padding: 6px 0; font-size: 14px; }
 .quest-list li.done { color: var(--accent); font-weight: bold; }
+
+/* ---------- Focus history ---------- */
+
+.history-chart { display: flex; align-items: flex-end; gap: 3px; height: 118px; }
+.history-col { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; min-width: 0; }
+.history-bar { width: 70%; background: var(--accent); border-radius: 3px 3px 0 0; }
+.history-val { font-size: 9px; color: var(--ink-soft); height: 12px; }
+.history-day { font-size: 10px; color: var(--ink-soft); margin-top: 3px; border-top: 1px solid var(--paper-edge); width: 100%; text-align: center; padding-top: 2px; }
+.history-day.today { color: var(--accent); font-weight: bold; }
+
+/* ---------- Shared tab ---------- */
+
+.stack { display: flex; flex-direction: column; gap: 8px; }
+.stack input {
+  padding: 10px;
+  border: 1px solid var(--paper-edge);
+  border-radius: 6px;
+  background: var(--paper);
+  font-size: 15px;
+}
+.stack button {
+  padding: 10px 16px;
+  border: none;
+  border-radius: 6px;
+  background: var(--accent);
+  color: var(--paper-light);
+  font-weight: bold;
+}
+.shared-actions { margin-top: 12px; }
+.add-row button.secondary-btn {
+  flex: 1;
+  background: none;
+  border: 1px solid var(--paper-edge);
+  color: var(--ink-soft);
+  font-weight: normal;
+}
 
 /* ---------- Toast ---------- */
 

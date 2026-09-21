@@ -112,6 +112,99 @@ alter table checklist_tasks add column if not exists source text not null defaul
 alter table checklist_tasks drop constraint if exists checklist_tasks_source_check;
 alter table checklist_tasks add constraint checklist_tasks_source_check check (source in ('checklist', 'wishlist'));
 
+-- v2.9 migrations (all no-ops when already applied):
+--  * tz_offset_min: the client's UTC offset in minutes, so "today" (daily
+--    task reset, quest day, streak day) follows YOUR local midnight instead
+--    of the server's UTC midnight. See user_today() below.
+--  * awarded_on: the last day this task paid out XP/quest progress, so
+--    un-checking and re-checking a task can't be farmed for XP.
+alter table app_state add column if not exists tz_offset_min int not null default 0;
+alter table checklist_tasks add column if not exists awarded_on date;
+
+-- One row per user per local day: feeds the Progress tab's history chart and
+-- the household "this week" totals.
+create table if not exists daily_stats (
+  user_id uuid not null references auth.users(id) on delete cascade,
+  day date not null,
+  pomodoros int not null default 0,
+  focus_min int not null default 0,
+  tasks int not null default 0,
+  primary key (user_id, day)
+);
+
+alter table daily_stats enable row level security;
+drop policy if exists "own daily_stats rows" on daily_stats;
+create policy "own daily_stats rows"
+  on daily_stats for all
+  using (auth.uid() = user_id)
+  with check (auth.uid() = user_id);
+
+-- ============================================================
+-- Household (shared list for two people)
+-- ============================================================
+-- A household is a small group (capped at 4) that shares one to-do list
+-- (groceries, chores) and can see each other's level/streak/weekly totals.
+-- Everything else (notes, personal checklist, XP) stays private per account.
+-- Nothing here is writable directly: clients go through the household_* and
+-- shared_* functions below.
+
+create table if not exists households (
+  id uuid primary key default gen_random_uuid(),
+  invite_code text not null unique default upper(encode(gen_random_bytes(5), 'hex')),
+  created_at timestamptz not null default now()
+);
+
+-- user_id is the primary key: an account belongs to at most one household.
+create table if not exists household_members (
+  user_id uuid primary key references auth.users(id) on delete cascade,
+  household_id uuid not null references households(id) on delete cascade,
+  display_name text not null default '',
+  joined_at timestamptz not null default now()
+);
+
+create table if not exists shared_tasks (
+  id text primary key default encode(gen_random_bytes(6), 'hex'),
+  household_id uuid not null references households(id) on delete cascade,
+  text text not null,
+  done boolean not null default false,
+  done_by uuid references auth.users(id) on delete set null,
+  done_at timestamptz,
+  sort_order double precision not null default 0,
+  created_by uuid references auth.users(id) on delete set null,
+  created_at timestamptz not null default now()
+);
+
+-- security definer so the membership lookup inside the RLS policies below
+-- doesn't itself trip over household_members' own RLS (infinite recursion).
+create or replace function is_household_member(hid uuid) returns boolean
+language sql stable security definer set search_path = public, extensions as $$
+  select exists (select 1 from household_members where household_id = hid and user_id = auth.uid());
+$$;
+
+create or replace function my_household_id() returns uuid
+language sql stable security definer set search_path = public, extensions as $$
+  select household_id from household_members where user_id = auth.uid();
+$$;
+
+alter table households enable row level security;
+drop policy if exists "members read their household" on households;
+create policy "members read their household"
+  on households for select
+  using (is_household_member(id));
+
+alter table household_members enable row level security;
+drop policy if exists "members read their household roster" on household_members;
+create policy "members read their household roster"
+  on household_members for select
+  using (is_household_member(household_id));
+
+alter table shared_tasks enable row level security;
+drop policy if exists "members manage shared tasks" on shared_tasks;
+create policy "members manage shared tasks"
+  on shared_tasks for all
+  using (is_household_member(household_id))
+  with check (is_household_member(household_id));
+
 -- ============================================================
 -- Pure helper functions (mirror gamification.py exactly)
 -- ============================================================
@@ -145,6 +238,26 @@ language sql immutable as $$
   select d - ((((extract(dow from d)::int + 6) % 7) - 1 + 7) % 7);
 $$;
 
+-- "Today" for this user, at THEIR local midnight rather than the server's
+-- (UTC) one. Clients report their UTC offset via set_tz_offset() (it's
+-- re-sent whenever it changes, so daylight-saving shifts follow along).
+-- Every daily/weekly rollover below (task reset, quest day, streak day)
+-- uses this instead of current_date -- otherwise, at UTC-6 for example,
+-- everything would roll over at 6pm.
+create or replace function user_today() returns date
+language sql stable security invoker set search_path = public, extensions as $$
+  select ((now() at time zone 'utc')
+          + coalesce((select tz_offset_min from app_state where user_id = auth.uid()), 0) * interval '1 minute')::date;
+$$;
+
+create or replace function set_tz_offset(p_minutes int) returns void
+language plpgsql security invoker set search_path = public, extensions as $$
+begin
+  perform ensure_app_state();
+  update app_state set tz_offset_min = greatest(-840, least(840, p_minutes)) where user_id = auth.uid();
+end;
+$$;
+
 -- ============================================================
 -- State-mutating functions (all run as the calling user; RLS applies)
 -- ============================================================
@@ -166,7 +279,7 @@ create or replace function ensure_daily_quests() returns void
 language plpgsql security invoker set search_path = public, extensions as $$
 declare
   s app_state;
-  today date := current_date;
+  today date := user_today();
   picked jsonb;
 begin
   s := ensure_app_state();
@@ -186,7 +299,7 @@ create or replace function ensure_weekly_quests() returns void
 language plpgsql security invoker set search_path = public, extensions as $$
 declare
   s app_state;
-  wk date := week_start_for(current_date);
+  wk date := week_start_for(user_today());
   picked jsonb;
 begin
   s := ensure_app_state();
@@ -216,8 +329,8 @@ create or replace function bump_streak() returns void
 language plpgsql security invoker set search_path = public, extensions as $$
 declare
   s app_state;
-  today date := current_date;
-  yesterday date := current_date - 1;
+  today date := user_today();
+  yesterday date := user_today() - 1;
   new_streak int;
 begin
   select * into s from app_state where user_id = auth.uid();
@@ -305,7 +418,22 @@ begin
 end;
 $$;
 
-create or replace function record_pomodoro_completed() returns jsonb
+-- Adds to today's row in daily_stats (creating it if needed).
+create or replace function bump_daily_stats(p_pomodoros int, p_focus_min int, p_tasks int) returns void
+language sql security invoker set search_path = public, extensions as $$
+  insert into daily_stats (user_id, day, pomodoros, focus_min, tasks)
+    values (auth.uid(), user_today(), p_pomodoros, p_focus_min, p_tasks)
+  on conflict (user_id, day) do update set
+    pomodoros = daily_stats.pomodoros + excluded.pomodoros,
+    focus_min = daily_stats.focus_min + excluded.focus_min,
+    tasks = greatest(0, daily_stats.tasks + excluded.tasks);
+$$;
+
+-- p_minutes is the length of the work session, for the focus-time history.
+-- The old zero-argument version is dropped so the two can't both exist and
+-- make a no-argument call ambiguous.
+drop function if exists record_pomodoro_completed();
+create or replace function record_pomodoro_completed(p_minutes int default 25) returns jsonb
 language plpgsql security invoker set search_path = public, extensions as $$
 declare
   s app_state;
@@ -316,6 +444,7 @@ begin
   perform ensure_daily_quests();
   perform ensure_weekly_quests();
   perform bump_streak();
+  perform bump_daily_stats(1, greatest(0, least(coalesce(p_minutes, 25), 600)), 0);
 
   select * into s from app_state where user_id = auth.uid();
   select * into old_lvl from level_from_xp(s.xp);
@@ -362,7 +491,7 @@ declare
 begin
   update checklist_tasks set
     completed_today = p_done,
-    last_completed = case when p_done then current_date else last_completed end
+    last_completed = case when p_done then user_today() else last_completed end
   where id = p_task_id and user_id = auth.uid()
   returning * into t;
   if not found then
@@ -372,12 +501,11 @@ begin
 end;
 $$;
 
--- XP/streak/quest side effects for completing (or un-completing) a task
--- of the given recurrence. Assumes the checklist row was already flipped
--- by set_task_completed_flag, since the "cleared the whole checklist"
--- check reads current checklist_tasks state. Mirrors
--- Storage.record_task_event exactly.
-create or replace function apply_task_xp(p_recurrence text, p_done boolean) returns jsonb
+-- The XP/streak/quest payout for completing a task of the given recurrence.
+-- Assumes the checklist row was already flipped by set_task_completed_flag,
+-- since the "cleared the whole checklist" check reads current
+-- checklist_tasks state. Mirrors Storage._award_task.
+create or replace function award_task(p_recurrence text) returns jsonb
 language plpgsql security invoker set search_path = public, extensions as $$
 declare
   task_xp int;
@@ -393,53 +521,89 @@ begin
 
   task_xp := case p_recurrence when 'daily' then 10 when 'weekly' then 15 when 'once' then 25 else 10 end;
 
-  if p_done then
-    perform bump_streak();
-    update app_state set total_tasks = total_tasks + 1, updated_at = now() where user_id = auth.uid();
+  perform bump_streak();
+  update app_state set total_tasks = total_tasks + 1, updated_at = now() where user_id = auth.uid();
+  perform bump_daily_stats(0, 0, 1);
 
-    select xp into cur_xp from app_state where user_id = auth.uid();
-    select * into old_lvl from level_from_xp(cur_xp);
+  select xp into cur_xp from app_state where user_id = auth.uid();
+  select * into old_lvl from level_from_xp(cur_xp);
 
-    perform add_xp(task_xp);
-    completed := advance_quests('tasks', 1);
+  perform add_xp(task_xp);
+  completed := advance_quests('tasks', 1);
 
-    select count(*), count(*) filter (where completed_today) into total_tasks_count, done_tasks_count
-      from checklist_tasks where user_id = auth.uid() and source = 'checklist';
-    if total_tasks_count > 0 and total_tasks_count = done_tasks_count then
-      completed := completed || advance_quests('clear_checklist', 1);
-    end if;
-
-    select xp into cur_xp from app_state where user_id = auth.uid();
-    select * into new_lvl from level_from_xp(cur_xp);
-
-    return jsonb_build_object('xp_gained', task_xp, 'old_level', old_lvl.level, 'new_level', new_lvl.level, 'completed_quests', completed);
-  else
-    update app_state set total_tasks = greatest(0, total_tasks - 1), updated_at = now() where user_id = auth.uid();
-    perform add_xp(-task_xp);
-    return jsonb_build_object('completed_quests', '[]'::jsonb);
+  select count(*), count(*) filter (where completed_today) into total_tasks_count, done_tasks_count
+    from checklist_tasks where user_id = auth.uid() and source = 'checklist';
+  if total_tasks_count > 0 and total_tasks_count = done_tasks_count then
+    completed := completed || advance_quests('clear_checklist', 1);
   end if;
+
+  select xp into cur_xp from app_state where user_id = auth.uid();
+  select * into new_lvl from level_from_xp(cur_xp);
+
+  return jsonb_build_object('xp_gained', task_xp, 'old_level', old_lvl.level, 'new_level', new_lvl.level, 'completed_quests', completed);
 end;
 $$;
 
--- Convenience single call combining both steps above, for clients (the
--- web app) that don't need to split them.
+-- Legacy entry point, kept only so desktop apps older than v2.9 (which call
+-- set_task_completed_flag + apply_task_xp separately) keep working. New
+-- clients use complete_task below, which also blocks XP farming.
+create or replace function apply_task_xp(p_recurrence text, p_done boolean) returns jsonb
+language plpgsql security invoker set search_path = public, extensions as $$
+begin
+  if p_done then
+    return award_task(p_recurrence);
+  end if;
+  perform ensure_daily_quests();
+  perform ensure_weekly_quests();
+  update app_state set total_tasks = greatest(0, total_tasks - 1), updated_at = now() where user_id = auth.uid();
+  perform add_xp(-case p_recurrence when 'daily' then 10 when 'weekly' then 15 when 'once' then 25 else 10 end);
+  return jsonb_build_object('completed_quests', '[]'::jsonb);
+end;
+$$;
+
+-- Ticks (or un-ticks) a task. A task pays out XP/quest progress only the
+-- FIRST time it's completed in its period (once: ever; weekly: per quest
+-- week; daily: per day) and un-ticking never takes XP back -- so
+-- check/uncheck/check can't be farmed. Mirrors Storage.set_task_done and
+-- gamification.task_already_awarded.
 create or replace function complete_task(p_task_id text, p_done boolean) returns jsonb
 language plpgsql security invoker set search_path = public, extensions as $$
 declare
   t checklist_tasks;
+  today date := user_today();
+  already boolean;
 begin
   t := set_task_completed_flag(p_task_id, p_done);
-  return apply_task_xp(t.recurrence, p_done);
+  if not p_done then
+    return jsonb_build_object('completed_quests', '[]'::jsonb);
+  end if;
+
+  already := case t.recurrence
+    when 'once' then t.awarded_on is not null
+    when 'weekly' then t.awarded_on is not null and t.awarded_on >= week_start_for(today)
+    else t.awarded_on is not null and t.awarded_on = today
+  end;
+  if already then
+    return jsonb_build_object('completed_quests', '[]'::jsonb);
+  end if;
+
+  update checklist_tasks set awarded_on = today where id = t.id and user_id = auth.uid();
+  return award_task(t.recurrence);
 end;
 $$;
 
+-- Daily tasks un-check at the start of each (local) day; weekly tasks
+-- un-check when the quest week rolls over (Tuesday), the same reset as the
+-- weekly quests. Mirrors Storage._roll_recurring_tasks.
 create or replace function roll_recurring_tasks() returns void
 language sql security invoker set search_path = public, extensions as $$
   update checklist_tasks set completed_today = false
   where user_id = auth.uid()
-    and recurrence = 'daily'
     and completed_today = true
-    and (last_completed is distinct from current_date);
+    and (
+      (recurrence = 'daily' and last_completed is distinct from user_today())
+      or (recurrence = 'weekly' and (last_completed is null or last_completed < week_start_for(user_today())))
+    );
 $$;
 
 create or replace function set_notes(p_notes text) returns void
@@ -447,19 +611,35 @@ language sql security invoker set search_path = public, extensions as $$
   update app_state set notes = p_notes, updated_at = now() where user_id = auth.uid();
 $$;
 
-create or replace function add_task(p_text text, p_recurrence text, p_reminder_time text default null, p_source text default 'checklist')
+-- p_id lets the desktop app (which queues edits made offline) create a task
+-- under the id it already gave it locally; calling again with an id that
+-- exists just returns the existing row, so a retried request is harmless.
+-- The old 4-argument version is dropped so the two can't be ambiguous.
+drop function if exists add_task(text, text, text, text);
+create or replace function add_task(p_text text, p_recurrence text, p_reminder_time text default null, p_source text default 'checklist', p_id text default null)
 returns checklist_tasks
 language plpgsql security invoker set search_path = public, extensions as $$
 declare
   t checklist_tasks;
   next_order double precision;
 begin
+  if p_id is not null then
+    select * into t from checklist_tasks where id = p_id and user_id = auth.uid();
+    if found then
+      return t;
+    end if;
+  end if;
   select coalesce(max(sort_order), 0) + 1 into next_order from checklist_tasks where user_id = auth.uid();
-  insert into checklist_tasks (user_id, text, recurrence, reminder_time, sort_order, source)
-    values (auth.uid(), p_text, p_recurrence, p_reminder_time, next_order, p_source)
+  insert into checklist_tasks (id, user_id, text, recurrence, reminder_time, sort_order, source)
+    values (coalesce(p_id, encode(gen_random_bytes(6), 'hex')), auth.uid(), p_text, p_recurrence, p_reminder_time, next_order, p_source)
     returning * into t;
   return t;
 end;
+$$;
+
+create or replace function rename_task(p_task_id text, p_text text) returns void
+language sql security invoker set search_path = public, extensions as $$
+  update checklist_tasks set text = p_text where id = p_task_id and user_id = auth.uid();
 $$;
 
 create or replace function remove_task(p_task_id text) returns void
@@ -517,6 +697,7 @@ language plpgsql security invoker set search_path = public, extensions as $$
 declare
   s app_state;
   tasks jsonb;
+  hist jsonb;
 begin
   perform roll_recurring_tasks();
   perform ensure_daily_quests();
@@ -525,6 +706,9 @@ begin
   select * into s from app_state where user_id = auth.uid();
   select coalesce(jsonb_agg(to_jsonb(c) - 'user_id' order by c.sort_order, c.created_at), '[]'::jsonb) into tasks
     from checklist_tasks c where user_id = auth.uid();
+  select coalesce(jsonb_agg(jsonb_build_object(
+      'day', d.day, 'pomodoros', d.pomodoros, 'focus_min', d.focus_min, 'tasks', d.tasks) order by d.day), '[]'::jsonb) into hist
+    from daily_stats d where d.user_id = auth.uid() and d.day >= user_today() - 41;
 
   return jsonb_build_object(
     'notes', s.notes,
@@ -535,7 +719,186 @@ begin
     'longest_streak', s.longest_streak,
     'quests', s.quests,
     'weekly_quests', s.weekly_quests,
-    'checklist', tasks
+    'checklist', tasks,
+    'history', hist
   );
 end;
+$$;
+
+-- ============================================================
+-- Household functions
+-- ============================================================
+
+-- Everything the household UI needs in one call: the roster (with each
+-- member's level inputs, streak and this-week totals) plus the shared list.
+-- Returns null when the caller isn't in a household. security definer
+-- because it reads the OTHER members' app_state/daily_stats rows, which
+-- RLS otherwise hides -- it only ever does so for the caller's own household.
+create or replace function household_pull() returns jsonb
+language plpgsql security definer set search_path = public, extensions as $$
+declare
+  hid uuid;
+  wk date;
+  result jsonb;
+begin
+  if auth.uid() is null then
+    raise exception 'not signed in';
+  end if;
+  hid := my_household_id();
+  if hid is null then
+    return null;
+  end if;
+  wk := week_start_for(user_today());
+
+  select jsonb_build_object(
+    'id', h.id,
+    'invite_code', h.invite_code,
+    'members', (
+      select coalesce(jsonb_agg(jsonb_build_object(
+          'user_id', m.user_id,
+          'name', m.display_name,
+          'is_me', m.user_id = auth.uid(),
+          'xp', coalesce(a.xp, 0),
+          'streak', coalesce(a.current_streak, 0),
+          'week_pomodoros', coalesce(w.pomodoros, 0),
+          'week_focus_min', coalesce(w.focus, 0),
+          'week_tasks', coalesce(w.tasks, 0)
+        ) order by m.joined_at), '[]'::jsonb)
+      from household_members m
+      left join app_state a on a.user_id = m.user_id
+      left join lateral (
+        select sum(d.pomodoros)::int as pomodoros, sum(d.focus_min)::int as focus, sum(d.tasks)::int as tasks
+        from daily_stats d where d.user_id = m.user_id and d.day >= wk
+      ) w on true
+      where m.household_id = h.id
+    ),
+    'tasks', (
+      select coalesce(jsonb_agg(jsonb_build_object(
+          'id', t.id, 'text', t.text, 'done', t.done, 'done_at', t.done_at,
+          'done_by_name', (select display_name from household_members where user_id = t.done_by)
+        ) order by t.sort_order, t.created_at), '[]'::jsonb)
+      from shared_tasks t where t.household_id = h.id
+    )
+  ) into result
+  from households h where h.id = hid;
+  return result;
+end;
+$$;
+
+create or replace function household_create(p_name text) returns jsonb
+language plpgsql security definer set search_path = public, extensions as $$
+declare
+  hid uuid;
+begin
+  if auth.uid() is null then
+    raise exception 'not signed in';
+  end if;
+  if my_household_id() is not null then
+    raise exception 'already in a household';
+  end if;
+  insert into households default values returning id into hid;
+  insert into household_members (user_id, household_id, display_name)
+    values (auth.uid(), hid, left(coalesce(nullif(trim(p_name), ''), 'Me'), 40));
+  return household_pull();
+end;
+$$;
+
+create or replace function household_join(p_code text, p_name text) returns jsonb
+language plpgsql security definer set search_path = public, extensions as $$
+declare
+  hid uuid;
+  mine uuid;
+begin
+  if auth.uid() is null then
+    raise exception 'not signed in';
+  end if;
+  select id into hid from households where invite_code = upper(trim(p_code));
+  if hid is null then
+    raise exception 'invalid invite code';
+  end if;
+  mine := my_household_id();
+  if mine is not null then
+    if mine = hid then
+      return household_pull();
+    end if;
+    raise exception 'already in a household';
+  end if;
+  if (select count(*) from household_members where household_id = hid) >= 4 then
+    raise exception 'household is full';
+  end if;
+  insert into household_members (user_id, household_id, display_name)
+    values (auth.uid(), hid, left(coalesce(nullif(trim(p_name), ''), 'Me'), 40));
+  return household_pull();
+end;
+$$;
+
+-- Leaves the household; the last person out deletes it (and its shared list).
+create or replace function household_leave() returns void
+language plpgsql security definer set search_path = public, extensions as $$
+declare
+  hid uuid;
+begin
+  if auth.uid() is null then
+    raise exception 'not signed in';
+  end if;
+  hid := my_household_id();
+  if hid is null then
+    return;
+  end if;
+  delete from household_members where user_id = auth.uid();
+  if not exists (select 1 from household_members where household_id = hid) then
+    delete from households where id = hid;
+  end if;
+end;
+$$;
+
+-- The shared-list functions run as the caller (security invoker); the RLS
+-- policy on shared_tasks is what actually limits them to the caller's own
+-- household.
+create or replace function shared_add_task(p_text text, p_id text default null) returns shared_tasks
+language plpgsql security invoker set search_path = public, extensions as $$
+declare
+  hid uuid := my_household_id();
+  t shared_tasks;
+  next_order double precision;
+begin
+  if hid is null then
+    raise exception 'not in a household';
+  end if;
+  if p_id is not null then
+    select * into t from shared_tasks where id = p_id and household_id = hid;
+    if found then
+      return t;
+    end if;
+  end if;
+  select coalesce(max(sort_order), 0) + 1 into next_order from shared_tasks where household_id = hid;
+  insert into shared_tasks (id, household_id, text, sort_order, created_by)
+    values (coalesce(p_id, encode(gen_random_bytes(6), 'hex')), hid, p_text, next_order, auth.uid())
+    returning * into t;
+  return t;
+end;
+$$;
+
+create or replace function shared_set_done(p_id text, p_done boolean) returns void
+language plpgsql security invoker set search_path = public, extensions as $$
+begin
+  update shared_tasks set
+    done = p_done,
+    done_by = case when p_done then auth.uid() else null end,
+    done_at = case when p_done then now() else null end
+  where id = p_id and household_id = my_household_id();
+  if not found then
+    raise exception 'task not found';
+  end if;
+end;
+$$;
+
+create or replace function shared_remove_task(p_id text) returns void
+language sql security invoker set search_path = public, extensions as $$
+  delete from shared_tasks where id = p_id and household_id = my_household_id();
+$$;
+
+create or replace function shared_clear_done() returns void
+language sql security invoker set search_path = public, extensions as $$
+  delete from shared_tasks where household_id = my_household_id() and done;
 $$;

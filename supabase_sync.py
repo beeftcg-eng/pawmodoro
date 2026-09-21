@@ -18,7 +18,30 @@ TIMEOUT = 5
 
 
 class SyncError(Exception):
-    pass
+    """Every failure talking to Supabase. `status` is the HTTP status (None
+    for a network-level failure) and `code` PostgREST's error code, when
+    there was one. `transient` says whether retrying later could help
+    (offline, server hiccup, expired session, cloud schema not updated yet)
+    as opposed to the request itself being wrong (e.g. "task not found"),
+    which the sync queue drops rather than retrying forever."""
+
+    def __init__(self, message, status=None, code=None, auth=False):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.auth = auth  # the login session itself is dead; needs a fresh log-in
+
+    @property
+    def schema_outdated(self):
+        # PostgREST answers 404 / PGRST202 for a function that doesn't exist
+        # yet, i.e. schema.sql hasn't been re-run since an app update.
+        return self.status == 404 or self.code == "PGRST202"
+
+    @property
+    def transient(self):
+        if self.auth or self.status is None or self.schema_outdated:
+            return True
+        return self.status >= 500 or self.status in (401, 408, 429)
 
 
 class SupabaseSync:
@@ -51,7 +74,12 @@ class SupabaseSync:
                 return json.loads(raw) if raw else None
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", "replace")
-            raise SyncError(f"{e.code}: {detail}") from e
+            code = None
+            try:
+                code = json.loads(detail).get("code")
+            except (ValueError, AttributeError):
+                pass
+            raise SyncError(f"{e.code}: {detail}", status=e.code, code=code) from e
         except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
             # ValueError covers a malformed self.url (e.g. missing scheme,
             # a typo like "https:/") from urllib.request.Request/urlopen —
@@ -104,8 +132,17 @@ class SupabaseSync:
         try:
             return self._request(f"/rest/v1/rpc/{name}", params or {})
         except SyncError as e:
-            if retry_on_auth_error and "401" in str(e) and self.refresh_token:
-                self.refresh_session()
+            if retry_on_auth_error and e.status == 401 and self.refresh_token:
+                try:
+                    self.refresh_session()
+                except SyncError as refresh_error:
+                    # A refused refresh (as opposed to a network blip) means
+                    # the session is really gone: flag it so the sync queue
+                    # holds its changes and waits for a new log-in instead
+                    # of treating this as a bad request.
+                    if refresh_error.status in (400, 401, 403):
+                        refresh_error.auth = True
+                    raise refresh_error from e
                 return self._request(f"/rest/v1/rpc/{name}", params or {})
             raise
 
@@ -115,13 +152,24 @@ class SupabaseSync:
     def set_notes(self, text):
         return self._rpc("set_notes", {"p_notes": text})
 
-    def add_task(self, text, recurrence, reminder_time=None, source="checklist"):
-        return self._rpc("add_task", {
-            "p_text": text, "p_recurrence": recurrence, "p_reminder_time": reminder_time, "p_source": source,
-        })
+    def set_tz_offset(self, minutes):
+        return self._rpc("set_tz_offset", {"p_minutes": minutes})
+
+    def add_task(self, text, recurrence, reminder_time=None, source="checklist", task_id=None):
+        # task_id lets the desktop create the task under the id it already
+        # gave it locally (safe to retry: the server returns the existing
+        # row). Left out when None so an older cloud schema, which doesn't
+        # know p_id yet, still accepts the call.
+        params = {"p_text": text, "p_recurrence": recurrence, "p_reminder_time": reminder_time, "p_source": source}
+        if task_id:
+            params["p_id"] = task_id
+        return self._rpc("add_task", params)
 
     def remove_task(self, task_id):
         return self._rpc("remove_task", {"p_task_id": task_id})
+
+    def rename_task(self, task_id, text):
+        return self._rpc("rename_task", {"p_task_id": task_id, "p_text": text})
 
     def set_task_reminder(self, task_id, reminder_time):
         return self._rpc("set_task_reminder", {"p_task_id": task_id, "p_reminder_time": reminder_time})
@@ -132,14 +180,8 @@ class SupabaseSync:
     def complete_task(self, task_id, done):
         return self._rpc("complete_task", {"p_task_id": task_id, "p_done": done})
 
-    def set_task_completed_flag(self, task_id, done):
-        return self._rpc("set_task_completed_flag", {"p_task_id": task_id, "p_done": done})
-
-    def apply_task_xp(self, recurrence, done):
-        return self._rpc("apply_task_xp", {"p_recurrence": recurrence, "p_done": done})
-
-    def record_pomodoro_completed(self):
-        return self._rpc("record_pomodoro_completed")
+    def record_pomodoro_completed(self, minutes=25):
+        return self._rpc("record_pomodoro_completed", {"p_minutes": minutes})
 
     def record_break_completed(self):
         return self._rpc("record_break_completed")
@@ -154,3 +196,32 @@ class SupabaseSync:
             "p_longest_streak": longest_streak,
             "p_last_active_date": last_active_date,
         })
+
+    # ---------- Household (shared list) ----------
+
+    def household_pull(self):
+        return self._rpc("household_pull")
+
+    def household_create(self, name):
+        return self._rpc("household_create", {"p_name": name})
+
+    def household_join(self, code, name):
+        return self._rpc("household_join", {"p_code": code, "p_name": name})
+
+    def household_leave(self):
+        return self._rpc("household_leave")
+
+    def shared_add_task(self, text, task_id=None):
+        params = {"p_text": text}
+        if task_id:
+            params["p_id"] = task_id
+        return self._rpc("shared_add_task", params)
+
+    def shared_set_done(self, task_id, done):
+        return self._rpc("shared_set_done", {"p_id": task_id, "p_done": done})
+
+    def shared_remove_task(self, task_id):
+        return self._rpc("shared_remove_task", {"p_id": task_id})
+
+    def shared_clear_done(self):
+        return self._rpc("shared_clear_done")

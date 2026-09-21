@@ -2,7 +2,9 @@
 pomodoro_tab.py - Configurable pomodoro timer with work/short-break/long-break
 cycling and desktop notifications when a phase ends.
 """
+import math
 import os
+import time
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QSpinBox,
     QFormLayout, QGroupBox, QSlider, QCheckBox, QFileDialog, QInputDialog,
@@ -14,6 +16,7 @@ import theme
 from theme import serif_font
 from circular_timer import CircularTimer
 from ambient_loop import AmbientLoop, AMBIENT_SOUNDS, MAX_CONCURRENT
+import chime
 import notifier
 import quotes
 
@@ -25,6 +28,14 @@ AUDIO_FILE_FILTER = "Audio files (*.wav *.wave *.mp3 *.ogg *.flac *.m4a *.aac);;
 # stutter and needless process churn. Only the value the slider settles on
 # actually gets applied.
 VOLUME_APPLY_DELAY_MS = 200
+
+# The countdown is measured against an end time rather than by counting
+# ticks, so it can't drift. If more than this many seconds pass between two
+# ticks the computer was asleep or the app was frozen; that gap isn't counted
+# (the timer behaves as if paused), so closing the laptop lid mid-session
+# doesn't finish -- and credit -- a pomodoro.
+STALL_GAP_SECONDS = 3
+TICK_MS = 250
 
 PHASE_NAMES = {
     "work": "\U0001F43E Work session",
@@ -81,6 +92,9 @@ class PomodoroTab(QWidget):
         self.sessions_completed = 0
         self.seconds_left = settings["work_min"] * 60
         self.running = False
+        self._deadline = 0.0
+        self._last_tick = 0.0
+        self._ambient_auto_changing = False  # True while auto-mode flips the checkboxes itself
 
         outer = QVBoxLayout(self)
 
@@ -121,7 +135,8 @@ class PomodoroTab(QWidget):
 
         skip_btn = QPushButton("Skip ⏭")
         skip_btn.setObjectName("secondary_btn")
-        skip_btn.clicked.connect(self.advance_phase)
+        skip_btn.setToolTip("Jump to the next phase. Skipping doesn't earn XP or count as a finished session.")
+        skip_btn.clicked.connect(lambda: self.advance_phase(completed=False))
         btn_row.addWidget(skip_btn)
 
         btn_row.addStretch()
@@ -150,6 +165,28 @@ class PomodoroTab(QWidget):
         self.sessions_spin.setRange(1, 12)
         self.sessions_spin.setValue(settings["sessions_before_long_break"])
         form.addRow("Sessions before long break:", self.sessions_spin)
+
+        chime_row = QHBoxLayout()
+        self.chime_check = QCheckBox("Play a chime when a session ends")
+        self.chime_check.setChecked(settings.get("chime", True))
+        chime_row.addWidget(self.chime_check)
+        test_chime_btn = QPushButton("\U0001F514 Test")
+        test_chime_btn.clicked.connect(chime.play_chime)
+        chime_row.addWidget(test_chime_btn)
+        chime_row.addStretch()
+        form.addRow(chime_row)
+
+        self.auto_next_check = QCheckBox("Start the next session or break automatically")
+        self.auto_next_check.setChecked(settings.get("auto_start_next", True))
+        form.addRow(self.auto_next_check)
+
+        self.ambient_auto_check = QCheckBox("Play my ambient sounds only during work sessions")
+        self.ambient_auto_check.setToolTip(
+            "Starts the ambient mix you last picked when a work session starts, "
+            "and stops it for breaks."
+        )
+        self.ambient_auto_check.setChecked(settings.get("ambient_auto", False))
+        form.addRow(self.ambient_auto_check)
 
         save_settings_btn = QPushButton("Save settings")
         save_settings_btn.clicked.connect(self.save_settings)
@@ -203,7 +240,7 @@ class PomodoroTab(QWidget):
         layout.addStretch()
 
         self.timer = QTimer(self)
-        self.timer.setInterval(1000)
+        self.timer.setInterval(TICK_MS)
         self.timer.timeout.connect(self._on_tick)
 
         self.refresh_theme()
@@ -249,13 +286,14 @@ class PomodoroTab(QWidget):
         row.addWidget(check)
 
         row.addWidget(QLabel("Volume"))
+        volume = self.storage.get_ambient_prefs().get("volumes", {}).get(key, 50)
         slider = QSlider(Qt.Orientation.Horizontal)
         slider.setRange(0, 100)
-        slider.setValue(50)
+        slider.setValue(volume)
         slider.valueChanged.connect(lambda value, k=key: self._on_ambient_volume_changed(k, value))
         row.addWidget(slider)
 
-        loop.set_volume(50, apply=False)
+        loop.set_volume(volume, apply=False)
         if not loop.available():
             check.setEnabled(False)
             check.setToolTip("File not found on disk" if removable
@@ -325,13 +363,33 @@ class PomodoroTab(QWidget):
         return p["ACCENT"] if self.phase == "work" else p["ACCENT_SOFT"]
 
     def toggle_running(self):
-        self.running = not self.running
         if self.running:
-            self.timer.start()
-            self.start_btn.setText("⏸  Pause")
+            self._pause()
         else:
-            self.timer.stop()
-            self.start_btn.setText("▶  Start")
+            self._start()
+
+    def _start(self):
+        self.running = True
+        now = time.monotonic()
+        self._deadline = now + self.seconds_left
+        self._last_tick = now
+        self.timer.start()
+        self.start_btn.setText("⏸  Pause")
+        self._sync_ambient_to_phase()
+
+    def _pause(self):
+        self._update_seconds_left()  # settle the exact time remaining
+        self.running = False
+        self.timer.stop()
+        self.start_btn.setText("▶  Start")
+
+    def _update_seconds_left(self):
+        now = time.monotonic()
+        gap = now - self._last_tick
+        self._last_tick = now
+        if gap > STALL_GAP_SECONDS:
+            self._deadline += gap - TICK_MS / 1000  # forgive time spent asleep / frozen
+        self.seconds_left = max(0, math.ceil(self._deadline - now))
 
     def reset_phase(self):
         self.timer.stop()
@@ -340,31 +398,46 @@ class PomodoroTab(QWidget):
         self.seconds_left = self._phase_minutes(self.phase) * 60
         self._refresh_labels()
 
-    def advance_phase(self):
+    def advance_phase(self, completed=False):
+        """Moves on to the next phase. `completed` is True when the timer
+        ran out; only then does the phase earn credit (XP, a finished
+        session, quest progress) and a notification. Skip passes False, so
+        mashing Skip can't be used to farm XP."""
         self.timer.stop()
         self.running = False
         self.start_btn.setText("▶  Start")
 
         settings = self.storage.get_pomodoro_settings()
         if self.phase == "work":
-            self.sessions_completed += 1
-            if self.sessions_completed % settings["sessions_before_long_break"] == 0:
-                self.phase = "long_break"
-                notify("Pomodoro", "Work session done — time for a long break.")
-            else:
-                self.phase = "short_break"
-                notify("Pomodoro", "Work session done — take a short break.")
-            result = self.storage.record_pomodoro_completed()
-            congrats = quotes.random_pomodoro_congrats()
-            self._announce_gamification(result, f"\U0001F43E {congrats}")
+            if completed:
+                self.sessions_completed += 1
+            long_break = completed and self.sessions_completed % settings["sessions_before_long_break"] == 0
+            self.phase = "long_break" if long_break else "short_break"
+            if completed:
+                notify("Pomodoro", "Work session done — time for a long break." if long_break
+                       else "Work session done — take a short break.")
+                self._play_chime()
+                result = self.storage.record_pomodoro_completed(settings["work_min"])
+                congrats = quotes.random_pomodoro_congrats()
+                self._announce_gamification(result, f"\U0001F43E {congrats}")
         else:
             self.phase = "work"
-            notify("Pomodoro", "Break's over — back to work.")
-            break_result = self.storage.record_break_completed()
-            self._announce_quests(break_result.get("completed_quests", []))
+            if completed:
+                notify("Pomodoro", "Break's over — back to work.")
+                self._play_chime()
+                break_result = self.storage.record_break_completed()
+                self._announce_quests(break_result.get("completed_quests", []))
 
         self.seconds_left = self._phase_minutes(self.phase) * 60
         self._refresh_labels()
+        if completed and settings.get("auto_start_next", True):
+            self._start()
+        else:
+            self._sync_ambient_to_phase()
+
+    def _play_chime(self):
+        if self.storage.get_pomodoro_settings().get("chime", True):
+            chime.play_chime()
 
     def _announce_gamification(self, result, headline):
         detail = f"+{result['xp_gained']} XP"
@@ -384,11 +457,11 @@ class PomodoroTab(QWidget):
             )
 
     def _on_tick(self):
-        self.seconds_left -= 1
+        previous = self.seconds_left
+        self._update_seconds_left()
         if self.seconds_left <= 0:
-            self.advance_phase()
-            self.toggle_running()  # auto-continue into next phase
-        else:
+            self.advance_phase(completed=True)
+        elif self.seconds_left != previous:
             self._refresh_labels()
 
     def _refresh_labels(self):
@@ -444,6 +517,32 @@ class PomodoroTab(QWidget):
             loop.play()
         else:
             loop.stop()
+        if not self._ambient_auto_changing:
+            # remember what the user chose (the mix "work sessions only" replays)
+            self.storage.set_ambient_mix([k for k, c in self.ambient_checks.items() if c.isChecked()])
+
+    def _sync_ambient_to_phase(self):
+        """"Ambient sounds only during work" mode: when a work session is
+        running, bring up the remembered mix; during a break, silence it.
+        Does nothing when that setting is off."""
+        if not self.storage.get_pomodoro_settings().get("ambient_auto"):
+            return
+        self._ambient_auto_changing = True
+        try:
+            if self.phase == "work":
+                if not self.running:
+                    return
+                mix = self.storage.get_ambient_prefs().get("mix", [])
+                for key in mix[:MAX_CONCURRENT]:
+                    check = self.ambient_checks.get(key)
+                    if check is not None and check.isEnabled() and not check.isChecked():
+                        check.setChecked(True)
+            else:
+                for check in self.ambient_checks.values():
+                    if check.isChecked():
+                        check.setChecked(False)
+        finally:
+            self._ambient_auto_changing = False
 
     def _on_ambient_volume_changed(self, key, value):
         # Apply immediately if nothing is playing (cheap: just remembers the
@@ -464,7 +563,10 @@ class PomodoroTab(QWidget):
     def _apply_pending_volume(self, key):
         loop = self.ambient_loops.get(key)
         value = self._pending_ambient_volume.get(key)
-        if loop is not None and value is not None and loop.is_playing():
+        if value is None:
+            return
+        self.storage.set_ambient_volume(key, value)  # remembered for next time
+        if loop is not None and loop.is_playing():
             loop.set_volume(value, apply=True)
 
     def stop_all_ambient(self):
@@ -477,6 +579,9 @@ class PomodoroTab(QWidget):
             "short_break_min": self.short_break_spin.value(),
             "long_break_min": self.long_break_spin.value(),
             "sessions_before_long_break": self.sessions_spin.value(),
+            "chime": self.chime_check.isChecked(),
+            "auto_start_next": self.auto_next_check.isChecked(),
+            "ambient_auto": self.ambient_auto_check.isChecked(),
         }
         self.storage.set_pomodoro_settings(settings)
         if not self.running:

@@ -28,7 +28,7 @@ class SyncSettingsDialog(QDialog):
         layout = QVBoxLayout(self)
 
         intro = QLabel(
-            "Sync notes, checklist, and quest/XP progress with the phone web app.\n"
+            "Sync notes, checklist, shared list, and quest/XP progress with the phone web app.\n"
             "Get the URL and anon key from your Supabase project's\n"
             "Project Settings → API page."
         )
@@ -55,8 +55,10 @@ class SyncSettingsDialog(QDialog):
         form.addRow("Password:", self.password_edit)
         layout.addLayout(form)
 
+        engine = self.storage.sync
         self.status_label = QLabel(
-            "✅ Connected and syncing." if cfg.get("enabled") else "Not connected."
+            f"{'✅' if engine.status == 'online' else '⚠️'} {engine.status_text()}"
+            if cfg.get("enabled") else "Not connected."
         )
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
@@ -131,8 +133,14 @@ class SyncSettingsDialog(QDialog):
                 g["current_streak"], g["longest_streak"], g.get("last_active_date"),
             )
             for task in self.storage.get_checklist():
+                if task["recurrence"] == "weekday":
+                    # "specific day" tasks are desktop-only: the cloud's
+                    # recurrence constraint rejects them, which would fail
+                    # this whole first sync.
+                    continue
                 client.add_task(
                     task["text"], task["recurrence"], task.get("reminder_time"), task.get("source", "checklist"),
+                    task["id"],
                 )
             QMessageBox.information(
                 self, "Cloud Sync",

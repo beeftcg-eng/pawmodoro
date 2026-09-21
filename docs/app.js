@@ -56,7 +56,17 @@ let pomodoro = {
   running: false,
   sessionCount: 0,
   intervalId: null,
+  deadline: 0,            // Date.now() value the running phase ends at (the timer counts against this, not ticks)
+  completing: false,
 };
+
+let lastTzSent = null;         // UTC offset (minutes) last reported to the server
+let tzRetryAt = 0;
+let householdState;            // undefined = not fetched yet, null = not in a household, object = the household
+let householdSupported = true; // false if the cloud schema predates households
+let lastHouseholdFetch = 0;
+let wakeLock = null;
+const renderKeys = {};         // per tab: what the last render was built from, so polls only re-render on change
 
 const QUEST_ICONS = { pomodoros: "\u{1F43E}", tasks: "✅", breaks: "☕", clear_checklist: "\u{1F9F9}" };
 
@@ -224,21 +234,69 @@ async function doAuth(mode) {
 
 let pollIntervalId = null;
 
+// Tell the server our UTC offset so "today" (daily task reset, quest day,
+// streak day) rolls over at OUR midnight rather than the server's UTC one.
+async function sendTzOffset() {
+  const minutes = -new Date().getTimezoneOffset();
+  if (minutes === lastTzSent || Date.now() < tzRetryAt) return;
+  const { error } = await supabaseClient.rpc("set_tz_offset", { p_minutes: minutes });
+  if (error) tzRetryAt = Date.now() + 120000; // e.g. cloud schema not updated yet
+  else lastTzSent = minutes;
+}
+
 async function enterApp() {
   // Fetch state before building the shell — the shell's initial
   // switchTab() renders a tab immediately, and pullAndRender() skips
   // refreshing the Notes editor whenever it's focused (so a poll can't
   // clobber text being typed right now), so if Notes is the tab shown on
   // load, it needs real data on this very first render regardless.
+  await sendTzOffset();
   const { data, error } = await supabaseClient.rpc("sync_pull");
   if (!error) state = data;
+  await refreshHousehold(true);
   renderShell();
   updateLevelBadge();
+  startPolling();
+}
+
+function startPolling() {
   // Logging out and back in within the same page session (no reload)
   // would otherwise stack up a new poller on top of any still-running
   // one from a previous login.
+  stopPolling();
+  // pick up changes made on the desktop app; skipped while the page is hidden
+  // (screen off / another app in front), which saves battery and data
+  pollIntervalId = setInterval(() => { if (!document.hidden) pullAndRender(); }, 5000);
+}
+
+function stopPolling() {
   clearInterval(pollIntervalId);
-  pollIntervalId = setInterval(pullAndRender, 5000); // pick up changes made on the desktop app
+  pollIntervalId = null;
+}
+
+// Coming back to the app: the timer catches up on time that passed while the
+// screen was locked, and everything refreshes right away.
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) return;
+  if (pomodoro.running) {
+    requestWakeLock();
+    tickPomodoro();
+  }
+  if (supabaseClient && state) pullAndRender();
+});
+
+async function refreshHousehold(force) {
+  const due = force || activeTab === "shared" || activeTab === "progress" || Date.now() - lastHouseholdFetch > 30000;
+  if (!due || !householdSupported) return;
+  lastHouseholdFetch = Date.now();
+  const { data, error } = await supabaseClient.rpc("household_pull");
+  if (error) {
+    // A cloud schema from before households existed: carry on without them.
+    if (error.code === "PGRST202" || error.status === 404) householdSupported = false;
+    if (householdState === undefined) householdState = null;
+    return;
+  }
+  householdState = data; // null when this account isn't in a household
 }
 
 function renderShell() {
@@ -257,9 +315,10 @@ function renderShell() {
       <button data-tab="checklist">✅ Checklist</button>
       <button data-tab="pomodoro">⏱️ Pomodoro</button>
       <button data-tab="progress">\u{1F3C6} Progress</button>
+      <button data-tab="shared">\u{1F3E0} Shared</button>
     </nav>`;
   document.getElementById("logout-btn").addEventListener("click", async () => {
-    clearInterval(pollIntervalId);
+    stopPolling();
     await supabaseClient.auth.signOut();
     showLoginScreen();
   });
@@ -279,6 +338,7 @@ function switchTab(tab) {
   else if (tab === "checklist") renderChecklist();
   else if (tab === "pomodoro") renderPomodoro();
   else if (tab === "progress") renderProgress();
+  else if (tab === "shared") renderShared();
 }
 
 let pullRequestId = 0;
@@ -292,6 +352,7 @@ async function pullAndRender() {
   // only applied if its id is still the most recent one issued, so a slow
   // older request can never overwrite state a faster newer one already set.
   const requestId = ++pullRequestId;
+  await sendTzOffset();
   const { data, error } = await supabaseClient.rpc("sync_pull");
   if (requestId !== pullRequestId) return;
   if (error) {
@@ -299,7 +360,16 @@ async function pullAndRender() {
     return;
   }
   state = data;
+  await refreshHousehold(false);
+  if (requestId !== pullRequestId) return;
   updateLevelBadge();
+  rerenderActiveTab();
+}
+
+// Re-renders the visible tab after a pull, but only if what it shows actually
+// changed -- a poll every few seconds would otherwise wipe whatever is being
+// typed into a tab's input box.
+function rerenderActiveTab() {
   if (activeTab === "notes") {
     // Only refresh if the editor doesn't currently have focus, so a
     // poll landing mid-keystroke can never clobber text being typed
@@ -308,8 +378,26 @@ async function pullAndRender() {
     if (editor && document.activeElement !== editor) {
       editor.innerHTML = state.notes ?? "";
     }
-  } else if (activeTab === "checklist") renderChecklist();
-  else if (activeTab === "progress") renderProgress();
+  } else if (activeTab === "checklist") {
+    if (renderKeys.checklist !== checklistKey()) renderChecklist();
+  } else if (activeTab === "progress") {
+    if (renderKeys.progress !== progressKey()) renderProgress();
+  } else if (activeTab === "shared") {
+    if (renderKeys.shared !== sharedKey()) renderShared();
+  }
+}
+
+// Keeps what was typed (and the focus) in an input across a re-render.
+function keepDraft(id) {
+  const el = document.getElementById(id);
+  const value = el ? el.value : "";
+  const focused = el && document.activeElement === el;
+  return () => {
+    const fresh = document.getElementById(id);
+    if (!fresh) return;
+    fresh.value = value;
+    if (focused) fresh.focus();
+  };
 }
 
 function levelFromXp(totalXp) {
@@ -421,9 +509,17 @@ function renderTaskList(container, tasks, { showRecurrence = false } = {}) {
         <input type="checkbox" ${task.completed_today ? "checked" : ""}>
         <span>${escapeHtml(task.text)}${showRecurrence ? ` <em>[${task.recurrence}]</em>` : ""}</span>
       </label>
+      <button class="rename-btn" title="Rename">✎</button>
       <button class="remove-btn" title="Remove">✕</button>`;
     li.querySelector("input").addEventListener("change", async e => {
       await toggleTask(task.id, e.target.checked);
+    });
+    li.querySelector(".rename-btn").addEventListener("click", async () => {
+      const text = (prompt("Rename task", task.text) ?? "").trim();
+      if (!text || text === task.text) return;
+      const { error } = await supabaseClient.rpc("rename_task", { p_task_id: task.id, p_text: text });
+      if (error) toast("⚠️ Couldn't rename", error.message || "Check your connection and try again.");
+      await pullAndRender();
     });
     li.querySelector(".remove-btn").addEventListener("click", async () => {
       await supabaseClient.rpc("remove_task", { p_task_id: task.id });
@@ -436,7 +532,13 @@ function renderTaskList(container, tasks, { showRecurrence = false } = {}) {
   });
 }
 
+function checklistKey() {
+  return JSON.stringify(state?.checklist ?? []);
+}
+
 function renderChecklist() {
+  const restoreDraft = keepDraft("task-text");
+  renderKeys.checklist = checklistKey();
   const view = document.getElementById("view");
   const allTasks = state?.checklist ?? [];
   // Cards pushed from the Deckbuilder wishlist get their own section below
@@ -474,6 +576,7 @@ function renderChecklist() {
     document.getElementById("task-text").value = "";
     await pullAndRender();
   });
+  restoreDraft();
 }
 
 async function moveTask(tasks, index, delta) {
@@ -515,8 +618,9 @@ function renderPomodoro() {
         <button id="pomo-start-pause"></button>
         <button id="pomo-reset" class="secondary">Reset</button>
       </div>
-      <p class="hint">Heads up: mobile browsers can throttle timers once the screen locks or the
-      app is backgrounded, so for a reliable alert, keep this tab open and the screen on during a session.</p>
+      <p class="hint">The timer counts against a fixed end time, so it stays accurate even if your phone
+      pauses this page when the screen locks — it catches up when you come back. The end-of-session alert can be
+      late in that case, so the screen is kept awake while a session runs.</p>
       <details class="settings-details">
         <summary>Timer settings</summary>
         <label>Work (min) <input id="set-work" type="number" min="1" value="${s.workMin}"></label>
@@ -575,38 +679,81 @@ function updateTimerDisplay() {
 }
 
 function togglePomodoro() {
-  pomodoro.running = !pomodoro.running;
+  if (pomodoro.running) pausePomodoro();
+  else startPomodoro();
+}
+
+function startPomodoro() {
+  pomodoro.running = true;
+  pomodoro.deadline = Date.now() + pomodoro.secondsLeft * 1000;
+  clearInterval(pomodoro.intervalId);
+  pomodoro.intervalId = setInterval(tickPomodoro, 500);
+  requestWakeLock();
   updateTimerDisplay();
-  if (pomodoro.running) {
-    pomodoro.intervalId = setInterval(tickPomodoro, 1000);
-  } else {
-    clearInterval(pomodoro.intervalId);
-  }
+}
+
+function pausePomodoro() {
+  settlePomodoro();
+  pomodoro.running = false;
+  clearInterval(pomodoro.intervalId);
+  releaseWakeLock();
+  updateTimerDisplay();
+}
+
+// Time left is always derived from the end time, never counted tick by tick.
+function settlePomodoro() {
+  pomodoro.secondsLeft = Math.max(0, Math.ceil((pomodoro.deadline - Date.now()) / 1000));
 }
 
 function resetPomodoro() {
   clearInterval(pomodoro.intervalId);
   pomodoro.running = false;
+  releaseWakeLock();
   pomodoro.phase = "work";
   pomodoro.secondsLeft = phaseSeconds("work", getSettings());
   updateTimerDisplay();
 }
 
 async function tickPomodoro() {
-  pomodoro.secondsLeft -= 1;
+  if (!pomodoro.running || pomodoro.completing) return;
+  settlePomodoro();
   if (pomodoro.secondsLeft <= 0) {
+    pomodoro.completing = true; // a catch-up tick can race the interval; only complete once
     clearInterval(pomodoro.intervalId);
     pomodoro.running = false;
-    await onPhaseComplete();
+    releaseWakeLock();
+    try {
+      await onPhaseComplete();
+    } finally {
+      pomodoro.completing = false;
+    }
   }
   updateTimerDisplay();
+}
+
+// Keeps the screen on while a session runs, so the page isn't paused by a
+// screen lock. Best-effort: unsupported / denied is fine.
+async function requestWakeLock() {
+  try {
+    if ("wakeLock" in navigator && !wakeLock) {
+      wakeLock = await navigator.wakeLock.request("screen");
+      wakeLock.addEventListener("release", () => { wakeLock = null; });
+    }
+  } catch {
+    wakeLock = null;
+  }
+}
+
+function releaseWakeLock() {
+  try { if (wakeLock) wakeLock.release(); } catch { /* already released */ }
+  wakeLock = null;
 }
 
 async function onPhaseComplete() {
   const s = getSettings();
   if (pomodoro.phase === "work") {
     pomodoro.sessionCount += 1;
-    const { data } = await supabaseClient.rpc("record_pomodoro_completed");
+    const { data } = await supabaseClient.rpc("record_pomodoro_completed", { p_minutes: s.workMin });
     notify("Focus session complete!", data ? `+${data.xp_gained} XP` : "Nice work!");
     if (data) {
       for (const q of data.completed_quests ?? []) {
@@ -626,6 +773,7 @@ async function onPhaseComplete() {
 
 function notify(title, body) {
   toast(title, body);
+  if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
   if (window.Notification && Notification.permission === "granted") {
     new Notification(title, { body });
   }
@@ -633,8 +781,69 @@ function notify(title, body) {
 
 // ---------- Progress tab ----------
 
+function progressKey() {
+  return JSON.stringify([state, householdState]);
+}
+
+function localISODate(d) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+function formatMinutes(min) {
+  const h = Math.floor(min / 60), m = min % 60;
+  return h ? `${h}h ${String(m).padStart(2, "0")}m` : `${m}m`;
+}
+
+// Focus minutes for the last 14 days as a small bar chart, plus this week's
+// (since Tuesday, the quest-week reset) totals.
+function renderHistory() {
+  const rows = new Map((state.history ?? []).map(r => [r.day, r]));
+  const now = new Date();
+  const days = [];
+  for (let i = 13; i >= 0; i--) {
+    const d = new Date(now);
+    d.setDate(d.getDate() - i);
+    days.push({ key: localISODate(d), label: "MTWTFSS"[(d.getDay() + 6) % 7], min: rows.get(localISODate(d))?.focus_min ?? 0, today: i === 0 });
+  }
+  const peak = Math.max(1, ...days.map(d => d.min));
+  const daysSinceReset = ((now.getDay() + 6) % 7 - 1 + 7) % 7;
+  const weekStart = new Date(now);
+  weekStart.setDate(weekStart.getDate() - daysSinceReset);
+  const weekKey = localISODate(weekStart);
+  const week = { pomodoros: 0, focus_min: 0, tasks: 0 };
+  for (const r of state.history ?? []) {
+    if (r.day >= weekKey) { week.pomodoros += r.pomodoros; week.focus_min += r.focus_min; week.tasks += r.tasks; }
+  }
+  return `
+    <div class="history-chart">${days.map(d => `
+      <div class="history-col">
+        <span class="history-val">${d.min || ""}</span>
+        <div class="history-bar" style="height:${d.min ? Math.max(3, Math.round(80 * d.min / peak)) : 0}px"></div>
+        <span class="history-day${d.today ? " today" : ""}">${d.label}</span>
+      </div>`).join("")}</div>
+    <p class="hint">This week (since Tuesday): ${week.pomodoros} sessions &middot; ${formatMinutes(week.focus_min)} focused &middot; ${week.tasks} tasks</p>`;
+}
+
+function renderHouseholdSummary() {
+  if (!householdState) return "";
+  let sessions = 0, minutes = 0, tasks = 0;
+  const lines = householdState.members.map(m => {
+    sessions += m.week_pomodoros; minutes += m.week_focus_min; tasks += m.week_tasks;
+    const { level } = levelFromXp(m.xp);
+    return `<p class="hint"><strong>${escapeHtml(m.name || "?")}${m.is_me ? " (you)" : ""}</strong> — Lv.${level}${m.streak >= 2 ? ` \u{1F525}${m.streak}` : ""}
+      &middot; this week: ${m.week_pomodoros} sessions, ${formatMinutes(m.week_focus_min)}</p>`;
+  }).join("");
+  return `
+    <section class="card">
+      <h2>\u{1F3E0} Household</h2>
+      ${lines}
+      <p class="hint"><strong>Together this week:</strong> ${sessions} sessions &middot; ${formatMinutes(minutes)} focused &middot; ${tasks} tasks</p>
+    </section>`;
+}
+
 function renderProgress() {
   if (!state) return;
+  renderKeys.progress = progressKey();
   const { level, xpInto, xpNeeded } = levelFromXp(state.xp);
   const title = titleForLevel(level);
   const daysLeft = daysUntilWeeklyReset(new Date());
@@ -648,6 +857,11 @@ function renderProgress() {
         <p class="hint">${state.current_streak >= 2 ? `\u{1F525} ${state.current_streak}-day streak (best: ${state.longest_streak})` : "Complete something today to start a streak"}</p>
         <p class="hint">${state.total_pomodoros} sessions completed &nbsp;&middot;&nbsp; ${state.total_tasks} tasks completed</p>
       </section>
+      <section class="card">
+        <h2>Focus minutes, last 14 days</h2>
+        ${renderHistory()}
+      </section>
+      ${renderHouseholdSummary()}
       <section class="card">
         <h2>Today's quests</h2>
         ${renderQuestList(state.quests)}
@@ -671,6 +885,134 @@ function renderQuestList(quests) {
 function daysUntilWeeklyReset(d) {
   const pyWeekday = (d.getDay() + 6) % 7; // JS getDay(): Sun=0..Sat=6 -> Mon=0..Sun=6
   return 7 - ((pyWeekday - 1 + 7) % 7);
+}
+
+// ---------- Shared tab (household to-do list) ----------
+
+function sharedKey() {
+  return JSON.stringify([householdState, householdSupported]);
+}
+
+async function sharedCall(name, params) {
+  const { data, error } = await supabaseClient.rpc(name, params);
+  if (error) {
+    toast("⚠️ Couldn't do that", error.message || "Check your connection and try again.");
+    return { ok: false };
+  }
+  return { ok: true, data };
+}
+
+async function reloadShared() {
+  await refreshHousehold(true);
+  if (activeTab === "shared") renderShared();
+}
+
+function renderShared() {
+  const restoreDraft = keepDraft("shared-text");
+  renderKeys.shared = sharedKey();
+  const view = document.getElementById("view");
+
+  if (!householdSupported) {
+    view.innerHTML = `<div class="pane"><section class="card"><h2>\u{1F3E0} Shared list</h2>
+      <p class="hint">The cloud database needs updating for shared lists. Re-run <code>supabase/schema.sql</code>
+      in the Supabase SQL Editor (see MOBILE_SYNC.md), then reopen this app.</p></section></div>`;
+    return;
+  }
+
+  if (!householdState) {
+    view.innerHTML = `
+      <div class="pane">
+        <section class="card">
+          <h2>\u{1F3E0} Shared list</h2>
+          <p class="hint">Share a to-do list (groceries, chores…) with your partner. One of you creates the
+          household and gives the other the invite code. Your notes, checklist and XP stay private.</p>
+        </section>
+        <section class="card">
+          <h2>Create a household</h2>
+          <div class="stack"><input id="hh-create-name" type="text" placeholder="Your name (shown to your partner)">
+          <button id="hh-create">Create</button></div>
+        </section>
+        <section class="card">
+          <h2>Join with an invite code</h2>
+          <div class="stack"><input id="hh-join-code" type="text" placeholder="Invite code" autocapitalize="characters" autocorrect="off">
+          <input id="hh-join-name" type="text" placeholder="Your name (shown to your partner)">
+          <button id="hh-join">Join</button></div>
+        </section>
+      </div>`;
+    document.getElementById("hh-create").addEventListener("click", async () => {
+      const name = document.getElementById("hh-create-name").value.trim();
+      if (!name) { toast("Add your name", "Your partner will see it next to what you tick off."); return; }
+      const r = await sharedCall("household_create", { p_name: name });
+      if (r.ok) { householdState = r.data; renderShared(); }
+    });
+    document.getElementById("hh-join").addEventListener("click", async () => {
+      const code = document.getElementById("hh-join-code").value.trim();
+      const name = document.getElementById("hh-join-name").value.trim();
+      if (!code || !name) { toast("Almost there", "Enter the invite code and your name."); return; }
+      const r = await sharedCall("household_join", { p_code: code, p_name: name });
+      if (r.ok) { householdState = r.data; renderShared(); }
+    });
+    return;
+  }
+
+  const h = householdState;
+  const names = h.members.map(m => escapeHtml(m.name || "?"));
+  view.innerHTML = `
+    <div class="pane">
+      <p class="hint">${names.length < 2
+        ? `\u{1F3E0} Just you so far — give your partner this invite code: <strong>${escapeHtml(h.invite_code)}</strong>`
+        : `\u{1F3E0} ${names.join(" &amp; ")} — invite code <strong>${escapeHtml(h.invite_code)}</strong>`}</p>
+      <ul id="shared-list" class="task-list"></ul>
+      <div class="add-row">
+        <input id="shared-text" type="text" placeholder="e.g. Milk">
+        <button id="shared-add">Add</button>
+      </div>
+      <div class="add-row shared-actions">
+        <button id="shared-clear" class="secondary-btn">Clear completed</button>
+        <button id="shared-leave" class="secondary-btn">Leave household</button>
+      </div>
+    </div>`;
+  const list = document.getElementById("shared-list");
+  for (const task of h.tasks) {
+    const li = document.createElement("li");
+    li.className = "task-item" + (task.done ? " done" : "");
+    li.innerHTML = `
+      <label>
+        <input type="checkbox" ${task.done ? "checked" : ""}>
+        <span>${escapeHtml(task.text)}${task.done && task.done_by_name ? ` <em>✓ ${escapeHtml(task.done_by_name)}</em>` : ""}</span>
+      </label>
+      <button class="remove-btn" title="Remove">✕</button>`;
+    li.querySelector("input").addEventListener("change", async e => {
+      await sharedCall("shared_set_done", { p_id: task.id, p_done: e.target.checked });
+      await reloadShared();
+    });
+    li.querySelector(".remove-btn").addEventListener("click", async () => {
+      await sharedCall("shared_remove_task", { p_id: task.id });
+      await reloadShared();
+    });
+    list.appendChild(li);
+  }
+  const add = async () => {
+    const input = document.getElementById("shared-text");
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = "";
+    await sharedCall("shared_add_task", { p_text: text });
+    await reloadShared();
+    document.getElementById("shared-text")?.focus();
+  };
+  document.getElementById("shared-add").addEventListener("click", add);
+  document.getElementById("shared-text").addEventListener("keydown", e => { if (e.key === "Enter") add(); });
+  document.getElementById("shared-clear").addEventListener("click", async () => {
+    await sharedCall("shared_clear_done", {});
+    await reloadShared();
+  });
+  document.getElementById("shared-leave").addEventListener("click", async () => {
+    if (!confirm("Leave this household? You'll stop seeing the shared list. If you're the last one in it, the list is deleted.")) return;
+    const r = await sharedCall("household_leave", {});
+    if (r.ok) { householdState = null; renderShared(); }
+  });
+  restoreDraft();
 }
 
 // ---------- Small utilities ----------

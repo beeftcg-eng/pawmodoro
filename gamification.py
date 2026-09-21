@@ -131,3 +131,27 @@ def generate_weekly_quests(week_start_iso, count=QUESTS_PER_WEEK):
         }
         for template in chosen
     ]
+
+
+def task_already_awarded(recurrence, awarded_on, today):
+    """A task pays out XP / quest progress only the first time it's
+    completed in its period, so un-checking and re-checking it can't be
+    farmed: a "once" task pays out ever, a "weekly" task once per quest
+    week, everything else (daily / specific-day) once per day.
+    `awarded_on` is an ISO date string (or None); `today` is a date.
+    Mirrored by complete_task() in supabase/schema.sql."""
+    if not awarded_on:
+        return False
+    if recurrence == "once":
+        return True
+    if recurrence == "weekly":
+        return awarded_on >= week_start_for(today).isoformat()
+    return awarded_on == today.isoformat()
+
+
+def weekly_task_needs_reset(last_completed, today):
+    """A "weekly" task un-checks itself when the quest week rolls over
+    (Tuesday), same reset as the weekly quests. `last_completed` is an ISO
+    date string or None. Mirrored by roll_recurring_tasks() in
+    supabase/schema.sql."""
+    return not last_completed or last_completed < week_start_for(today).isoformat()

@@ -47,6 +47,65 @@ way on Android too.
 
 ---
 
+## Updating an existing project (v2.9.0 and later)
+
+If you set this up with an older version, do this **once, before** updating
+the desktop app or relying on the phone:
+
+1. Open your Supabase project → **SQL Editor → New query**.
+2. Paste the *entire* current `supabase/schema.sql` and click **Run**. It's
+   safe to re-run: it only adds what's new (a timezone setting, focus-time
+   history, the shared household list, one-time-per-period task XP, and
+   weekly task resets) and leaves your data alone.
+3. Update the desktop app (re-run `install.sh` / `install.bat`). On the
+   phone, close the app and reopen it (twice, if it still shows the old
+   version — phones cache web apps aggressively).
+
+Until step 2 is done, the desktop app keeps working locally and **holds your
+changes safely in its upload queue** (the ☁️ Sync button shows a ⚠ and a
+notification tells you why); everything uploads by itself once the schema is
+updated. Nothing is lost.
+
+## The shared household list (two people)
+
+Each of you keeps your own account (your notes, checklist and XP stay
+private). A *household* links two accounts so you share one to-do list —
+groceries, chores — and see each other's level, streak and this-week focus
+totals on the Progress tab.
+
+1. Both of you set up Cloud Sync (desktop and/or phone) with **your own**
+   email, as described below.
+2. **One** of you opens the **🏠 Shared** tab → **Create a household** →
+   enter your name. It shows a 10-character **invite code**.
+3. The other opens **🏠 Shared** → **Join with an invite code…** → enter the
+   code and their name. (Codes aren't case-sensitive.)
+4. That's it — the list appears on every desktop app and phone signed in to
+   either account. Tick items off, add, remove, or **Clear completed**.
+
+A household holds up to 4 people; **Leave household** removes just you (the
+last person out deletes the list).
+
+## Lock down sign-ups once you're both in
+
+The "Create account" button works for anyone who has the project URL and
+anon key. Once you and your partner have your accounts: Supabase dashboard →
+**Authentication → Sign In / Providers** → turn **off** "Allow new users to
+sign up". Existing logins keep working.
+
+## Keeping the free Supabase project awake
+
+Supabase's free tier pauses a project after about a week with no activity.
+Using the desktop app (it syncs every few seconds while open) counts as
+activity, and `.github/workflows/keep-supabase-awake.yml` pings it every two
+days as a backstop. **One catch:** GitHub automatically *disables* scheduled
+workflows in a repository with no commits for 60 days, and emails you a
+warning first. If you get that email (or the project ever pauses), open the
+repo's **Actions** tab → **Keep Supabase project awake** → **Enable
+workflow**, and (if it paused) **Restore** the project in the Supabase
+dashboard.
+
+---
+
 ## Step 2 — Separate accounts, one Supabase project
 
 **Important:** the Supabase project just created is shared *infrastructure*
@@ -56,9 +115,10 @@ account's notes, checklist, or progress, full stop. So: each person who
 uses this should sign up with their own email, not share a login.
 
 With separate accounts, a given phone is its own independent thing —
-nothing syncs between it and anyone else's desktop or phone. What the
-shared Supabase project buys is durable cloud backup (data survives a
-lost phone, a browser reset, etc.), not sharing between people.
+nothing syncs between it and anyone else's desktop or phone, *except* the
+opt-in shared household list described above. What the shared Supabase
+project otherwise buys is durable cloud backup (data survives a lost phone,
+a browser reset, etc.).
 
 If you want your *own* desktop notes/checklist/progress backed up too
 (e.g. to later add a second device of your own), click the **☁️ Sync**
@@ -91,39 +151,43 @@ own devices — not between different people's separate accounts.
 | | Synced? |
 |---|---|
 | Notes | ✅ (plain text on the phone — desktop's bold/highlight/lists formatting isn't editable there, but isn't lost either) |
-| Checklist | ✅ |
+| Checklist | ✅ (tasks, order, renames, reminders' times; the desktop-only "specific day" tasks stay on the desktop) |
+| Shared household list | ✅ — shared with the people in your household |
+| Focus-minutes history | ✅ |
 | XP, level, streak | ✅ |
 | Daily & weekly quests | ✅ — completing a pomodoro/task/break on *either* device advances the same quests |
 | Ambient sounds | ❌ desktop-only |
 | Music tab (YouTube Music / Spotify) | ❌ phone-only makes no sense here — use the phone's own music apps |
-| Theme, pomodoro timer durations | Independent per device (not synced, so each device can have its own) |
+| Theme, pomodoro timer durations, chime / auto-start settings | Independent per device (not synced, so each device can have its own) |
 
 ## A real limitation worth knowing
 
-Phone browsers (especially iOS Safari, including installed PWAs) throttle
-or pause JavaScript timers once the screen locks or the app isn't in the
-foreground. That means a 25-minute countdown running while the phone is
-locked in a pocket may not fire its completion alert exactly on time. For
-the most reliable experience, the screen should stay on and the app in the
-foreground during a session. This is a platform restriction, not a bug —
-a fully reliable background timer on iOS would require a native app.
+Phone browsers (especially iOS Safari, including installed PWAs) pause
+JavaScript once the screen locks or the app isn't in the foreground. The
+phone timer counts against a fixed end time, so it always shows the right
+time and catches up the moment you reopen the app (crediting the session if
+the time is up) — and it asks the phone to keep the screen awake while a
+session runs. What it can't do is fire the end-of-session alert *while the
+screen is locked*; that alert can be late. A truly reliable background
+timer on iOS would require a native app.
 
 ## Where things live
 
 - `supabase/schema.sql` — the database schema + all sync logic (run once, per Step 1).
 - `docs/` — the phone app's source, auto-deployed to the URL above via GitHub Pages.
-- `supabase_sync.py`, `sync_settings_dialog.py` — the desktop app's sync client and settings dialog.
+- `supabase_sync.py`, `sync_engine.py`, `sync_settings_dialog.py` — the desktop app's sync client, background upload queue, and settings dialog.
 
 ## If something breaks
 
 - **"Couldn't connect" in the desktop dialog, or a phone won't log in:**
   double check the Project URL and anon key were copied exactly (no extra
   spaces), and that step 1.4 (running the SQL) actually succeeded.
-- **Desktop seems to ignore sync entirely:** it fails *silently* by design —
-  if the Supabase project is unreachable, the app just falls back to
-  local-only behavior exactly like sync was never turned on, so a typo in
-  the URL won't ever crash or block the app. Reopen the Sync dialog to check
-  the status line, or check the internet connection.
+- **Desktop seems to ignore sync entirely:** it never blocks or crashes the
+  app. If the project is unreachable, changes are saved locally and queued
+  (hover the ☁️ Sync button, or open the dialog, for the status: ✓ synced,
+  ↑N changes waiting, ⚠ needs attention). They upload on their own once the
+  connection is back. ⚠ means either "log in again" or "re-run
+  `supabase/schema.sql`" — the message says which; nothing is lost either way.
 - **Wrong data got uploaded/adopted on first connect:** the first-connect
   rule is simple — if the cloud side is empty, that device's local data is
   uploaded to it; if the cloud side already has data, it replaces the local

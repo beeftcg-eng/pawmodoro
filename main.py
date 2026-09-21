@@ -8,26 +8,25 @@ Run: python3 main.py
 """
 import os
 import sys
-import threading
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QSystemTrayIcon, QMenu, QMessageBox,
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel
 )
 from PyQt6.QtGui import QIcon, QAction, QActionGroup
-from PyQt6.QtCore import Qt, QTimer, QObject, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
 from storage import Storage
 from notes_checklist_tab import NotesChecklistTab
 from pomodoro_tab import PomodoroTab
 from progress_tab import ProgressTab
+from shared_tab import SharedTab
 from music_tab import MusicTab
 from widget_window import WidgetWindow
 from player_bar import PlayerBar
 from spotify_client import SpotifyClient
 from toast import CelebrationToast
 from sync_settings_dialog import SyncSettingsDialog
-from supabase_sync import SyncError
 import notifier
 import theme
 import gamification
@@ -43,44 +42,12 @@ ICON_PATH = os.path.join(os.path.dirname(__file__), "resources", "icon.png")
 SINGLE_INSTANCE_KEY = "Pawmodoro-instance-lock"
 
 
-class _SyncPoller(QObject):
-    """Periodically checks the cloud for changes made elsewhere (e.g. the
-    phone web app). The network call runs on a background thread so a slow
-    or dead connection can't freeze the UI; `pulled` is a Qt signal, so
-    Qt safely queues its delivery back onto the main thread regardless of
-    which thread emitted it — the actual local-state update (in
-    MainWindow._on_remote_pulled) always runs on the main thread."""
-    pulled = pyqtSignal(dict)
-
-    def __init__(self, storage, parent=None):
-        super().__init__(parent)
-        self.storage = storage
-        self._in_flight = False
-
-    def poll(self):
-        client = self.storage._sync_client
-        # Skip this tick if the previous poll's network call hasn't
-        # returned yet — at a 5s interval that can happen on a slow
-        # connection, and overlapping calls would risk a slower, older
-        # result landing (and overwriting local state) after a faster,
-        # newer one already applied.
-        if not client or self._in_flight:
-            return
-        self._in_flight = True
-
-        def worker():
-            try:
-                remote = client.sync_pull()
-            except SyncError:
-                return
-            finally:
-                self._in_flight = False
-            self.pulled.emit(remote)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-
 class MainWindow(QMainWindow):
+    # Carries a cloud pull (remote state, household, local revision) from the
+    # sync thread to the UI thread; Qt queues the delivery, so the slot always
+    # runs on the main thread. See sync_engine.py.
+    remote_pulled = pyqtSignal(object, object, int)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"Pawmodoro v{VERSION}")
@@ -97,11 +64,13 @@ class MainWindow(QMainWindow):
         self.notes_checklist_tab = NotesChecklistTab(self.storage)
         self.pomodoro_tab = PomodoroTab(self.storage)
         self.progress_tab = ProgressTab(self.storage)
+        self.shared_tab = SharedTab(self.storage)
         self.music_tab = MusicTab(self.spotify_client)
 
         self.tabs.addTab(self.notes_checklist_tab, "Notes && Checklist")
         self.tabs.addTab(self.pomodoro_tab, "Pomodoro")
         self.tabs.addTab(self.progress_tab, "\U0001F3C6 Progress")
+        self.tabs.addTab(self.shared_tab, "\U0001F3E0 Shared")
         self.tabs.addTab(self.music_tab, "Music")
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
@@ -145,9 +114,12 @@ class MainWindow(QMainWindow):
 
         self.pomodoro_tab.celebrate.connect(self._on_celebrate)
         self.checklist_tab.celebrate.connect(self._on_celebrate)
+        self.shared_tab.household_changed.connect(self.progress_tab.refresh)
 
         self.widget_window = WidgetWindow(self.storage)
         self.widget_window.restore_requested.connect(self.restore_from_widget)
+        self.widget_window.celebrate.connect(self._on_celebrate)
+        self.widget_window.task_toggled.connect(self.checklist_tab.refresh)
         self.pomodoro_tab.tick.connect(self.widget_window.update_pomodoro)
         self.widget_window.set_spotify_client(self.spotify_client)
 
@@ -164,17 +136,25 @@ class MainWindow(QMainWindow):
         self.reminder_timer.timeout.connect(self._check_reminders)
         self.reminder_timer.start(20000)
 
-        # Cloud Sync: pick up changes made on the phone web app without
-        # needing a restart. A no-op (cheap, no network call) whenever sync
-        # isn't enabled. 5s keeps things feeling close to real-time without
-        # needing a full websocket/Realtime subscription; the network call
-        # itself runs on a background thread either way, so a short
-        # interval doesn't cost any UI responsiveness.
-        self._sync_poller = _SyncPoller(self.storage, self)
-        self._sync_poller.pulled.connect(self._on_remote_pulled)
-        self.sync_timer = QTimer(self)
-        self.sync_timer.timeout.connect(self._sync_poller.poll)
-        self.sync_timer.start(5000)
+        # The app can sit in the tray for days: notice when the calendar day
+        # changes so daily tasks, quests and streaks roll over at midnight
+        # instead of only at the next launch.
+        self.day_timer = QTimer(self)
+        self.day_timer.timeout.connect(self._check_new_day)
+        self.day_timer.start(30000)
+
+        # Cloud Sync runs entirely on its own background thread (see
+        # sync_engine.py): it uploads queued edits and periodically pulls
+        # changes made elsewhere (e.g. the phone). This just receives its
+        # results on the UI thread and shows its status.
+        self._last_sync_status = None
+        self.remote_pulled.connect(self._on_remote_pulled)
+        self.storage.sync.on_pulled = self.remote_pulled.emit
+        self.storage.sync.start()
+        self.sync_status_timer = QTimer(self)
+        self.sync_status_timer.timeout.connect(self._refresh_sync_status)
+        self.sync_status_timer.start(2000)
+        self._refresh_sync_status()
 
         state = self.storage.get_window_state()
         if state.get("widget_mode"):
@@ -186,17 +166,46 @@ class MainWindow(QMainWindow):
         if self.tabs.widget(index) is self.progress_tab:
             self.progress_tab.refresh(new_quote=True)
 
-    def _on_remote_pulled(self, remote):
-        """Runs on the main thread (Qt queues the cross-thread signal
-        delivery), so this is the only place that actually mutates
-        storage.data from a cloud pull — the background thread itself
-        never touches it."""
-        self.storage.adopt_remote_state(remote)
+    def _on_remote_pulled(self, remote, household, rev):
+        """Runs on the main thread, and is the only place a cloud pull is
+        applied to local data. adopt_remote_state refuses (returns False) if
+        you've edited anything since the pull began or edits are still
+        waiting to upload, so a pull can never overwrite fresh work; the next
+        poll simply tries again."""
+        notes_tab = self.notes_checklist_tab.notes_tab
+        if not self.storage.adopt_remote_state(remote, household, rev, keep_notes=notes_tab.is_busy()):
+            return
         self.checklist_tab.refresh()
         self.progress_tab.refresh()
         self._refresh_level_indicator()
         self.widget_window.refresh_tasks()
-        self.notes_checklist_tab.notes_tab.maybe_reload_from_remote()
+        self.shared_tab.refresh()
+        notes_tab.maybe_reload_from_remote()
+
+    def _check_new_day(self):
+        if self.storage.roll_day_if_needed():
+            self.checklist_tab.refresh()
+            self.progress_tab.refresh()
+            self._refresh_level_indicator()
+            self.widget_window.refresh_tasks()
+
+    def _refresh_sync_status(self):
+        engine = self.storage.sync
+        if not self.storage.sync_configured():
+            self.sync_btn.setText("☁️ Sync")
+        elif engine.status == "online" and not engine.pending_count():
+            self.sync_btn.setText("☁️ Sync ✓")
+        elif engine.status in ("auth", "schema"):
+            self.sync_btn.setText("☁️ Sync ⚠")
+        elif engine.pending_count():
+            self.sync_btn.setText(f"☁️ Sync ↑{engine.pending_count()}")
+        else:
+            self.sync_btn.setText("☁️ Sync …")
+        self.sync_btn.setToolTip(engine.status_text())
+        # Say so once when sync needs attention, since it fails quietly otherwise.
+        if engine.status != self._last_sync_status and engine.status in ("auth", "schema"):
+            notifier.send("Pawmodoro cloud sync", engine.status_text())
+        self._last_sync_status = engine.status
 
     def _open_sync_settings(self):
         dialog = SyncSettingsDialog(self.storage, self)
@@ -204,8 +213,11 @@ class MainWindow(QMainWindow):
         # The dialog may have just connected and reconciled state.
         self.checklist_tab.refresh()
         self.progress_tab.refresh()
+        self.shared_tab.refresh(force=True)
         self.notes_checklist_tab.notes_tab.reload_from_storage()
         self._refresh_level_indicator()
+        self.widget_window.refresh_tasks()
+        self._refresh_sync_status()
 
     def _check_reminders(self):
         for task in self.storage.check_due_reminders():
@@ -256,6 +268,7 @@ class MainWindow(QMainWindow):
         self.notes_checklist_tab.refresh_theme()
         self.pomodoro_tab.refresh_theme()
         self.progress_tab.refresh_theme()
+        self.shared_tab.refresh_theme()
         self.music_tab.refresh_theme()
         self.widget_window.refresh_theme()
         self.player_bar.refresh_theme()
@@ -356,6 +369,7 @@ class MainWindow(QMainWindow):
 
     def close_app(self):
         self.pomodoro_tab.stop_all_ambient()
+        self.storage.sync.stop()
         self.storage.save()
         QApplication.quit()
 
