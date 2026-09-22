@@ -1053,3 +1053,220 @@ create or replace function shared_clear_done() returns void
 language sql security invoker set search_path = public, extensions as $$
   delete from shared_tasks where household_id = my_household_id() and done and recurrence = 'once';
 $$;
+
+-- ============================================================
+-- Deckbuilder trading (opt-in public collections + a "for trade" list)
+-- ============================================================
+-- Unrelated to the rest of this file (Pawmodoro's own notes/checklist/
+-- gamification): Deckbuilder reuses this same project/account purely because
+-- its client already asks people to connect it for wishlist push (see
+-- electron/ipc/pawmodoro.ts in the Deckbuilder repo). Nothing here is
+-- visible to anyone until a person explicitly makes their profile public.
+
+create table if not exists deckbuilder_profiles (
+  user_id uuid primary key references auth.users(id) on delete cascade,
+  public boolean not null default false,
+  display_name text not null default '',
+  updated_at timestamptz not null default now()
+);
+
+-- Cards match "the same card" for trading purposes by name, not exact
+-- printing/id — someone who wants a card doesn't usually care which
+-- printing fills it, and this keeps the matching query simple. `card_id`
+-- is kept anyway so the client can deep-link back to the exact card.
+create table if not exists deckbuilder_collection (
+  user_id uuid not null references auth.users(id) on delete cascade,
+  game_id text not null,
+  card_id text not null,
+  card_name text not null,
+  set_code text not null default '',
+  quantity int not null default 0 check (quantity >= 0),
+  for_trade boolean not null default false,
+  updated_at timestamptz not null default now(),
+  primary key (user_id, game_id, card_id)
+);
+
+create table if not exists deckbuilder_wants (
+  user_id uuid not null references auth.users(id) on delete cascade,
+  game_id text not null,
+  card_id text not null,
+  card_name text not null,
+  quantity int not null default 1 check (quantity >= 0),
+  updated_at timestamptz not null default now(),
+  primary key (user_id, game_id, card_id)
+);
+
+-- security definer so the public-profile check inside the collection/wants
+-- policies below doesn't itself trip over deckbuilder_profiles' own RLS.
+create or replace function is_public_deckbuilder_profile(uid uuid) returns boolean
+language sql stable security definer set search_path = public, extensions as $$
+  select coalesce((select public from deckbuilder_profiles where user_id = uid), false);
+$$;
+
+alter table deckbuilder_profiles enable row level security;
+drop policy if exists "own deckbuilder profile" on deckbuilder_profiles;
+create policy "own deckbuilder profile"
+  on deckbuilder_profiles for all
+  using (auth.uid() = user_id)
+  with check (auth.uid() = user_id);
+drop policy if exists "public deckbuilder profiles readable" on deckbuilder_profiles;
+create policy "public deckbuilder profiles readable"
+  on deckbuilder_profiles for select
+  using (public);
+
+alter table deckbuilder_collection enable row level security;
+drop policy if exists "own deckbuilder collection rows" on deckbuilder_collection;
+create policy "own deckbuilder collection rows"
+  on deckbuilder_collection for all
+  using (auth.uid() = user_id)
+  with check (auth.uid() = user_id);
+drop policy if exists "public deckbuilder collection readable" on deckbuilder_collection;
+create policy "public deckbuilder collection readable"
+  on deckbuilder_collection for select
+  using (is_public_deckbuilder_profile(user_id));
+
+alter table deckbuilder_wants enable row level security;
+drop policy if exists "own deckbuilder wants rows" on deckbuilder_wants;
+create policy "own deckbuilder wants rows"
+  on deckbuilder_wants for all
+  using (auth.uid() = user_id)
+  with check (auth.uid() = user_id);
+drop policy if exists "public deckbuilder wants readable" on deckbuilder_wants;
+create policy "public deckbuilder wants readable"
+  on deckbuilder_wants for select
+  using (is_public_deckbuilder_profile(user_id));
+
+create or replace function deckbuilder_set_profile(p_public boolean, p_display_name text default null) returns void
+language sql security invoker set search_path = public, extensions as $$
+  insert into deckbuilder_profiles (user_id, public, display_name, updated_at)
+  values (auth.uid(), p_public, coalesce(nullif(trim(p_display_name), ''), ''), now())
+  on conflict (user_id) do update set
+    public = excluded.public,
+    display_name = case when p_display_name is null then deckbuilder_profiles.display_name else excluded.display_name end,
+    updated_at = now();
+$$;
+
+-- Full replace of the caller's own list, e.g. {game_id, card_id, card_name, set_code, quantity, for_trade}[].
+-- The client only calls this with its whole local collection/wants, so a delete-then-insert can't
+-- leave a stale row behind from a card that was un-owned or removed since the last sync.
+create or replace function deckbuilder_sync_collection(p_entries jsonb) returns void
+language plpgsql security invoker set search_path = public, extensions as $$
+begin
+  if auth.uid() is null then
+    raise exception 'not signed in';
+  end if;
+  delete from deckbuilder_collection where user_id = auth.uid();
+  insert into deckbuilder_collection (user_id, game_id, card_id, card_name, set_code, quantity, for_trade)
+  select auth.uid(), e->>'game_id', e->>'card_id', e->>'card_name', coalesce(e->>'set_code', ''),
+    (e->>'quantity')::int, coalesce((e->>'for_trade')::boolean, false)
+  from jsonb_array_elements(p_entries) as e
+  where (e->>'quantity')::int > 0;
+end;
+$$;
+
+create or replace function deckbuilder_sync_wants(p_entries jsonb) returns void
+language plpgsql security invoker set search_path = public, extensions as $$
+begin
+  if auth.uid() is null then
+    raise exception 'not signed in';
+  end if;
+  delete from deckbuilder_wants where user_id = auth.uid();
+  insert into deckbuilder_wants (user_id, game_id, card_id, card_name, quantity)
+  select auth.uid(), e->>'game_id', e->>'card_id', e->>'card_name', (e->>'quantity')::int
+  from jsonb_array_elements(p_entries) as e
+  where (e->>'quantity')::int > 0;
+end;
+$$;
+
+-- Every other public profile's full collection and want list, for the Browse page. security
+-- definer so it can read the account's email out of auth.users (never exposed to PostgREST
+-- directly) — the one piece of contact info two people need to actually arrange a trade.
+create or replace function deckbuilder_browse() returns jsonb
+language plpgsql security definer set search_path = public, extensions as $$
+declare
+  result jsonb;
+begin
+  if auth.uid() is null then
+    raise exception 'not signed in';
+  end if;
+  select coalesce(jsonb_agg(jsonb_build_object(
+    'user_id', p.user_id,
+    'display_name', p.display_name,
+    'email', u.email,
+    'collection', (
+      select coalesce(jsonb_agg(jsonb_build_object(
+        'game_id', c.game_id, 'card_id', c.card_id, 'card_name', c.card_name,
+        'set_code', c.set_code, 'quantity', c.quantity, 'for_trade', c.for_trade
+      ) order by c.card_name), '[]'::jsonb)
+      from deckbuilder_collection c where c.user_id = p.user_id
+    ),
+    'wants', (
+      select coalesce(jsonb_agg(jsonb_build_object(
+        'game_id', w.game_id, 'card_id', w.card_id, 'card_name', w.card_name, 'quantity', w.quantity
+      ) order by w.card_name), '[]'::jsonb)
+      from deckbuilder_wants w where w.user_id = p.user_id
+    )
+  ) order by p.display_name), '[]'::jsonb)
+  into result
+  from deckbuilder_profiles p
+  join auth.users u on u.id = p.user_id
+  where p.public and p.user_id <> auth.uid();
+  return result;
+end;
+$$;
+
+-- Trade matches for the caller: everyone whose for-trade list covers something the caller wants,
+-- or who wants something the caller has for trade (by name, see deckbuilder_collection above).
+-- `mutual` is true when it goes both ways -- the strongest kind of match, since neither side has
+-- to give something up for nothing.
+create or replace function deckbuilder_matches() returns jsonb
+language plpgsql security definer set search_path = public, extensions as $$
+declare
+  result jsonb;
+begin
+  if auth.uid() is null then
+    raise exception 'not signed in';
+  end if;
+  with my_trades as (
+    select game_id, lower(card_name) as norm_name from deckbuilder_collection
+    where user_id = auth.uid() and for_trade
+  ), my_wants as (
+    select game_id, lower(card_name) as norm_name from deckbuilder_wants
+    where user_id = auth.uid()
+  ), they_have as (
+    select c.user_id, c.game_id, c.card_name
+    from deckbuilder_collection c
+    join my_wants w on w.game_id = c.game_id and w.norm_name = lower(c.card_name)
+    where c.for_trade and c.user_id <> auth.uid() and is_public_deckbuilder_profile(c.user_id)
+  ), i_have as (
+    select ws.user_id, ws.game_id, ws.card_name
+    from deckbuilder_wants ws
+    join my_trades t on t.game_id = ws.game_id and t.norm_name = lower(ws.card_name)
+    where ws.user_id <> auth.uid() and is_public_deckbuilder_profile(ws.user_id)
+  ), people as (
+    select user_id from they_have
+    union
+    select user_id from i_have
+  )
+  select coalesce(jsonb_agg(jsonb_build_object(
+    'user_id', ppl.user_id,
+    'display_name', pr.display_name,
+    'email', u.email,
+    'they_have_what_i_want', (
+      select coalesce(jsonb_agg(distinct jsonb_build_object('game_id', game_id, 'card_name', card_name)), '[]'::jsonb)
+      from they_have th where th.user_id = ppl.user_id
+    ),
+    'i_have_what_they_want', (
+      select coalesce(jsonb_agg(distinct jsonb_build_object('game_id', game_id, 'card_name', card_name)), '[]'::jsonb)
+      from i_have ih where ih.user_id = ppl.user_id
+    ),
+    'mutual', exists(select 1 from they_have th where th.user_id = ppl.user_id)
+      and exists(select 1 from i_have ih where ih.user_id = ppl.user_id)
+  ) order by pr.display_name), '[]'::jsonb)
+  into result
+  from people ppl
+  join deckbuilder_profiles pr on pr.user_id = ppl.user_id
+  join auth.users u on u.id = ppl.user_id;
+  return result;
+end;
+$$;
