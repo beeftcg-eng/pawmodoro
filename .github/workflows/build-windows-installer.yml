@@ -1,0 +1,52 @@
+name: Build Windows installer
+
+# Produces Pawmodoro-Setup.exe (windows_installer/pawmodoro.iss) via Inno Setup,
+# which GitHub's windows-latest runners ship preinstalled - unlike the
+# zip-plus-script bundle attached to each GitHub release (which the in-app
+# updater reads and remains the primary/only distribution channel that
+# changes), this is a real silently-installable .exe needed for winget and
+# similar package managers. Run from the Actions tab, or push a v* tag; the
+# installer is attached to the run as the "Pawmodoro-Setup" artifact.
+
+on:
+  workflow_dispatch: {}
+  push:
+    tags: ["v*"]
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Ambient sound files are gitignored (one is 227MB) and regenerated
+      # locally before each release, same as CLAUDE.md documents for the
+      # zip bundle.
+      - name: Generate ambient sound resources
+        run: |
+          pip install numpy scipy
+          python tools/generate_rain.py
+          python tools/generate_ambient.py
+
+      - name: Read version
+        id: version
+        shell: pwsh
+        run: |
+          $text = Get-Content version.py -Raw
+          if ($text -notmatch '"([^"]+)"') { throw "Couldn't parse VERSION from version.py" }
+          echo "version=$($Matches[1])" >> $env:GITHUB_OUTPUT
+
+      - name: Compile installer
+        shell: pwsh
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAppVersion=${{ steps.version.outputs.version }} windows_installer\pawmodoro.iss
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Pawmodoro-Setup
+          path: windows_installer\Output\Pawmodoro-Setup.exe
+          if-no-files-found: error
