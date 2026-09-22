@@ -242,7 +242,21 @@ class PlayerBar(QWidget):
                 self.player_combo.setCurrentText(current_text)
                 self.current_player = current_text
             else:
-                preferred = SPOTIFY_LABEL if SPOTIFY_LABEL in players else mpris.pick_default(players)
+                # The previous selection dropped out of the list (e.g. a
+                # browser tab reloaded and its player id changed) - if it
+                # was a non-Spotify player, stay on a non-Spotify player
+                # when one's still available instead of falling back to
+                # Spotify, which would otherwise silently and permanently
+                # steal the selection back on every later refresh (Spotify
+                # trivially stays "in players" once picked).
+                was_non_spotify = self.current_player is not None and self.current_player != SPOTIFY_LABEL
+                non_spotify = [p for p in players if p != SPOTIFY_LABEL]
+                if was_non_spotify and non_spotify:
+                    preferred = mpris.pick_default(non_spotify)
+                elif SPOTIFY_LABEL in players:
+                    preferred = SPOTIFY_LABEL
+                else:
+                    preferred = mpris.pick_default(players)
                 self.player_combo.setCurrentText(preferred)
                 self.current_player = preferred
         self.player_combo.blockSignals(False)

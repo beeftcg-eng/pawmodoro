@@ -19,9 +19,9 @@ Write-Host "Installing Pawmodoro to $InstallDir ..."
 # code even after you reinstall. Stop it first so an update actually
 # takes effect. The actual long-running process is always pythonw.exe
 # (the launcher exe, see $AppExe below, just launches that and exits
-# immediately), but the LIKE match covers it too - its filename is
-# version-specific (Pawmodoro-X.Y.Z.exe), so an exact-name match would
-# silently stop matching on every single release.
+# immediately), but the LIKE match covers it too, in case a version-
+# specific launcher exe from an install predating this script's switch
+# to a stable filename is still what's actually running.
 Get-CimInstance Win32_Process -Filter "Name = 'pythonw.exe' OR Name = 'python.exe' OR Name LIKE 'Pawmodoro%.exe'" -ErrorAction SilentlyContinue |
     Where-Object { $_.CommandLine -like "*Pawmodoro*main.py*" } |
     ForEach-Object {
@@ -93,19 +93,18 @@ $ErrorActionPreference = $PreviousErrorAction
 # interpreter and has its own embedded icon/version info, so it can't be
 # confused with one.
 #
-# The filename includes the version number rather than always being a
-# plain "Pawmodoro.exe": Windows' shell icon cache can key off a file's
-# path, and if an earlier install ever put something else at that exact
-# path (an old build, an interpreter copy, whatever), a stale cached icon
-# can keep showing there even after the file's actual content changes and
-# even after unpinning/re-pinning - a version-specific path can never
-# collide with whatever an older install left behind, sidestepping that
-# regardless of exactly how the caching was going wrong. The "wipe
-# everything except venv" step above already deletes any older version's
-# exe, so this doesn't accumulate stale files.
-$VersionText = Get-Content (Join-Path $SrcDir "version.py") -Raw
-$AppVersion = if ($VersionText -match '"([^"]+)"') { $Matches[1] } else { "0" }
-$AppExe = Join-Path $InstallDir "Pawmodoro-$AppVersion.exe"
+# The filename is stable ("Pawmodoro.exe") rather than version-suffixed,
+# so a Desktop/Start Menu pin (which stores its own resolved target path,
+# separate from the shortcut it was pinned from) keeps working across
+# updates instead of turning into a dangling reference to a deleted file
+# every release. This is safe against the old version-suffix's original
+# stale-shell-icon-cache concern: the "wipe everything except venv" step
+# above deletes the previous install's exe (whatever its name) before
+# this one is copied in, and main.py now also sets an explicit, constant
+# AppUserModelID on the running process, which is what Explorer actually
+# keys pin/grouping identity off of - a leftover cached icon would be
+# cosmetic at worst, not an identity mix-up.
+$AppExe = Join-Path $InstallDir "Pawmodoro.exe"
 Copy-Item -Path (Join-Path $SrcDir "windows_launcher\Pawmodoro.exe") -Destination $AppExe -Force
 
 # Launcher: uses pythonw.exe (no console window) for double-click use
@@ -140,12 +139,26 @@ if (Test-Path $IconPath) {
 }
 $Shortcut.Save()
 
+# Start Menu shortcut too (per-user, no admin rights needed) - on modern
+# Windows, "Pin to taskbar" is most reliably offered from a Start Menu
+# entry rather than an arbitrary Desktop shortcut.
+$StartMenuDir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs"
+New-Item -ItemType Directory -Force -Path $StartMenuDir | Out-Null
+$StartShortcut = $Shell.CreateShortcut((Join-Path $StartMenuDir "Pawmodoro.lnk"))
+$StartShortcut.TargetPath = $AppExe
+$StartShortcut.WorkingDirectory = $InstallDir
+if (Test-Path $IconPath) {
+    $StartShortcut.IconLocation = $IconPath
+}
+$StartShortcut.Save()
+
 Write-Host ""
-Write-Host "Done! A 'Pawmodoro' shortcut was added to your Desktop."
+Write-Host "Done! A 'Pawmodoro' shortcut was added to your Desktop and Start Menu."
 Write-Host "Double-click it to launch. (If something looks wrong, run"
 Write-Host "$InstallDir\run_console.bat instead to see error output.)"
-Write-Host "Want it on your taskbar? Right-click the Desktop shortcut and choose"
-Write-Host "'Pin to taskbar'."
+Write-Host "Want it on your taskbar? Find it in the Start Menu and choose"
+Write-Host "'Pin to taskbar', or right-click its icon in the taskbar while"
+Write-Host "it's running and choose the same."
 
 if (-not (Get-Command ffplay -ErrorAction SilentlyContinue)) {
     Write-Host ""

@@ -55,6 +55,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $dir 'pawmodoro\i
 
 ## What changed from the first version
 
+**v2.13.2 — Windows taskbar pinning, and browser playback fixes.** No schema change.
+- **Windows taskbar pin fix**: pinning never reliably worked. `main.py` now sets an explicit, stable AppUserModelID (`SetCurrentProcessExplicitAppUserModelID`) on the real running process, which is what Explorer keys pin/taskbar-grouping identity off of. `install.ps1` also now installs `Pawmodoro.exe` under a **stable filename** (it used to be version-suffixed, e.g. `Pawmodoro-2.13.1.exe`) — since a taskbar pin stores its own resolved target path separately from the shortcut it was pinned from, a version-suffixed exe meant every update silently deleted the file an existing pin pointed at. A **Start Menu shortcut** was added too (previously Desktop-only), since that's the more reliable place to find "Pin to taskbar" on modern Windows.
+- **Browser playback fix** (`player_bar.py`): once Spotify was connected, the player dropdown would silently and permanently fall back to Spotify the moment an active browser/MPRIS/SMTC session's reported id changed (e.g. a tab reload) — the bar now stays on a non-Spotify player when one's still available instead of defaulting back to Spotify.
+- **Windows SMTC hardening** (`smtc_windows.py`): transport commands (play/pause/next/previous/loop/shuffle) constructed the WinRT async call outside the module's one logged error path, so a real API-shape bug there would look identical to "browser not detected," with nothing printed. All calls now funnel through the same logged path, and setting `PAWMODORO_SMTC_DEBUG=1` gets every error (not just the first of its kind), a full traceback, and a session count on every poll — useful to paste back if a browser session still isn't picked up.
+- **Flatpak Firefox note** (Linux): documented that it needs an explicit D-Bus permission grant to expose MPRIS at all — see "Playback controls: installing playerctl" below.
+- **Honest testing note**: the `player_bar.py` selection-stickiness fix and the `main.py` AUMID call's own no-op-on-non-Windows guard were run headless on Linux (`QT_QPA_PLATFORM=offscreen`); the `smtc_windows.py` refactor was checked for import/syntax correctness only. **Not exercised: any of it on a real Windows machine** — the taskbar pin behavior, the Start Menu shortcut, the stable-filename install path across an update, and whether the SMTC hardening actually surfaces a real bug. If pinning or browser detection is still broken after this, run with `PAWMODORO_SMTC_DEBUG=1` (Windows) and paste back what prints.
+
 **v2.13.1 — emoji icons drawing again on Linux, and a Get the mobile app button.** No schema change.
 - **Get the mobile app** (`mobile_app_dialog.py`): a **📱 Get the mobile app** button in the window header (and **View → Get the mobile app…**) opens a small dialog with the phone app's address, **Open in browser** / **Copy link** buttons, and the steps to sign in with the same account and add it to a home screen.
 - **Fix** (`theme.py`): the emoji in tabs and buttons (🏆 Progress, 🏠 Shared, ☁️ Sync, 🎨 Theme, 🔔, 🎵, ⏳ …) showed as blank gaps on some Linux systems. Qt picked "Noto Color Emoji" for them, and where that is the newer COLRv1 build (Fedora 44, for one) Qt 6 can't draw it. The theme's font list now offers **Twemoji** for emoji first; a machine without it (Windows, macOS, most distros) skips it and behaves exactly as before. On Fedora it's the `twitter-twemoji-fonts` package (already installed on the machine this was found on).
@@ -201,6 +208,12 @@ distrobox enter tools -- distrobox-export --bin /usr/bin/playerctl
 If `rpm-ostree install` fails with a "min-free-space-percent" error, your OSTree partition is low on space — run `rpm-ostree cleanup -bpr` to reclaim space from old deployments, or just use the distrobox route instead, which doesn't touch the OS image at all.
 
 **Note on `distrobox-export`:** it drops the wrapper in `~/.local/bin/playerctl`, but apps launched from the KDE app menu (rather than a terminal) don't always inherit `~/.local/bin` on their `PATH`. Pawmodoro checks that location directly regardless of `PATH`, and prints where it looked (`[mpris] playerctl found at ...` / `NOT found`) if you run it from a terminal — useful for double-checking.
+
+**Note on Flatpak Firefox:** it doesn't expose an MPRIS D-Bus name by default, so a YouTube Music tab playing in it won't show up as a player at all (this isn't specific to Pawmodoro — `playerctl -l` alone won't list it either). Grant it the permission once:
+```bash
+flatpak override --user --talk-name=org.mpris.MediaPlayer2.firefox org.mozilla.firefox
+```
+A non-Flatpak (system package, or other distribution method) Firefox doesn't need this.
 
 **Volume and shuffle controls are best-effort.** Browsers only forward what the web Media Session API supports to MPRIS — play/pause/next/previous/seek work reliably for a YouTube Music tab, but volume and shuffle aren't part of that API, so those two controls may only do something with native MPRIS apps (e.g. a Spotify desktop client), not a browser tab. They're included since they're genuinely useful when you do have a native player active.
 

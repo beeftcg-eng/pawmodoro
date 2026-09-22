@@ -502,6 +502,18 @@ class MainWindow(QMainWindow):
 
 def main():
     print(f"Pawmodoro v{VERSION} starting...")
+    if sys.platform == "win32":
+        # Explicit, stable app identity so Explorer groups/recognizes this
+        # window consistently across launches - needed for "pin to
+        # taskbar" to work and for a pin to keep resolving to this app
+        # rather than a generic/mismatched identity. Must be set on the
+        # real long-running process (this one), since the launcher exe
+        # (windows_launcher/) just spawns pythonw.exe and exits.
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Pawmodoro.DesktopApp")
+        except Exception:
+            pass
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName("Pawmodoro")

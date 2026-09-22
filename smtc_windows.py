@@ -32,6 +32,14 @@ Caveats versus real MPRIS:
   once, picking a default falls back to a browser-name heuristic only.
 """
 import asyncio
+import os
+import traceback
+
+# Set PAWMODORO_SMTC_DEBUG=1 to get every error (not just the first of each
+# kind) plus a full traceback, and a session count on every list_players()
+# call - useful for a user to paste back when this module isn't finding a
+# browser session and the reason isn't obvious from the plain output above.
+_SMTC_DEBUG = os.environ.get("PAWMODORO_SMTC_DEBUG") == "1"
 
 try:
     from winsdk.windows.media.control import (
@@ -62,15 +70,23 @@ def available():
 _last_error_logged = None
 
 
-def _run(coro):
+def _run(fn):
     """Every entry point here is a synchronous, one-shot call (mirrors
     mpris.py's subprocess-per-call shape), so just spin up a fresh event
-    loop each time rather than keeping one alive across the whole app."""
+    loop each time rather than keeping one alive across the whole app.
+
+    `fn` is a zero-arg callable that *returns* the awaitable, not the
+    awaitable itself - constructing it (e.g. evaluating
+    `session.try_toggle_play_pause_async()`) can itself raise (wrong
+    attribute name on this winsdk version, wrong arg count), and building
+    it inside this try is what funnels that through the one logged path
+    below instead of vanishing into a bare `except: pass` at the call
+    site, which would look identical to "nothing to control"."""
     global _last_error_logged
     if not _WINSDK_OK:
         return None
     try:
-        return asyncio.run(coro)
+        return asyncio.run(fn())
     except Exception as e:
         # Only the *first* occurrence of each distinct error is printed -
         # this runs on every player_bar poll tick (every ~1.5s), and a
@@ -79,9 +95,11 @@ def _run(coro):
         # distinguishable from "no browser session right now" instead of
         # both looking identical from the outside.
         message = f"{type(e).__name__}: {e}"
-        if message != _last_error_logged:
+        if _SMTC_DEBUG or message != _last_error_logged:
             _last_error_logged = message
             print(f"[smtc] unexpected error talking to Windows media session API: {message}")
+            if _SMTC_DEBUG:
+                traceback.print_exc()
         return None
 
 
@@ -91,7 +109,7 @@ async def _get_sessions():
 
 
 def _find_session(player_id):
-    sessions = _run(_get_sessions()) or []
+    sessions = _run(_get_sessions) or []
     for s in sessions:
         try:
             if s.source_app_user_model_id == player_id:
@@ -125,7 +143,9 @@ def _timespan_seconds(ts):
 def list_players():
     if not _WINSDK_OK:
         return []
-    sessions = _run(_get_sessions()) or []
+    sessions = _run(_get_sessions) or []
+    if _SMTC_DEBUG:
+        print(f"[smtc] list_players: {len(sessions)} session(s)")
     players = []
     for s in sessions:
         try:
@@ -163,10 +183,7 @@ def now_playing_bundle(player):
     session = _find_session(player)
     if not session:
         return "", None
-    try:
-        props = _run(session.try_get_media_properties_async())
-    except Exception:
-        props = None
+    props = _run(session.try_get_media_properties_async)
     title = (getattr(props, "title", "") or "") if props else ""
     artist = (getattr(props, "artist", "") or "") if props else ""
     text = (f"{title} — {artist}" if title and artist else title) if title else ""
@@ -182,15 +199,12 @@ def command(player, action):
     session = _find_session(player)
     if not session:
         return
-    try:
-        if action == "play-pause":
-            _run(session.try_toggle_play_pause_async())
-        elif action == "next":
-            _run(session.try_skip_next_async())
-        elif action == "previous":
-            _run(session.try_skip_previous_async())
-    except Exception:
-        pass
+    if action == "play-pause":
+        _run(session.try_toggle_play_pause_async)
+    elif action == "next":
+        _run(session.try_skip_next_async)
+    elif action == "previous":
+        _run(session.try_skip_previous_async)
 
 
 def seek(player, seconds):
@@ -231,10 +245,7 @@ def set_loop_status(player, value):
     if not session:
         return
     mode = {"None": 0, "Track": 1, "Playlist": 2}.get(value, 0)
-    try:
-        _run(session.try_change_auto_repeat_mode_async(mode))
-    except Exception:
-        pass
+    _run(lambda: session.try_change_auto_repeat_mode_async(mode))
 
 
 def get_shuffle(player):
@@ -254,10 +265,7 @@ def set_shuffle(player, value):
     session = _find_session(player)
     if not session:
         return
-    try:
-        _run(session.try_change_shuffle_active_async(value == "On"))
-    except Exception:
-        pass
+    _run(lambda: session.try_change_shuffle_active_async(value == "On"))
 
 
 def get_url(player):
