@@ -238,19 +238,31 @@ async function doAuth(mode) {
     errEl.textContent = "Email and password are required.";
     return;
   }
-  const { error } = mode === "signup"
-    ? await supabaseClient.auth.signUp({ email, password })
-    : await supabaseClient.auth.signInWithPassword({ email, password });
-  if (error) {
-    errEl.textContent = error.message;
-    return;
+  // Unguarded, a flaky connection (e.g. switching wifi/cell) could make the
+  // auth call reject instead of resolving with {error}, leaving the button
+  // looking like it did nothing — same class of bug boot() had before it
+  // got try/catch + a timeout.
+  const btn = document.getElementById(mode === "signup" ? "signup-btn" : "login-btn");
+  btn.disabled = true;
+  try {
+    const { error } = mode === "signup"
+      ? await withTimeout(supabaseClient.auth.signUp({ email, password }), 10000, "Timed out. Check your connection and try again.")
+      : await withTimeout(supabaseClient.auth.signInWithPassword({ email, password }), 10000, "Timed out. Check your connection and try again.");
+    if (error) {
+      errEl.textContent = error.message;
+      return;
+    }
+    const { data: { session } } = await supabaseClient.auth.getSession();
+    if (!session) {
+      errEl.textContent = "Check your email to confirm the account, then log in.";
+      return;
+    }
+    await enterApp();
+  } catch (err) {
+    errEl.textContent = err?.message || String(err);
+  } finally {
+    btn.disabled = false;
   }
-  const { data: { session } } = await supabaseClient.auth.getSession();
-  if (!session) {
-    errEl.textContent = "Check your email to confirm the account, then log in.";
-    return;
-  }
-  await enterApp();
 }
 
 // ---------- Main app ----------
