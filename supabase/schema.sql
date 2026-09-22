@@ -1270,3 +1270,149 @@ begin
   return result;
 end;
 $$;
+
+-- Real two-way sync (decks, collection, wishlist) between a person's own devices - the desktop
+-- app and the phone PWA - as opposed to everything above this point, which is one-way pushes for
+-- the trading feature. Deliberately additive: deckbuilder_sync_collection/deckbuilder_sync_wants
+-- above are untouched and keep working for any client still calling them; the RPCs below are a
+-- second, incremental way to write the same deckbuilder_collection/deckbuilder_wants tables (both
+-- keyed the same way, so rows from either path are interchangeable), plus a new deckbuilder_decks
+-- table those two didn't need. Mirrors Pawmodoro's own sync shape: the client keeps a purely
+-- local monotonic "rev" (never stored here) that it bumps on every local edit and every completed
+-- upload, and only applies a deckbuilder_sync_pull result if that rev hasn't moved since the pull
+-- started and its own outbox is empty - see storage.py's adopt_remote_state for the original.
+-- There's no soft-delete/tombstone column anywhere here: a deck, collection row or wishlist row
+-- that's gone server-side simply isn't in deckbuilder_sync_pull's next result, and the client does
+-- a full local replace of each of those three lists from that result (same as Pawmodoro's
+-- checklist), so an ordinary hard delete is enough to propagate.
+
+-- One deck as one JSON blob (name, formatId, zones, locked, iconCardId, etc.) rather than
+-- decomposed into columns - decks are never queried by content server-side (no "browse other
+-- people's decks" feature), and this way the schema never needs to change when the Deck type
+-- gains a field. `id` is the deck's own client-generated id, unchanged across syncs.
+create table if not exists deckbuilder_decks (
+  user_id uuid not null references auth.users(id) on delete cascade,
+  id text not null,
+  game_id text not null,
+  data jsonb not null,
+  updated_at timestamptz not null default now(),
+  primary key (user_id, id)
+);
+
+alter table deckbuilder_decks enable row level security;
+drop policy if exists "own deckbuilder decks" on deckbuilder_decks;
+create policy "own deckbuilder decks"
+  on deckbuilder_decks for all
+  using (auth.uid() = user_id)
+  with check (auth.uid() = user_id);
+
+create or replace function deckbuilder_save_deck(p_id text, p_game_id text, p_data jsonb) returns void
+language plpgsql security invoker set search_path = public, extensions as $$
+begin
+  if auth.uid() is null then
+    raise exception 'not signed in';
+  end if;
+  insert into deckbuilder_decks (user_id, id, game_id, data, updated_at)
+  values (auth.uid(), p_id, p_game_id, p_data, now())
+  on conflict (user_id, id) do update set
+    game_id = excluded.game_id,
+    data = excluded.data,
+    updated_at = now();
+end;
+$$;
+
+create or replace function deckbuilder_delete_deck(p_id text) returns void
+language sql security invoker set search_path = public, extensions as $$
+  delete from deckbuilder_decks where user_id = auth.uid() and id = p_id;
+$$;
+
+-- Incremental collection/wishlist writes - one row at a time, unlike the full-replace
+-- deckbuilder_sync_collection/deckbuilder_sync_wants above, so an edit on one device doesn't have
+-- to ship the caller's entire collection just to change one card's count. Quantity 0 deletes the
+-- row outright (not a lingering zero-quantity row) since deckbuilder_browse/deckbuilder_matches
+-- don't filter on quantity and would otherwise show a card the person no longer owns.
+create or replace function deckbuilder_set_collection_quantity(
+  p_game_id text, p_card_id text, p_card_name text, p_set_code text, p_quantity int
+) returns void
+language plpgsql security invoker set search_path = public, extensions as $$
+begin
+  if auth.uid() is null then
+    raise exception 'not signed in';
+  end if;
+  if p_quantity <= 0 then
+    delete from deckbuilder_collection where user_id = auth.uid() and game_id = p_game_id and card_id = p_card_id;
+    return;
+  end if;
+  insert into deckbuilder_collection (user_id, game_id, card_id, card_name, set_code, quantity, updated_at)
+  values (auth.uid(), p_game_id, p_card_id, p_card_name, coalesce(p_set_code, ''), p_quantity, now())
+  on conflict (user_id, game_id, card_id) do update set
+    card_name = excluded.card_name,
+    set_code = excluded.set_code,
+    quantity = excluded.quantity,
+    updated_at = now();
+end;
+$$;
+
+-- Only meaningful for a card already in the collection (marking something "for trade" you don't
+-- own is a no-op, not an error - the row simply won't exist yet).
+create or replace function deckbuilder_set_for_trade(p_game_id text, p_card_id text, p_for_trade boolean) returns void
+language sql security invoker set search_path = public, extensions as $$
+  update deckbuilder_collection set for_trade = p_for_trade, updated_at = now()
+  where user_id = auth.uid() and game_id = p_game_id and card_id = p_card_id;
+$$;
+
+create or replace function deckbuilder_wishlist_set_quantity(
+  p_game_id text, p_card_id text, p_card_name text, p_quantity int
+) returns void
+language plpgsql security invoker set search_path = public, extensions as $$
+begin
+  if auth.uid() is null then
+    raise exception 'not signed in';
+  end if;
+  if p_quantity <= 0 then
+    delete from deckbuilder_wants where user_id = auth.uid() and game_id = p_game_id and card_id = p_card_id;
+    return;
+  end if;
+  insert into deckbuilder_wants (user_id, game_id, card_id, card_name, quantity, updated_at)
+  values (auth.uid(), p_game_id, p_card_id, p_card_name, p_quantity, now())
+  on conflict (user_id, game_id, card_id) do update set
+    card_name = excluded.card_name,
+    quantity = excluded.quantity,
+    updated_at = now();
+end;
+$$;
+
+-- Full current state for the caller's own decks/collection/wishlist, for the client to reconcile
+-- against its local rev (see the comment above this section). Unlike deckbuilder_browse, this is
+-- never security definer and never reads another user's rows - security invoker plus RLS is
+-- exactly the access this needs.
+create or replace function deckbuilder_sync_pull() returns jsonb
+language plpgsql security invoker set search_path = public, extensions as $$
+declare
+  result jsonb;
+begin
+  if auth.uid() is null then
+    raise exception 'not signed in';
+  end if;
+  select jsonb_build_object(
+    'decks', (
+      select coalesce(jsonb_agg(jsonb_build_object('id', d.id, 'game_id', d.game_id, 'data', d.data)), '[]'::jsonb)
+      from deckbuilder_decks d where d.user_id = auth.uid()
+    ),
+    'collection', (
+      select coalesce(jsonb_agg(jsonb_build_object(
+        'game_id', c.game_id, 'card_id', c.card_id, 'card_name', c.card_name,
+        'set_code', c.set_code, 'quantity', c.quantity, 'for_trade', c.for_trade
+      )), '[]'::jsonb)
+      from deckbuilder_collection c where c.user_id = auth.uid()
+    ),
+    'wants', (
+      select coalesce(jsonb_agg(jsonb_build_object(
+        'game_id', w.game_id, 'card_id', w.card_id, 'card_name', w.card_name, 'quantity', w.quantity
+      )), '[]'::jsonb)
+      from deckbuilder_wants w where w.user_id = auth.uid()
+    )
+  ) into result;
+  return result;
+end;
+$$;
