@@ -12,3 +12,6 @@ venv/
 
 # Never commit local user data.
 data.json
+
+# Supabase CLI working files (project link, cached versions).
+supabase/.temp/
