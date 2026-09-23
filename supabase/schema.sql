@@ -1271,20 +1271,21 @@ begin
 end;
 $$;
 
--- Real two-way sync (decks, collection, wishlist) between a person's own devices - the desktop
--- app and the phone PWA - as opposed to everything above this point, which is one-way pushes for
--- the trading feature. Deliberately additive: deckbuilder_sync_collection/deckbuilder_sync_wants
--- above are untouched and keep working for any client still calling them; the RPCs below are a
--- second, incremental way to write the same deckbuilder_collection/deckbuilder_wants tables (both
--- keyed the same way, so rows from either path are interchangeable), plus a new deckbuilder_decks
--- table those two didn't need. Mirrors Pawmodoro's own sync shape: the client keeps a purely
--- local monotonic "rev" (never stored here) that it bumps on every local edit and every completed
--- upload, and only applies a deckbuilder_sync_pull result if that rev hasn't moved since the pull
--- started and its own outbox is empty - see storage.py's adopt_remote_state for the original.
--- There's no soft-delete/tombstone column anywhere here: a deck, collection row or wishlist row
--- that's gone server-side simply isn't in deckbuilder_sync_pull's next result, and the client does
--- a full local replace of each of those three lists from that result (same as Pawmodoro's
--- checklist), so an ordinary hard delete is enough to propagate.
+-- Real two-way sync (decks, binders, collection, wishlist) between a person's own devices - the
+-- desktop app and the phone PWA - as opposed to everything above this point, which is one-way
+-- pushes for the trading feature. Deliberately additive: deckbuilder_sync_collection/
+-- deckbuilder_sync_wants above are untouched and keep working for any client still calling them;
+-- the RPCs below are a second, incremental way to write the same deckbuilder_collection/
+-- deckbuilder_wants tables (both keyed the same way, so rows from either path are
+-- interchangeable), plus new deckbuilder_decks/deckbuilder_binders tables those two didn't need.
+-- Mirrors Pawmodoro's own sync shape: the client keeps a purely local monotonic "rev" (never
+-- stored here) that it bumps on every local edit and every completed upload, and only applies a
+-- deckbuilder_sync_pull result if that rev hasn't moved since the pull started and its own
+-- outbox is empty - see storage.py's adopt_remote_state for the original. There's no soft-
+-- delete/tombstone column anywhere here: a deck, binder, collection row or wishlist row that's
+-- gone server-side simply isn't in deckbuilder_sync_pull's next result, and the client does a
+-- full local replace of each of those lists from that result (same as Pawmodoro's checklist), so
+-- an ordinary hard delete is enough to propagate.
 
 -- One deck as one JSON blob (name, formatId, zones, locked, iconCardId, etc.) rather than
 -- decomposed into columns - decks are never queried by content server-side (no "browse other
@@ -1324,6 +1325,44 @@ $$;
 create or replace function deckbuilder_delete_deck(p_id text) returns void
 language sql security invoker set search_path = public, extensions as $$
   delete from deckbuilder_decks where user_id = auth.uid() and id = p_id;
+$$;
+
+-- A named, cross-game group of owned cards (see src/shared/types.ts's Binder in the Deckbuilder
+-- repo) - unlike deckbuilder_decks, there's no game_id column: a binder's own `data.cards` map
+-- can hold any game's card ids side by side, since a physical binder doesn't care what game a
+-- card is from. Same one-JSON-blob shape and reasoning as deckbuilder_decks otherwise.
+create table if not exists deckbuilder_binders (
+  user_id uuid not null references auth.users(id) on delete cascade,
+  id text not null,
+  data jsonb not null,
+  updated_at timestamptz not null default now(),
+  primary key (user_id, id)
+);
+
+alter table deckbuilder_binders enable row level security;
+drop policy if exists "own deckbuilder binders" on deckbuilder_binders;
+create policy "own deckbuilder binders"
+  on deckbuilder_binders for all
+  using (auth.uid() = user_id)
+  with check (auth.uid() = user_id);
+
+create or replace function deckbuilder_save_binder(p_id text, p_data jsonb) returns void
+language plpgsql security invoker set search_path = public, extensions as $$
+begin
+  if auth.uid() is null then
+    raise exception 'not signed in';
+  end if;
+  insert into deckbuilder_binders (user_id, id, data, updated_at)
+  values (auth.uid(), p_id, p_data, now())
+  on conflict (user_id, id) do update set
+    data = excluded.data,
+    updated_at = now();
+end;
+$$;
+
+create or replace function deckbuilder_delete_binder(p_id text) returns void
+language sql security invoker set search_path = public, extensions as $$
+  delete from deckbuilder_binders where user_id = auth.uid() and id = p_id;
 $$;
 
 -- Incremental collection/wishlist writes - one row at a time, unlike the full-replace
@@ -1398,6 +1437,10 @@ begin
     'decks', (
       select coalesce(jsonb_agg(jsonb_build_object('id', d.id, 'game_id', d.game_id, 'data', d.data)), '[]'::jsonb)
       from deckbuilder_decks d where d.user_id = auth.uid()
+    ),
+    'binders', (
+      select coalesce(jsonb_agg(jsonb_build_object('id', b.id, 'data', b.data)), '[]'::jsonb)
+      from deckbuilder_binders b where b.user_id = auth.uid()
     ),
     'collection', (
       select coalesce(jsonb_agg(jsonb_build_object(
