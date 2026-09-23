@@ -1459,3 +1459,34 @@ begin
   return result;
 end;
 $$;
+
+-- A lighter, decks-only read for other apps that link to your Brewhouse decks (Pairings, the TCG
+-- tournament tracker, imports a deck from here and re-syncs it later). Returns each deck's
+-- metadata - never its card list: `data` minus the zones, plus `card_count` (every real card in
+-- every zone; free-text zones like Riftbound runes aren't counted, same as the app's own total)
+-- and whatever `summary` (leader/legend name, colors, format label) Brewhouse last saved on it.
+-- Security invoker plus RLS: only the caller's own decks, same as deckbuilder_sync_pull.
+create or replace function deckbuilder_list_decks() returns jsonb
+language plpgsql security invoker set search_path = public, extensions as $$
+declare
+  result jsonb;
+begin
+  if auth.uid() is null then
+    raise exception 'not signed in';
+  end if;
+  select coalesce(jsonb_agg(jsonb_build_object(
+    'id', d.id,
+    'game_id', d.game_id,
+    'updated_at', d.updated_at,
+    'data', d.data - 'zones' - 'freeTextZones',
+    'card_count', (
+      select coalesce(sum(case when jsonb_typeof(e->'quantity') = 'number' then (e->>'quantity')::numeric else 0 end), 0)::int
+      from jsonb_each(case when jsonb_typeof(d.data->'zones') = 'object' then d.data->'zones' else '{}'::jsonb end) z(zone_id, entries),
+           jsonb_array_elements(case when jsonb_typeof(z.entries) = 'array' then z.entries else '[]'::jsonb end) e
+    )
+  ) order by d.updated_at desc), '[]'::jsonb)
+  into result
+  from deckbuilder_decks d where d.user_id = auth.uid();
+  return result;
+end;
+$$;
