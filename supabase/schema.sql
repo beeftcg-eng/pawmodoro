@@ -1227,19 +1227,21 @@ begin
   if auth.uid() is null then
     raise exception 'not signed in';
   end if;
+  -- distinct so wanting (or trading) two printings of one card doesn't double the other side's
+  -- rows, and with it the summed quantities below.
   with my_trades as (
-    select game_id, lower(card_name) as norm_name from deckbuilder_collection
+    select distinct game_id, lower(card_name) as norm_name from deckbuilder_collection
     where user_id = auth.uid() and for_trade
   ), my_wants as (
-    select game_id, lower(card_name) as norm_name from deckbuilder_wants
+    select distinct game_id, lower(card_name) as norm_name from deckbuilder_wants
     where user_id = auth.uid()
   ), they_have as (
-    select c.user_id, c.game_id, c.card_name
+    select c.user_id, c.game_id, c.card_name, c.quantity
     from deckbuilder_collection c
     join my_wants w on w.game_id = c.game_id and w.norm_name = lower(c.card_name)
     where c.for_trade and c.user_id <> auth.uid() and is_public_deckbuilder_profile(c.user_id)
   ), i_have as (
-    select ws.user_id, ws.game_id, ws.card_name
+    select ws.user_id, ws.game_id, ws.card_name, ws.quantity
     from deckbuilder_wants ws
     join my_trades t on t.game_id = ws.game_id and t.norm_name = lower(ws.card_name)
     where ws.user_id <> auth.uid() and is_public_deckbuilder_profile(ws.user_id)
@@ -1248,17 +1250,27 @@ begin
     union
     select user_id from i_have
   )
+  -- `quantity` per card, summed over printings: copies they have marked for trade, or copies they
+  -- want. Clients must keep working without it (a cloud schema from before it was added).
   select coalesce(jsonb_agg(jsonb_build_object(
     'user_id', ppl.user_id,
     'display_name', pr.display_name,
     'email', u.email,
     'they_have_what_i_want', (
-      select coalesce(jsonb_agg(distinct jsonb_build_object('game_id', game_id, 'card_name', card_name)), '[]'::jsonb)
-      from they_have th where th.user_id = ppl.user_id
+      select coalesce(jsonb_agg(jsonb_build_object('game_id', game_id, 'card_name', card_name, 'quantity', qty) order by card_name), '[]'::jsonb)
+      from (
+        select game_id, card_name, sum(quantity)::int as qty
+        from they_have th where th.user_id = ppl.user_id
+        group by game_id, card_name
+      ) s
     ),
     'i_have_what_they_want', (
-      select coalesce(jsonb_agg(distinct jsonb_build_object('game_id', game_id, 'card_name', card_name)), '[]'::jsonb)
-      from i_have ih where ih.user_id = ppl.user_id
+      select coalesce(jsonb_agg(jsonb_build_object('game_id', game_id, 'card_name', card_name, 'quantity', qty) order by card_name), '[]'::jsonb)
+      from (
+        select game_id, card_name, sum(quantity)::int as qty
+        from i_have ih where ih.user_id = ppl.user_id
+        group by game_id, card_name
+      ) s
     ),
     'mutual', exists(select 1 from they_have th where th.user_id = ppl.user_id)
       and exists(select 1 from i_have ih where ih.user_id = ppl.user_id)
