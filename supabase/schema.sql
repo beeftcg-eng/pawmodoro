@@ -1576,3 +1576,43 @@ end;
 $$;
 
 grant execute on function deckbuilder_shared_deck(text) to anon, authenticated;
+
+-- Brewhouse's "Report a bug" button (BugReportModal.tsx in the Deckbuilder repo): reports from
+-- friends land here, to be read in the Supabase Table Editor. Nothing can read them through the API
+-- (RLS on and no policies); the only way in is deckbuilder_report_bug below, signed in or not.
+create table if not exists deckbuilder_bug_reports (
+  id bigint generated always as identity primary key,
+  created_at timestamptz not null default now(),
+  user_id uuid references auth.users(id) on delete set null,
+  message text not null,
+  contact text,
+  context jsonb not null default '{}'::jsonb
+);
+
+alter table deckbuilder_bug_reports enable row level security;
+revoke all on deckbuilder_bug_reports from anon, authenticated;
+
+-- Security definer so the anon role can add a report without being able to read any. Sizes are
+-- capped, and 30 reports an hour from everyone together keeps a stuck button or a script from
+-- flooding the table.
+create or replace function deckbuilder_report_bug(p_message text, p_contact text, p_context jsonb) returns void
+language plpgsql volatile security definer set search_path = public, extensions as $$
+begin
+  if p_message is null or length(trim(p_message)) = 0 then
+    raise exception 'empty report';
+  end if;
+  if p_context is not null and jsonb_typeof(p_context) <> 'object' then
+    raise exception 'bad report details';
+  end if;
+  if length(p_message) > 5000 or length(coalesce(p_contact, '')) > 200 or length(coalesce(p_context::text, '')) > 20000 then
+    raise exception 'report too long';
+  end if;
+  if (select count(*) from deckbuilder_bug_reports where created_at > now() - interval '1 hour') >= 30 then
+    raise exception 'too many reports right now, try again later';
+  end if;
+  insert into deckbuilder_bug_reports (user_id, message, contact, context)
+  values (auth.uid(), trim(p_message), nullif(trim(coalesce(p_contact, '')), ''), coalesce(p_context, '{}'::jsonb));
+end;
+$$;
+
+grant execute on function deckbuilder_report_bug(text, text, jsonb) to anon, authenticated;
