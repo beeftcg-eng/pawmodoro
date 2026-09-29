@@ -1398,6 +1398,45 @@ language sql security invoker set search_path = public, extensions as $$
   delete from deckbuilder_binders where user_id = auth.uid() and id = p_id;
 $$;
 
+-- Brewhouse's smaller synced things, one row each, so two devices editing different ones never
+-- overwrite each other: a pack opening (key = its id), a wishlist price alert (key = card id) and
+-- a point on the collection-value graph (key = "<game>:<YYYY-MM-DD>"). Brewhouse 0.37+.
+create table if not exists deckbuilder_user_items (
+  user_id uuid not null references auth.users(id) on delete cascade,
+  kind text not null check (kind in ('pack_opening', 'price_alert', 'value_point')),
+  key text not null check (length(key) between 1 and 200),
+  data jsonb not null,
+  updated_at timestamptz not null default now(),
+  primary key (user_id, kind, key)
+);
+
+alter table deckbuilder_user_items enable row level security;
+drop policy if exists "own deckbuilder items" on deckbuilder_user_items;
+create policy "own deckbuilder items"
+  on deckbuilder_user_items for all
+  using (auth.uid() = user_id)
+  with check (auth.uid() = user_id);
+
+-- Saves one item, or deletes it when p_data is null.
+create or replace function deckbuilder_set_item(p_kind text, p_key text, p_data jsonb) returns void
+language plpgsql security invoker set search_path = public, extensions as $$
+begin
+  if auth.uid() is null then
+    raise exception 'not signed in';
+  end if;
+  if p_data is null then
+    delete from deckbuilder_user_items where user_id = auth.uid() and kind = p_kind and key = p_key;
+  else
+    if octet_length(p_data::text) > 200000 then
+      raise exception 'item too large';
+    end if;
+    insert into deckbuilder_user_items (user_id, kind, key, data, updated_at)
+    values (auth.uid(), p_kind, p_key, p_data, now())
+    on conflict (user_id, kind, key) do update set data = excluded.data, updated_at = now();
+  end if;
+end;
+$$;
+
 -- Incremental collection/wishlist writes - one row at a time, unlike the full-replace
 -- deckbuilder_sync_collection/deckbuilder_sync_wants above, so an edit on one device doesn't have
 -- to ship the caller's entire collection just to change one card's count. Quantity 0 deletes the
@@ -1487,6 +1526,10 @@ begin
         'game_id', w.game_id, 'card_id', w.card_id, 'card_name', w.card_name, 'quantity', w.quantity
       )), '[]'::jsonb)
       from deckbuilder_wants w where w.user_id = auth.uid()
+    ),
+    'items', (
+      select coalesce(jsonb_agg(jsonb_build_object('kind', i.kind, 'key', i.key, 'data', i.data)), '[]'::jsonb)
+      from deckbuilder_user_items i where i.user_id = auth.uid()
     )
   ) into result;
   return result;
