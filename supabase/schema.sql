@@ -1334,8 +1334,29 @@ begin
 end;
 $$;
 
+-- Share links (Brewhouse's "Share" button): a random token that lets anyone - signed in or not -
+-- read one deck through deckbuilder_shared_deck below, e.g.
+-- https://beeftcg-eng.github.io/deckbuilder/?share=<token>. The link follows the deck: it reads the
+-- live deckbuilder_decks row, so later edits show up, and deleting the deck or "Stop sharing"
+-- (deckbuilder_unshare_deck) makes the link dead. One token per deck; sharing again returns it.
+create table if not exists deckbuilder_deck_shares (
+  token text primary key,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  deck_id text not null,
+  created_at timestamptz not null default now(),
+  unique (user_id, deck_id)
+);
+
+alter table deckbuilder_deck_shares enable row level security;
+drop policy if exists "own deckbuilder deck shares" on deckbuilder_deck_shares;
+create policy "own deckbuilder deck shares"
+  on deckbuilder_deck_shares for all
+  using (auth.uid() = user_id)
+  with check (auth.uid() = user_id);
+
 create or replace function deckbuilder_delete_deck(p_id text) returns void
 language sql security invoker set search_path = public, extensions as $$
+  delete from deckbuilder_deck_shares where user_id = auth.uid() and deck_id = p_id;
   delete from deckbuilder_decks where user_id = auth.uid() and id = p_id;
 $$;
 
@@ -1502,3 +1523,56 @@ begin
   return result;
 end;
 $$;
+
+-- Returns the deck's share token, making one the first time. The deck has to have reached the
+-- cloud already (the client's outbox uploads it within seconds of any edit); 'deck not synced'
+-- tells the client to try again shortly. 16 hex characters = 64 random bits, unguessable.
+create or replace function deckbuilder_share_deck(p_deck_id text) returns text
+language plpgsql security invoker set search_path = public, extensions as $$
+declare
+  v_token text;
+begin
+  if auth.uid() is null then
+    raise exception 'not signed in';
+  end if;
+  if not exists (select 1 from deckbuilder_decks where user_id = auth.uid() and id = p_deck_id) then
+    raise exception 'deck not synced';
+  end if;
+  select token into v_token from deckbuilder_deck_shares where user_id = auth.uid() and deck_id = p_deck_id;
+  if v_token is null then
+    v_token := substr(replace(gen_random_uuid()::text, '-', ''), 1, 16);
+    insert into deckbuilder_deck_shares (token, user_id, deck_id) values (v_token, auth.uid(), p_deck_id);
+  end if;
+  return v_token;
+end;
+$$;
+
+create or replace function deckbuilder_unshare_deck(p_deck_id text) returns void
+language sql security invoker set search_path = public, extensions as $$
+  delete from deckbuilder_deck_shares where user_id = auth.uid() and deck_id = p_deck_id;
+$$;
+
+-- The one read that works without signing in (the anon role), hence security definer: it can
+-- only ever return the single deck the token names, never lists anything, and returns null for
+-- an unknown/revoked token or a deleted deck. The owner shows as their trading display name if
+-- they set one - never their email. The deck's own shareToken/locked flags are stripped.
+create or replace function deckbuilder_shared_deck(p_token text) returns jsonb
+language plpgsql stable security definer set search_path = public, extensions as $$
+declare
+  result jsonb;
+begin
+  select jsonb_build_object(
+    'game_id', d.game_id,
+    'data', d.data - 'shareToken' - 'locked',
+    'updated_at', d.updated_at,
+    'owner_name', nullif(trim(coalesce(pr.display_name, '')), '')
+  ) into result
+  from deckbuilder_deck_shares sh
+  join deckbuilder_decks d on d.user_id = sh.user_id and d.id = sh.deck_id
+  left join deckbuilder_profiles pr on pr.user_id = sh.user_id
+  where sh.token = p_token;
+  return result;
+end;
+$$;
+
+grant execute on function deckbuilder_shared_deck(text) to anon, authenticated;
