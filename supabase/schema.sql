@@ -1555,7 +1555,7 @@ $$;
 -- The one read that works without signing in (the anon role), hence security definer: it can
 -- only ever return the single deck the token names, never lists anything, and returns null for
 -- an unknown/revoked token or a deleted deck. The owner shows as their trading display name if
--- they set one - never their email. The deck's own shareToken/locked flags are stripped.
+-- they set one - never their email. The deck's own shareToken/locked flags and its private notes are stripped.
 create or replace function deckbuilder_shared_deck(p_token text) returns jsonb
 language plpgsql stable security definer set search_path = public, extensions as $$
 declare
@@ -1563,7 +1563,7 @@ declare
 begin
   select jsonb_build_object(
     'game_id', d.game_id,
-    'data', d.data - 'shareToken' - 'locked',
+    'data', d.data - 'shareToken' - 'locked' - 'notes',
     'updated_at', d.updated_at,
     'owner_name', nullif(trim(coalesce(pr.display_name, '')), '')
   ) into result
