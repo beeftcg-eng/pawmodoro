@@ -1400,15 +1400,21 @@ $$;
 
 -- Brewhouse's smaller synced things, one row each, so two devices editing different ones never
 -- overwrite each other: a pack opening (key = its id), a wishlist price alert (key = card id) and
--- a point on the collection-value graph (key = "<game>:<YYYY-MM-DD>"). Brewhouse 0.37+.
+-- a point on the collection-value graph (key = "<game>:<YYYY-MM-DD>"). Brewhouse 0.37+. Brewhouse 0.40+
+-- adds a card's copy details, its copies' finish and condition (key = card id).
 create table if not exists deckbuilder_user_items (
   user_id uuid not null references auth.users(id) on delete cascade,
-  kind text not null check (kind in ('pack_opening', 'price_alert', 'value_point')),
+  kind text not null check (kind in ('pack_opening', 'price_alert', 'value_point', 'copy_detail')),
   key text not null check (length(key) between 1 and 200),
   data jsonb not null,
   updated_at timestamptz not null default now(),
   primary key (user_id, kind, key)
 );
+
+-- Tables made before 'copy_detail' existed keep their old check until it's replaced here.
+alter table deckbuilder_user_items drop constraint if exists deckbuilder_user_items_kind_check;
+alter table deckbuilder_user_items
+  add constraint deckbuilder_user_items_kind_check check (kind in ('pack_opening', 'price_alert', 'value_point', 'copy_detail'));
 
 alter table deckbuilder_user_items enable row level security;
 drop policy if exists "own deckbuilder items" on deckbuilder_user_items;
@@ -1598,7 +1604,7 @@ $$;
 -- The one read that works without signing in (the anon role), hence security definer: it can
 -- only ever return the single deck the token names, never lists anything, and returns null for
 -- an unknown/revoked token or a deleted deck. The owner shows as their trading display name if
--- they set one - never their email. The deck's own shareToken/locked flags, its private notes and its folder are stripped.
+-- they set one - never their email. The deck's own shareToken/locked flags, its private notes, its folder and its earlier versions are stripped.
 create or replace function deckbuilder_shared_deck(p_token text) returns jsonb
 language plpgsql stable security definer set search_path = public, extensions as $$
 declare
@@ -1606,7 +1612,7 @@ declare
 begin
   select jsonb_build_object(
     'game_id', d.game_id,
-    'data', d.data - 'shareToken' - 'locked' - 'notes' - 'folder',
+    'data', d.data - 'shareToken' - 'locked' - 'notes' - 'folder' - 'versions',
     'updated_at', d.updated_at,
     'owner_name', nullif(trim(coalesce(pr.display_name, '')), '')
   ) into result
