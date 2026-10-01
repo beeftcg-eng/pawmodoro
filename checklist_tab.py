@@ -17,7 +17,7 @@ from datetime import date
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem,
-    QPushButton, QLineEdit, QComboBox, QLabel, QTimeEdit, QAbstractItemView,
+    QPushButton, QLineEdit, QComboBox, QLabel, QTimeEdit, QSpinBox, QAbstractItemView,
     QInputDialog
 )
 from PyQt6.QtCore import Qt, QTime, QTimer, pyqtSignal
@@ -46,13 +46,28 @@ class ChecklistTab(QWidget):
 
         reminder_row = QHBoxLayout()
         reminder_row.addWidget(QLabel("\U0001F514 Reminder for selected:"))
+        self.reminder_mode_box = QComboBox()
+        self.reminder_mode_box.addItem("daily at", "time")
+        self.reminder_mode_box.addItem("every", "interval")
+        self.reminder_mode_box.currentIndexChanged.connect(self._on_reminder_mode_changed)
+        reminder_row.addWidget(self.reminder_mode_box)
+
         self.reminder_time_edit = QTimeEdit()
         self.reminder_time_edit.setDisplayFormat("HH:mm")
         self.reminder_time_edit.setTime(QTime.currentTime())
         reminder_row.addWidget(self.reminder_time_edit)
 
+        self.reminder_hours_spin = QSpinBox()
+        self.reminder_hours_spin.setRange(1, 24)
+        self.reminder_hours_spin.setValue(8)
+        self.reminder_hours_spin.setSuffix(" hours")
+        self.reminder_hours_spin.setToolTip(
+            "Repeats this often, starting from when you press Set (desktop only, doesn't sync)")
+        self.reminder_hours_spin.setVisible(False)
+        reminder_row.addWidget(self.reminder_hours_spin)
+
         set_reminder_btn = QPushButton("Set")
-        set_reminder_btn.setToolTip("Notify me at this time on days the task isn't done yet")
+        set_reminder_btn.setToolTip("Notify me while the task isn't done yet")
         set_reminder_btn.clicked.connect(self.set_reminder)
         reminder_row.addWidget(set_reminder_btn)
 
@@ -136,6 +151,11 @@ class ChecklistTab(QWidget):
         self.wishlist_list_widget.model().rowsMoved.connect(self._on_wishlist_rows_moved)
         self.refresh()
 
+    def _on_reminder_mode_changed(self, index=None):
+        interval = self.reminder_mode_box.currentData() == "interval"
+        self.reminder_time_edit.setVisible(not interval)
+        self.reminder_hours_spin.setVisible(interval)
+
     def _on_recurrence_changed(self, index=None):
         self.weekday_box.setVisible(self.recurrence_box.currentData() == "weekday")
 
@@ -145,7 +165,7 @@ class ChecklistTab(QWidget):
         # throws away the current selection (and can interrupt a drag), so
         # only rebuild when something visible actually changed.
         signature = [
-            (t["id"], t["text"], t["recurrence"], t.get("weekday"), t.get("reminder_time"),
+            (t["id"], t["text"], t["recurrence"], t.get("weekday"), t.get("reminder_time"), t.get("reminder_every_h"),
              bool(t.get("completed_today")), t.get("source"))
             for t in tasks
         ]
@@ -169,7 +189,9 @@ class ChecklistTab(QWidget):
             else:
                 recurrence_label = task["recurrence"]
             label = f"{task['text']}  \u2014  [{recurrence_label}]"
-            if task.get("reminder_time"):
+            if task.get("reminder_every_h"):
+                label += f"  \U0001F514 every {task['reminder_every_h']}h"
+            elif task.get("reminder_time"):
                 label += f"  \U0001F514 {task['reminder_time']}"
             item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, task["id"])
@@ -297,8 +319,11 @@ class ChecklistTab(QWidget):
         if not item:
             return
         task_id = item.data(Qt.ItemDataRole.UserRole)
-        time_str = self.reminder_time_edit.time().toString("HH:mm")
-        self.storage.set_task_reminder(task_id, time_str)
+        if self.reminder_mode_box.currentData() == "interval":
+            self.storage.set_task_reminder(task_id, None, every_hours=self.reminder_hours_spin.value())
+        else:
+            time_str = self.reminder_time_edit.time().toString("HH:mm")
+            self.storage.set_task_reminder(task_id, time_str)
         self.refresh()
 
     def clear_reminder(self):

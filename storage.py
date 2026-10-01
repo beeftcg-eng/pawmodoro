@@ -35,7 +35,8 @@ DEFAULT_DATA = {
     "notes": "",
     "checklist": [],  # list of {id, text, recurrence, last_completed, completed_today,
                        #          reminder_time ("HH:MM" or None), last_reminded (date or None),
-                       #          awarded_on (date or None), weekday, source}
+                       #          awarded_on (date or None), weekday, source,
+                       #          reminder_every_h (int or None), last_reminded_at (datetime or None)}
     "pomodoro": {
         "work_min": 25,
         "short_break_min": 5,
@@ -332,6 +333,8 @@ class Storage:
             "reminder_time": reminder_time,  # "HH:MM" or None
             "weekday": weekday,  # 0=Monday..6=Sunday, only meaningful for recurrence="weekday"; local-only, doesn't sync
             "last_reminded": None,  # date isoformat, so a reminder fires at most once/day (local-only)
+            "reminder_every_h": None,  # hours between repeating reminders, or None (local-only, doesn't sync)
+            "last_reminded_at": None,  # datetime isoformat the repeating reminder last fired/was set (local-only)
             "awarded_on": None,  # last date this task paid out XP, see gamification.task_already_awarded
             "source": source,  # "checklist" (default) or "wishlist" (pushed from Deckbuilder)
         }
@@ -359,13 +362,21 @@ class Storage:
             self._enqueue("rename_task", {"id": task_id, "text": text})
         self.save()
 
-    def set_task_reminder(self, task_id, reminder_time):
-        """reminder_time: "HH:MM" string, or None to clear the reminder."""
+    def set_task_reminder(self, task_id, reminder_time, every_hours=None):
+        """reminder_time: "HH:MM" string for a once-a-day reminder, or
+        every_hours: an int for a reminder repeating every that many hours
+        (counted from now). Neither clears the task's reminder. A task has
+        at most one kind; the repeating one is local-only (the cloud only
+        knows reminder_time), so setting it clears the synced time."""
         task = self._find_task(task_id)
         if task is None:
             return
+        if every_hours:
+            reminder_time = None
         task["reminder_time"] = reminder_time
         task["last_reminded"] = None
+        task["reminder_every_h"] = every_hours or None
+        task["last_reminded_at"] = datetime.now().isoformat(timespec="seconds") if every_hours else None
         if task["recurrence"] != "weekday":
             self._enqueue("set_task_reminder", {"id": task_id, "reminder_time": reminder_time})
         self.save()
@@ -380,6 +391,21 @@ class Storage:
         current_hm = now.strftime("%H:%M")
         due = []
         for task in self.data.get("checklist", []):
+            every_h = task.get("reminder_every_h")
+            if every_h:
+                if task.get("completed_today"):
+                    continue
+                if task.get("recurrence") == "weekday" and task.get("weekday") not in (None, now.weekday()):
+                    continue
+                try:
+                    last = datetime.fromisoformat(task.get("last_reminded_at") or "")
+                except ValueError:
+                    last = None
+                # A clock moved backwards would otherwise silence it for good.
+                if last is None or last > now or now - last >= timedelta(hours=every_h):
+                    task["last_reminded_at"] = now.isoformat(timespec="seconds")
+                    due.append(task)
+                continue
             reminder_time = task.get("reminder_time")
             if not reminder_time or task.get("completed_today"):
                 continue
@@ -572,6 +598,11 @@ class Storage:
                 # learns when we notified), so keep our own record instead
                 # of letting every pull reset it and re-fire the reminder.
                 "last_reminded": (local_tasks.get(t["id"]) or {}).get("last_reminded") or t.get("last_reminded"),
+                # Repeating reminders never reach the server at all (setting
+                # one clears the synced time, so a time coming back means it
+                # was set again elsewhere, e.g. on the phone, and wins).
+                "reminder_every_h": None if t.get("reminder_time") else (local_tasks.get(t["id"]) or {}).get("reminder_every_h"),
+                "last_reminded_at": (local_tasks.get(t["id"]) or {}).get("last_reminded_at"),
                 "awarded_on": t.get("awarded_on"),
                 "source": t.get("source", "checklist"),
             }
