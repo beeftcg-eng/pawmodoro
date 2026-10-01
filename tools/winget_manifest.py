@@ -2,7 +2,7 @@
 """
 winget_manifest.py - Writes the winget manifests (version, installer,
 defaultLocale) for a published release, ready to submit as a pull request
-to github.com/microsoft/winget-pkgs under manifests/b/BeefTCG/Pawmodoro/<version>/.
+to github.com/microsoft/winget-pkgs under manifests/b/beeftcg/Pawmodoro/<version>/.
 
     python tools/winget_manifest.py --license "MIT" [--version 2.17.0] [--out DIR]
 
@@ -22,9 +22,9 @@ sys.path.insert(0, ROOT)
 from version import VERSION  # noqa: E402
 
 REPO = "beeftcg-eng/pawmodoro"
-PACKAGE_ID = "BeefTCG.Pawmodoro"
-MANIFEST_VERSION = "1.6.0"
-SCHEMA = "https://aka.ms/winget-manifest.{kind}.1.6.0.schema.json"
+PACKAGE_ID = "beeftcg.Pawmodoro"
+MANIFEST_VERSION = "1.12.0"
+SCHEMA = "https://aka.ms/winget-manifest.{kind}.1.12.0.schema.json"
 ASSET = "Pawmodoro-Setup.exe"
 PYTHON_PACKAGE = "Python.Python.3.12"
 
@@ -111,7 +111,7 @@ def main():
     parser.add_argument("--out", default=os.path.join(ROOT, "dist", "winget"))
     args = parser.parse_args()
     url, sha256, released = release_asset(args.version)
-    folder = os.path.join(args.out, "manifests", "b", "BeefTCG", "Pawmodoro", args.version)
+    folder = os.path.join(args.out, "manifests", "b", "beeftcg", "Pawmodoro", args.version)
     os.makedirs(folder, exist_ok=True)
     for name, text in manifests(args.version, args.license, url, sha256, released).items():
         with open(os.path.join(folder, name), "w", encoding="utf-8") as f:

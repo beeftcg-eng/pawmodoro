@@ -30,7 +30,7 @@ if something fails.
 ## Keyboard and menus
 
 - [ ] Ctrl+1 to Ctrl+5 switch tabs; Ctrl+P starts/pauses the timer; Ctrl+T jumps to a new checklist task; Ctrl+N asks for a new notes page.
-- [ ] View → **Export everything…** saves a zip; it contains `notes/`, `checklist.md` and `pawmodoro-data.json`.
+- [ ] View → **Export everything…** saves a zip; it contains `notes/`, `checklist.md` and `pawmodoro-data.json`, and text you made **bold** in your notes shows as `**bold**` in the exported `.md` file.
 - [ ] View → **Restore from a backup…** → pick today's → Pawmodoro restarts by itself (a single window, a single tray icon).
 
 ## Updating
