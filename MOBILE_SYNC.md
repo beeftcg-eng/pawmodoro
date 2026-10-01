@@ -77,6 +77,44 @@ changes safely in its upload queue** (the ☁️ Sync button shows a ⚠ and a
 notification tells you why); everything uploads by itself once the schema is
 updated. Nothing is lost.
 
+**v2.16.0** adds notes pages and phone push reminders; re-run `schema.sql`
+once more for them. Until you do, extra notes pages simply stay on the
+desktop (they never hold up the rest of the queue) and the phone gets no
+pushes. Everything else syncs as before.
+
+## Phone reminders with the app closed (v2.16.0, optional)
+
+The phone app can receive your checklist's daily 🔔 reminders as real
+notifications even when it isn't open. That needs a tiny server function on
+your Supabase project that runs every minute. One-time setup, about ten
+minutes, from a computer with this repo:
+
+1. Re-run `supabase/schema.sql` (above).
+2. Install the [Supabase CLI](https://supabase.com/docs/guides/cli), then log
+   in and link this folder to your project. The project ref is the
+   `xxxx` in `https://xxxx.supabase.co`:
+   ```bash
+   supabase login
+   supabase link --project-ref xxxx
+   ```
+3. Make a key pair for Web Push and give it to the function. The **public**
+   key also goes into `VAPID_PUBLIC_KEY` at the top of `docs/app.js` (it's
+   already set for the shared project). Keep the private key out of git.
+   ```bash
+   npx web-push generate-vapid-keys
+   supabase secrets set VAPID_PUBLIC_KEY=... VAPID_PRIVATE_KEY=...
+   supabase functions deploy send-reminders
+   ```
+4. Run `supabase/push_reminders.sql` in the SQL Editor. It schedules the
+   function every minute (put your own project URL and anon key in it if
+   you're not on the shared project).
+5. On the phone: Checklist tab → **🔔 Turn on**. On an iPhone this only
+   works once Pawmodoro is added to the Home Screen and opened from there
+   (iOS 16.4 or later).
+
+Only the daily "remind me at" time is pushed. The desktop's "every N hours"
+reminders stay on the desktop.
+
 ## The shared household list (two people)
 
 Each of you keeps your own account (your notes, checklist and XP stay
@@ -187,8 +225,8 @@ own devices — not between different people's separate accounts.
 
 | | Synced? |
 |---|---|
-| Notes | ✅ (plain text on the phone — desktop's bold/highlight/lists formatting isn't editable there, but isn't lost either) |
-| Checklist | ✅ (tasks, order, renames, reminders' times; the desktop-only "specific day" tasks stay on the desktop) |
+| Notes | ✅ including extra pages (v2.16.0+). Bold/underline/lists are editable on the phone; other desktop formatting (highlights, colors) isn't, but isn't lost either |
+| Checklist | ✅ (tasks, order, renames, daily reminder times; the desktop-only "specific day" tasks, "every N hours" reminders, snoozes and 🍅 counts stay on the desktop) |
 | Shared household list | ✅ — shared with the people in your household |
 | Focus-minutes history | ✅ |
 | XP, level, streak | ✅ |

@@ -24,7 +24,7 @@ import player_icons
 import gamification
 import quotes
 from circular_timer import CircularTimer
-from player_bar import run_player_query
+from player_bar import PlayerQuery
 
 ICON_SIZE = 16
 SPOTIFY_LABEL = "Spotify"
@@ -41,7 +41,6 @@ class WidgetWindow(QWidget):
     # a task was ticked here, so the main window's checklist should refresh
     task_toggled = pyqtSignal()
     _spotify_status_ready = pyqtSignal(object, object)
-    _mini_poll_done = pyqtSignal(object)  # (mpris players, chosen player, snapshot or None)
 
     def __init__(self, storage, parent=None):
         super().__init__(parent)
@@ -129,13 +128,12 @@ class WidgetWindow(QWidget):
         self.mini_prev.clicked.connect(lambda: self._mini_command("previous"))
         self.mini_play.clicked.connect(lambda: self._mini_command("play-pause"))
         self.mini_next.clicked.connect(lambda: self._mini_command("next"))
-        self._mini_polling = False
+        self._mini_query = PlayerQuery(self, self._on_mini_poll_done)
         # Skips its work while the widget is hidden (i.e. not in widget mode).
         self._mini_timer = QTimer(self)
         self._mini_timer.timeout.connect(self._refresh_mini_player)
         self._mini_timer.start(2000)
         self._spotify_status_ready.connect(self._on_spotify_mini_status)
-        self._mini_poll_done.connect(self._on_mini_poll_done)
         self._update_mini_availability()
 
         outer.addWidget(self.frame)
@@ -258,11 +256,10 @@ class WidgetWindow(QWidget):
         self._refresh_mini_player()
 
     def _refresh_mini_player(self):
-        if self._mini_polling or not self.isVisible():
+        if self._mini_query.busy or not self.isVisible():
             return
         spotify = self.spotify_client is not None and self.spotify_client.is_connected()
         current = self.current_player
-        self._mini_polling = True
 
         def query():
             players = mpris.list_players() if mpris.available() else []
@@ -272,10 +269,9 @@ class WidgetWindow(QWidget):
             snap = mpris.snapshot(choice) if choice and choice != SPOTIFY_LABEL else None
             return players, choice, snap
 
-        run_player_query(query, self._mini_poll_done.emit)
+        self._mini_query.start(query)
 
     def _on_mini_poll_done(self, result):
-        self._mini_polling = False
         _players, choice, snap = result
         self.current_player = choice
         if choice is None:

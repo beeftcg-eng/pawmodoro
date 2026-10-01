@@ -5,6 +5,7 @@ cycling and desktop notifications when a phase ends.
 import math
 import os
 import time
+from datetime import date
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QSpinBox,
     QFormLayout, QGroupBox, QSlider, QCheckBox, QFileDialog, QInputDialog,
@@ -42,6 +43,11 @@ PHASE_NAMES = {
     "short_break": "☕ Short break",
     "long_break": "\U0001F319 Long break",
 }
+
+
+def phase_name(phase):
+    """"Work session" etc. without the emoji, for plain-text places (the tray)."""
+    return PHASE_NAMES[phase].split(" ", 1)[1]
 
 
 def notify(title, message):
@@ -258,7 +264,48 @@ class PomodoroTab(QWidget):
         self.timer.timeout.connect(self._on_tick)
 
         self.refresh_theme()
+        self._restore_timer_state()
         self._refresh_labels()
+
+    # ---------- Surviving a restart ----------
+    def _save_timer_state(self):
+        """Saved on every start/pause/reset/phase change and on quit (not per
+        tick). A running timer is stored by its wall-clock end time, so a
+        quick restart -- e.g. the in-app update -- picks it up mid-session."""
+        if self.running:
+            self._update_seconds_left()
+        self.storage.set_timer_state({
+            "phase": self.phase,
+            "sessions_completed": self.sessions_completed,
+            "seconds_left": self.seconds_left,
+            "running": self.running,
+            "ends_at": time.time() + self.seconds_left if self.running else None,
+            "day": date.today().isoformat(),
+        })
+
+    def _restore_timer_state(self):
+        state = self.storage.get_timer_state()
+        if not state or state.get("phase") not in PHASE_NAMES:
+            return
+        self.phase = state["phase"]
+        full = self._phase_minutes(self.phase) * 60
+        # The session dots are a per-day thing.
+        if state.get("day") == date.today().isoformat():
+            self.sessions_completed = int(state.get("sessions_completed", 0))
+        if state.get("running") and state.get("ends_at"):
+            remaining = math.ceil(state["ends_at"] - time.time())
+            if 0 < remaining <= full:
+                self.seconds_left = remaining
+                self._start()
+                return
+            # It ran out while the app wasn't running: like time spent
+            # asleep, that isn't counted, so the phase starts over.
+            self.seconds_left = full
+            return
+        self.seconds_left = max(1, min(int(state.get("seconds_left", full)), full))
+
+    def save_on_quit(self):
+        self._save_timer_state()
 
     def _build_ambient_rows(self):
         """(Re)builds the ambient sound checkbox/slider rows from the
@@ -358,6 +405,10 @@ class PomodoroTab(QWidget):
         self.storage.restore_builtin_sounds()
         self._build_ambient_rows()
 
+    def _full_phase_time(self):
+        m, s = divmod(self._phase_minutes(self.phase) * 60, 60)
+        return f"{m:02d}:{s:02d}"
+
     def _format_time(self):
         m, s = divmod(self.seconds_left, 60)
         return f"{m:02d}:{s:02d}"
@@ -390,12 +441,14 @@ class PomodoroTab(QWidget):
         self.timer.start()
         self.start_btn.setText("⏸  Pause")
         self._sync_ambient_to_phase()
+        self._save_timer_state()
 
     def _pause(self):
         self._update_seconds_left()  # settle the exact time remaining
         self.running = False
         self.timer.stop()
         self.start_btn.setText("▶  Start")
+        self._save_timer_state()
 
     def _update_seconds_left(self):
         now = time.monotonic()
@@ -411,6 +464,7 @@ class PomodoroTab(QWidget):
         self.start_btn.setText("▶  Start")
         self.seconds_left = self._phase_minutes(self.phase) * 60
         self._refresh_labels()
+        self._save_timer_state()
 
     def advance_phase(self, completed=False):
         """Moves on to the next phase. `completed` is True when the timer
@@ -452,6 +506,7 @@ class PomodoroTab(QWidget):
             self._start()
         else:
             self._sync_ambient_to_phase()
+            self._save_timer_state()
 
     def refresh_focus_tasks(self):
         """Fills the "Working on" list with today's pending tasks (plus the

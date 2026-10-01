@@ -33,7 +33,8 @@ HISTORY_KEEP_DAYS = 120
 
 DEFAULT_DATA = {
     "notes": "",  # the main notes page (the one that syncs)
-    "notes_pages": [],  # extra notes pages, desktop-only: list of {id, title, html}
+    "notes_pages": [],  # extra notes pages: list of {id, title, html} (sync from v2.16, table notes_pages)
+    "notes_pages_synced": False,  # every local page has been queued for upload to this account
     "notes_current_page": "main",  # "main" or a notes_pages id
     "checklist": [],  # list of {id, text, recurrence, last_completed, completed_today,
                        #          reminder_time ("HH:MM" or None), last_reminded (date or None),
@@ -50,6 +51,7 @@ DEFAULT_DATA = {
         "auto_start_next": True,   # roll straight into the next phase
         "ambient_auto": False,     # play the ambient mix only during work phases
     },
+    "timer_state": None,  # the pomodoro timer across restarts, see PomodoroTab._save_timer_state
     "focus_task": None,  # checklist task id the pomodoro timer is "working on", or None
     "window": {
         "widget_mode": False,
@@ -84,6 +86,7 @@ DEFAULT_DATA = {
         "weekly_quests": [],  # list of {id, kind, target, desc, progress, completed}
     },
     "history": {},  # day isoformat -> {pomodoros, focus_min, tasks}
+    "focus_log": {},  # day isoformat -> {task id: {text, pomodoros, focus_min}} (local-only, pruned like history)
     "sync": {
         "enabled": False,
         "url": "",
@@ -145,6 +148,7 @@ class Storage:
         self._roll_shared_tasks()
         # Created here, started by MainWindow once its UI callbacks are wired.
         self.sync = SyncEngine(self)
+        self._queue_unsynced_pages()
 
     # ---------- Loading / saving ----------
 
@@ -176,6 +180,55 @@ class Storage:
             except (json.JSONDecodeError, OSError):
                 continue
         return None
+
+    # ---------- Backups you can pick from (View → Restore from a backup…) ----------
+    def list_backups(self):
+        """[(path, modified datetime)], newest first: the daily backups plus
+        the copy kept from just before the last restore."""
+        found = []
+        candidates = [os.path.join(BACKUP_DIR, n) for n in (os.listdir(BACKUP_DIR) if os.path.isdir(BACKUP_DIR) else [])]
+        candidates.append(os.path.join(APP_DIR, "data-before-restore.json"))
+        for path in candidates:
+            if path.endswith(".json") and os.path.isfile(path):
+                found.append((path, datetime.fromtimestamp(os.path.getmtime(path))))
+        return sorted(found, key=lambda item: item[1], reverse=True)
+
+    def restore_from_file(self, path):
+        """Replaces all local data with a backup / export file. Raises
+        ValueError if it isn't Pawmodoro data. Keeps what a backup shouldn't
+        undo: the cloud and Spotify logins, and (empties) the upload queue,
+        whose entries belonged to the replaced data. The current data is
+        kept as data-before-restore.json first, so a restore can be undone.
+        The app should restart afterwards (every tab caches what it shows)."""
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            raise ValueError(f"couldn't read that file ({e})") from e
+        if not isinstance(loaded, dict) or not isinstance(loaded.get("checklist", []), list) or "notes" not in loaded:
+            raise ValueError("that isn't a Pawmodoro data file")
+        restored = _deep_merge(DEFAULT_DATA, loaded)
+        with self._lock:
+            before = os.path.join(APP_DIR, "data-before-restore.json")
+            if os.path.exists(DATA_FILE) and os.path.abspath(path) != os.path.abspath(before):
+                shutil.copyfile(DATA_FILE, before)
+                _restrict_permissions(before)
+            restored["sync"] = self.data.get("sync", DEFAULT_DATA["sync"])
+            restored["spotify"] = self.data.get("spotify", DEFAULT_DATA["spotify"])
+            restored["sync_outbox"] = []
+            self._outbox_inflight = None
+            restored["notes_pages_synced"] = False  # re-upload the restored pages
+            self.data = restored
+            self.rev += 1
+        self.save()
+
+    def export_data(self):
+        """A copy of all data that's safe to hand around: no login tokens."""
+        data = json.loads(json.dumps(self.data))
+        data["sync"]["refresh_token"] = None
+        data["spotify"].update(access_token=None, refresh_token=None)
+        data["sync_outbox"] = []
+        return data
 
     def _backup_daily(self):
         """Keeps one dated copy of data.json per day (the newest BACKUP_KEEP),
@@ -312,11 +365,43 @@ class Storage:
         page = self._find_note_page(page_id)
         if page is not None and page["html"] != html:
             page["html"] = html
+            self._enqueue_page(page)
             self.save()
+
+    def _enqueue_page(self, page):
+        # Keyed per page: only its latest title + text ever needs sending.
+        self._enqueue("note_page_set", {"id": page["id"], "title": page["title"], "html": page["html"]},
+                      key=f"page:{page['id']}")
+
+    def _enqueue_page_order(self):
+        self._enqueue("note_pages_reorder", {"ids": [p["id"] for p in self.data.get("notes_pages", [])]},
+                      key="page_order")
+
+    def _queue_unsynced_pages(self):
+        """Uploads every local page once per account: pages made before
+        pages synced (v2.15), or while the cloud schema was older. A pull
+        never replaces local pages until this has happened."""
+        if self.data.get("notes_pages_synced") or not self.sync_configured():
+            return
+        for page in self.data.get("notes_pages", []):
+            self._enqueue_page(page)
+        if self.data.get("notes_pages"):
+            self._enqueue_page_order()
+        self.data["notes_pages_synced"] = True
+        self.save()
+
+    def outbox_note_pages_unsupported(self):
+        """Called by the sync thread when the cloud schema has no notes
+        pages yet (schema.sql not re-run): page edits are dropped from the
+        queue instead of holding everything else up, and all pages are
+        queued again on the next start."""
+        with self._lock:
+            self.data["notes_pages_synced"] = False
 
     def add_note_page(self, title):
         page = {"id": uuid.uuid4().hex[:8], "title": title, "html": ""}
         self.data.setdefault("notes_pages", []).append(page)
+        self._enqueue_page(page)
         self.save()
         return page["id"]
 
@@ -324,6 +409,7 @@ class Storage:
         page = self._find_note_page(page_id)
         if page is not None:
             page["title"] = title
+            self._enqueue_page(page)
             self.save()
 
     def remove_note_page(self, page_id):
@@ -334,6 +420,7 @@ class Storage:
                 del pages[index]
                 if self.data.get("notes_current_page") == page_id:
                     self.data["notes_current_page"] = self.MAIN_NOTES_PAGE
+                self._enqueue("note_page_remove", {"id": page_id}, key=f"page:{page_id}")
                 self.save()
                 return page, index
         return None
@@ -341,6 +428,8 @@ class Storage:
     def restore_note_page(self, page, index):
         pages = self.data.setdefault("notes_pages", [])
         pages.insert(min(index, len(pages)), page)
+        self._enqueue_page(page)
+        self._enqueue_page_order()
         self.save()
 
     def move_note_page(self, page_id, new_index):
@@ -351,6 +440,7 @@ class Storage:
             return
         pages.remove(page)
         pages.insert(max(0, min(new_index, len(pages))), page)
+        self._enqueue_page_order()
         self.save()
 
     def get_current_note_page(self):
@@ -615,6 +705,13 @@ class Storage:
         self.data["pomodoro"] = dict(settings)
         self.save()
 
+    def get_timer_state(self):
+        return self.data.get("timer_state")
+
+    def set_timer_state(self, state):
+        self.data["timer_state"] = state
+        self.save()
+
     def get_focus_task(self):
         """The task chosen on the Pomodoro tab, if it still exists."""
         task_id = self.data.get("focus_task")
@@ -706,7 +803,9 @@ class Storage:
                 self.data["sync_outbox"] = []
                 self._outbox_inflight = None
             self.data["household"] = None
+            self.data["notes_pages_synced"] = False  # bring this computer's pages to that account
         self.save()
+        self._queue_unsynced_pages()
         self.sync.reconfigure()
 
     def _apply_remote_state(self, remote, keep_notes=False):
@@ -715,6 +814,7 @@ class Storage:
         connected)."""
         if not keep_notes:
             self.data["notes"] = remote["notes"]
+        self._apply_remote_pages(remote, keep_notes)
         local_tasks = {t["id"]: t for t in self.data.get("checklist", [])}
         # "weekday" (specific-day) tasks are local-only — the cloud
         # schema's checklist_tasks.recurrence CHECK constraint doesn't
@@ -760,6 +860,22 @@ class Storage:
         g["weekly_quests_start"] = gamification.week_start_for(today).isoformat()
         self._merge_remote_history(remote.get("history") or [])
 
+    def _apply_remote_pages(self, remote, keep_notes):
+        """Pages from the cloud replace the local ones, once this computer's
+        pages have been uploaded (or a pull could delete pages that only
+        exist here). Absent from an older cloud schema: then pages stay as
+        they are. `keep_notes`: the open page is being typed in, keep it."""
+        if "notes_pages" not in remote:
+            return
+        if not self.data.get("notes_pages_synced"):
+            self._queue_unsynced_pages()  # the cloud just gained pages support
+            return
+        open_page = self._find_note_page(self.data.get("notes_current_page")) if keep_notes else None
+        pages = [{"id": p["id"], "title": p["title"], "html": p.get("html") or ""} for p in remote["notes_pages"]]
+        if open_page is not None:
+            pages = [open_page if p["id"] == open_page["id"] else p for p in pages]
+        self.data["notes_pages"] = pages
+
     def adopt_remote_state(self, remote, household=False, rev=None, keep_notes=False):
         """Replaces the local cache with the server's state (see
         sync_engine.py). `household`: False = leave the cached household
@@ -788,6 +904,36 @@ class Storage:
         cutoff = (date.today() - timedelta(days=HISTORY_KEEP_DAYS)).isoformat()
         for day in [d for d in history if d < cutoff]:
             del history[day]
+
+    def _focus_log_bump(self, task, minutes):
+        log = self.data.setdefault("focus_log", {})
+        row = log.setdefault(date.today().isoformat(), {}).setdefault(
+            task["id"], {"text": task["text"], "pomodoros": 0, "focus_min": 0})
+        row["text"] = task["text"]
+        row["pomodoros"] += 1
+        row["focus_min"] += minutes
+        cutoff = (date.today() - timedelta(days=HISTORY_KEEP_DAYS)).isoformat()
+        for day in [d for d in log if d < cutoff]:
+            del log[day]
+
+    def get_week_focus_by_task(self):
+        """This quest week's (since Tuesday) focus per task, most first:
+        [{"id", "text", "pomodoros", "focus_min"}]. Uses the task's current
+        name when it still exists."""
+        start = gamification.week_start_for(date.today()).isoformat()
+        totals = {}
+        for day, tasks in self.data.get("focus_log", {}).items():
+            if day < start:
+                continue
+            for task_id, row in tasks.items():
+                total = totals.setdefault(task_id, {"id": task_id, "text": row["text"], "pomodoros": 0, "focus_min": 0})
+                total["pomodoros"] += row["pomodoros"]
+                total["focus_min"] += row["focus_min"]
+        for total in totals.values():
+            task = self._find_task(total["id"])
+            if task is not None:
+                total["text"] = task["text"]
+        return sorted(totals.values(), key=lambda r: (-r["focus_min"], -r["pomodoros"], r["text"]))
 
     def _merge_remote_history(self, rows):
         history = self.data.setdefault("history", {})
@@ -1072,6 +1218,7 @@ class Storage:
         if task is not None:
             task["focus_pomodoros"] = task.get("focus_pomodoros", 0) + 1
             task["focus_min"] = task.get("focus_min", 0) + minutes
+            self._focus_log_bump(task, minutes)
         self._ensure_daily_quests()
         self._ensure_weekly_quests()
         self._bump_streak()

@@ -9,17 +9,19 @@ Run: python3 main.py
 import os
 import sys
 import threading
+import time
+from datetime import date
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QSystemTrayIcon, QMenu, QMessageBox,
-    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel
+    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFileDialog
 )
-from PyQt6.QtGui import QIcon, QAction, QActionGroup
-from PyQt6.QtCore import QTimer, pyqtSignal
+from PyQt6.QtGui import QIcon, QAction, QActionGroup, QKeySequence
+from PyQt6.QtCore import QTimer, QEvent, QProcess, pyqtSignal
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
 from storage import Storage
 from notes_checklist_tab import NotesChecklistTab
-from pomodoro_tab import PomodoroTab
+from pomodoro_tab import PomodoroTab, phase_name as pomodoro_phase_name
 from progress_tab import ProgressTab
 from shared_tab import SharedTab
 from music_tab import MusicTab
@@ -28,6 +30,8 @@ from player_bar import PlayerBar
 from spotify_client import SpotifyClient
 from toast import CelebrationToast
 from sync_settings_dialog import SyncSettingsDialog
+from backup_dialog import BackupDialog
+import exporter
 import notifier
 import paths
 import shared_activity
@@ -318,6 +322,38 @@ class MainWindow(QMainWindow):
         if manual:
             self._open_update_dialog()
 
+    # ---------- Backups ----------
+    def _export_everything(self):
+        notes = self.notes_checklist_tab.notes_tab
+        if notes.is_busy():
+            notes.save_now()
+        default = os.path.join(os.path.expanduser("~"), f"Pawmodoro export {date.today().isoformat()}.zip")
+        path, _ = QFileDialog.getSaveFileName(self, "Export everything", default, "Zip files (*.zip)")
+        if not path:
+            return
+        if not path.lower().endswith(".zip"):
+            path += ".zip"
+        try:
+            pages = exporter.export_zip(self.storage, path)
+        except OSError as e:
+            QMessageBox.warning(self, "Export", f"Couldn't write the export: {e}")
+            return
+        QMessageBox.information(
+            self, "Export",
+            f"Saved {pages} notes page{'s' if pages != 1 else ''}, your checklist and all your data to\n{path}")
+
+    def _open_backup_dialog(self):
+        dialog = BackupDialog(self.storage, self)
+        dialog.restored.connect(self._restart_app)
+        dialog.exec()
+
+    def _restart_app(self):
+        """Starts a fresh copy, then quits; the new one waits for this one to
+        be gone before its single-instance check (see main())."""
+        os.environ["PAWMODORO_RESTARTING"] = "1"
+        QProcess.startDetached(sys.executable, [os.path.abspath(sys.argv[0])] + sys.argv[1:], os.getcwd())
+        self.close_app()
+
     def _open_mobile_app_dialog(self):
         MobileAppDialog(self).exec()
 
@@ -367,6 +403,15 @@ class MainWindow(QMainWindow):
         sync_action.triggered.connect(self._open_sync_settings)
         menu.addAction(sync_action)
 
+        menu.addSeparator()
+        export_action = QAction("Export everything…", self)
+        export_action.triggered.connect(self._export_everything)
+        menu.addAction(export_action)
+        restore_action = QAction("Restore from a backup…", self)
+        restore_action.triggered.connect(self._open_backup_dialog)
+        menu.addAction(restore_action)
+        menu.addSeparator()
+
         mobile_action = QAction("Get the mobile app…", self)
         mobile_action.triggered.connect(self._open_mobile_app_dialog)
         menu.addAction(mobile_action)
@@ -380,8 +425,41 @@ class MainWindow(QMainWindow):
         menu.addAction(auto_update_action)
 
         quit_action = QAction("Quit", self)
+        quit_action.setShortcut(QKeySequence("Ctrl+Q"))
         quit_action.triggered.connect(self.close_app)
         menu.addAction(quit_action)
+
+        self._build_go_menu()
+
+    def _build_go_menu(self):
+        """Keyboard shortcuts, listed in a menu so they can be discovered."""
+        go = self.menuBar().addMenu("Go")
+        for number in range(self.tabs.count()):
+            action = QAction(self.tabs.tabText(number).replace("&&", "&"), self)
+            action.setShortcut(QKeySequence(f"Ctrl+{number + 1}"))
+            action.triggered.connect(lambda checked=False, n=number: self.tabs.setCurrentIndex(n))
+            go.addAction(action)
+        go.addSeparator()
+        entries = [
+            ("Start / pause the timer", "Ctrl+P", self.pomodoro_tab.toggle_running),
+            ("Skip to the next phase", "Ctrl+Shift+P", lambda: self.pomodoro_tab.advance_phase(completed=False)),
+            ("New checklist task", "Ctrl+T", self._focus_new_task),
+            ("New notes page", "Ctrl+N", self._new_notes_page),
+            ("Pin as desktop widget", "Ctrl+Shift+W", self._enter_widget_mode),
+        ]
+        for text, keys, handler in entries:
+            action = QAction(text, self)
+            action.setShortcut(QKeySequence(keys))
+            action.triggered.connect(lambda checked=False, h=handler: h())
+            go.addAction(action)
+
+    def _focus_new_task(self):
+        self.tabs.setCurrentWidget(self.notes_checklist_tab)
+        self.checklist_tab.text_input.setFocus()
+
+    def _new_notes_page(self):
+        self.tabs.setCurrentWidget(self.notes_checklist_tab)
+        self.notes_checklist_tab.notes_tab._add_page()
 
     def _build_theme_menu(self):
         theme_menu = QMenu("Color theme", self)
@@ -445,6 +523,17 @@ class MainWindow(QMainWindow):
         show_action.triggered.connect(self.restore_from_widget)
         tray_menu.addAction(show_action)
 
+        # The timer, without opening the window.
+        tray_menu.addSeparator()
+        self.tray_timer_action = QAction("", self)
+        self.tray_timer_action.triggered.connect(self.pomodoro_tab.toggle_running)
+        tray_menu.addAction(self.tray_timer_action)
+        skip_action = QAction("⏭ Skip to the next phase", self)
+        skip_action.triggered.connect(lambda: self.pomodoro_tab.advance_phase(completed=False))
+        tray_menu.addAction(skip_action)
+        tray_menu.addSeparator()
+        tray_menu.aboutToShow.connect(self._refresh_tray_timer)
+
         widget_action = QAction("Pin as desktop widget", self)
         widget_action.triggered.connect(self._enter_widget_mode)
         tray_menu.addAction(widget_action)
@@ -456,13 +545,45 @@ class MainWindow(QMainWindow):
         tray_menu.addAction(quit_action)
 
         self.tray.setContextMenu(tray_menu)
+        self._tray_menu = tray_menu  # setContextMenu doesn't take ownership
+        self._refresh_tray_timer()
+        self.pomodoro_tab.tick.connect(lambda *_: self._refresh_tray_timer())
         self.tray.activated.connect(self._on_tray_activated)
         self.tray.show()
         notifier.register_tray(self.tray)
 
+    def _refresh_tray_timer(self):
+        tab = self.pomodoro_tab
+        phase = pomodoro_phase_name(tab.phase)
+        remaining = tab._format_time()
+        if tab.running:
+            self.tray_timer_action.setText(f"⏸ Pause timer ({remaining} left)")
+            self.tray.setToolTip(f"Pawmodoro: {phase}, {remaining} left")
+        else:
+            self.tray_timer_action.setText(f"▶ Start timer ({phase}, {remaining})")
+            self.tray.setToolTip("Pawmodoro" if remaining == tab._full_phase_time() else f"Pawmodoro: {phase} paused, {remaining} left")
+
     def _on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
             self.restore_from_widget()
+
+    # ---------- Is any window on screen? (sync polls slowly when not) ----------
+    def _update_sync_background(self):
+        on_screen = (self.isVisible() and not self.isMinimized()) or self.widget_window.isVisible()
+        self.storage.sync.set_background(not on_screen)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._update_sync_background()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._update_sync_background()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange:
+            self._update_sync_background()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -485,6 +606,7 @@ class MainWindow(QMainWindow):
             self.widget_window.move(state.get("widget_x", 100), state.get("widget_y", 100))
         self.widget_window.show()
         self.hide()
+        self._update_sync_background()
 
     def bring_to_front(self):
         """Called when a second launch attempt pings us over the
@@ -505,10 +627,12 @@ class MainWindow(QMainWindow):
         self.checklist_tab.refresh()
         self.widget_window.hide()
         self.show()
+        self._update_sync_background()
         self.raise_()
         self.activateWindow()
 
     def close_app(self):
+        self.pomodoro_tab.save_on_quit()
         self.pomodoro_tab.stop_all_ambient()
         self.storage.sync.stop()
         self.storage.save()
@@ -543,6 +667,16 @@ def main():
     # this name, ping it to surface its window and exit instead of
     # starting a second full instance alongside it.
     probe = QLocalSocket()
+    if os.environ.pop("PAWMODORO_RESTARTING", None):
+        # Started by _restart_app: give the old copy up to 10 s to exit.
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            probe.connectToServer(SINGLE_INSTANCE_KEY)
+            if not probe.waitForConnected(200):
+                break
+            probe.abort()
+            time.sleep(0.3)
+        probe.abort()
     probe.connectToServer(SINGLE_INSTANCE_KEY)
     if probe.waitForConnected(200):
         print("Pawmodoro is already running — bringing its window to the front instead.")

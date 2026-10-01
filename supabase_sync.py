@@ -152,6 +152,15 @@ class SupabaseSync:
     def set_notes(self, text):
         return self._rpc("set_notes", {"p_notes": text})
 
+    def set_note_page(self, page_id, title, html):
+        return self._rpc("set_note_page", {"p_id": page_id, "p_title": title, "p_html": html})
+
+    def remove_note_page(self, page_id):
+        return self._rpc("remove_note_page", {"p_id": page_id})
+
+    def reorder_note_pages(self, ordered_ids):
+        return self._rpc("reorder_note_pages", {"p_ordered_ids": ordered_ids})
+
     def set_tz_offset(self, minutes):
         return self._rpc("set_tz_offset", {"p_minutes": minutes})
 

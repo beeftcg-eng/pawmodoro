@@ -190,6 +190,15 @@ html, body {
 .task-item.done span { color: var(--ink-soft); text-decoration: line-through; }
 .task-item em { font-style: normal; color: var(--ink-soft); font-size: 12px; }
 .remove-btn { background: none; border: none; color: var(--ink-soft); font-size: 16px; flex-shrink: 0; }
+.push-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.push-row .hint { margin: 0; }
+.notes-pages { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 8px; }
+.notes-page-tab, .notes-page-add {
+  background: var(--paper-light); color: var(--ink); border: 1px solid var(--paper-edge);
+  border-radius: 14px; padding: 4px 12px; font: inherit; font-size: 14px;
+}
+.notes-page-tab.active { background: var(--accent); border-color: var(--accent); color: var(--paper-light); }
+.notes-page-add { color: var(--ink-soft); border-style: dashed; }
 .reminder-edit { flex-basis: 100%; display: flex; align-items: center; gap: 6px; padding: 8px 0 0 28px; }
 .reminder-edit[hidden] { display: none; }
 .reminder-edit input[type="time"] { font: inherit; padding: 4px; }

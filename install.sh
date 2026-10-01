@@ -13,13 +13,24 @@ DESKTOP_DIR="$HOME/.local/share/applications"
 # Pawmodoro keeps running in the system tray after you close its window (by
 # design), so an old process can quietly keep running under the OLD code even
 # after you reinstall. Make sure nothing stale is still alive first.
-# (Matches both an installed run.sh launch and a "python3 main.py" launch
-# from an extracted source folder, since argv[0] is always a full path.)
-if pgrep -f "pawmodoro-app/venv/bin/python3 main.py" > /dev/null 2>&1 || pgrep -f "pawmodoro/main.py" > /dev/null 2>&1; then
+# Matches an installed run.sh launch ("<venv>/bin/python3 main.py") and a
+# "python3 <folder>/pawmodoro/main.py" launch from a source folder. Anchored
+# to the WHOLE command line, so a shell or editor that merely mentions these
+# paths (e.g. `bash -c "... pawmodoro/main.py ..."`) is never caught.
+RUNNING_PATTERNS=(
+    "^[^ ]*/pawmodoro-app/venv/bin/python3? main\.py\$"
+    "^[^ ]*python[0-9.]* [^ ]*pawmodoro/main\.py\$"
+)
+running=0
+for pattern in "${RUNNING_PATTERNS[@]}"; do
+    pgrep -f "$pattern" > /dev/null 2>&1 && running=1
+done
+if [ "$running" = 1 ]; then
     echo "Pawmodoro is currently running (likely minimized to the tray)."
     echo "Stopping it so the update actually takes effect..."
-    pkill -f "pawmodoro-app/venv/bin/python3 main.py" 2>/dev/null || true
-    pkill -f "pawmodoro/main.py" 2>/dev/null || true
+    for pattern in "${RUNNING_PATTERNS[@]}"; do
+        pkill -f "$pattern" 2>/dev/null || true
+    done
     sleep 1
 fi
 

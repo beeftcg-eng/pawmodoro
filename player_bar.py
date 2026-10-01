@@ -30,8 +30,8 @@ from PyQt6.QtCore import Qt, QTimer, QUrl, QSize, pyqtSignal
 from PyQt6.QtGui import QDesktopServices
 
 import platform
-import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 if platform.system() == "Windows":
     import smtc_windows as mpris  # same function names/shapes as mpris.py, see that file
 else:
@@ -46,28 +46,61 @@ STATUS_POLL_MS = 1500
 PLAYERS_POLL_SECONDS = 5
 
 
-def run_player_query(fn, done):
+_query_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="pawmodoro-player")
+
+
+class PlayerQuery:
     """Runs a player query off the UI thread on Linux, where every query
     spawns a playerctl process that can stall for up to its timeout. On
     Windows SMTC queries are in-process and stay on the calling thread
-    (WinRT from a worker thread hasn't been verified there). `done(result)`
-    must be a signal's emit, so the result lands back on the UI thread."""
-    if platform.system() == "Windows":
-        done(fn())
-    else:
-        threading.Thread(target=lambda: done(fn()), daemon=True).start()
+    (WinRT from a worker thread hasn't been verified there).
+
+    The worker never touches Qt: a timer owned by `parent` collects the
+    result on the UI thread and calls on_result(result). If the parent is
+    deleted first, its timer goes with it and the result is simply dropped
+    (a worker emitting a signal into a deleted widget could crash)."""
+
+    def __init__(self, parent, on_result):
+        self._on_result = on_result
+        self._future = None
+        self._timer = QTimer(parent)
+        self._timer.setInterval(50)
+        self._timer.timeout.connect(self._collect)
+
+    @property
+    def busy(self):
+        return self._future is not None
+
+    def start(self, fn):
+        if platform.system() == "Windows":
+            self._on_result(fn())
+            return
+        self._future = _query_pool.submit(fn)
+        self._timer.start()
+
+    def _collect(self):
+        future = self._future
+        if future is None or not future.done():
+            return
+        self._future = None
+        self._timer.stop()
+        try:
+            result = future.result()
+        except Exception as e:  # noqa: BLE001 - a failed query just means no update
+            print(f"[player] query failed: {e}")
+            return
+        self._on_result(result)
 
 
 class PlayerBar(QWidget):
     _spotify_status_ready = pyqtSignal(object, object)  # (status_dict_or_None, error_or_None)
     _spotify_command_done = pyqtSignal(object)  # error_or_None
-    _poll_done = pyqtSignal(object)  # (players list or None, player, snapshot or None)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.current_player = None
         self.spotify_client = None
-        self._polling = False
+        self._query = PlayerQuery(self, self._on_poll_done)
         self._players_polled_at = 0.0
 
         outer = QVBoxLayout(self)
@@ -156,7 +189,6 @@ class PlayerBar(QWidget):
 
         self._spotify_status_ready.connect(self._on_spotify_status)
         self._spotify_command_done.connect(self._on_spotify_command_done)
-        self._poll_done.connect(self._on_poll_done)
 
         self.refresh_theme()
         self._poll(force_players=True)
@@ -166,7 +198,7 @@ class PlayerBar(QWidget):
         self._poll(force_players=True)
 
     def _poll(self, force_players=False):
-        if self._polling or not self.isVisible():
+        if self._query.busy or not self.isVisible():
             return
         want_players = force_players or time.monotonic() - self._players_polled_at >= PLAYERS_POLL_SECONDS
         player = None if self._is_spotify() else self.current_player
@@ -178,7 +210,6 @@ class PlayerBar(QWidget):
             return
         if want_players:
             self._players_polled_at = time.monotonic()
-        self._polling = True
 
         def query():
             players = mpris.list_players() if want_players else None
@@ -188,10 +219,9 @@ class PlayerBar(QWidget):
                 return players, player, mpris.snapshot(player)
             return players, player, None
 
-        run_player_query(query, self._poll_done.emit)
+        self._query.start(query)
 
     def _on_poll_done(self, result):
-        self._polling = False
         players, player, snap = result
         if players is not None:
             self._apply_players(players)

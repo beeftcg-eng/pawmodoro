@@ -8,8 +8,8 @@ text notes saved by older versions of this app load in just fine (no "<"
 in them, so they're treated as plain text on load).
 
 Notes can have several pages (tabs above the editor). The first, "Notes",
-is the one that syncs with the phone; pages added here are desktop-only
-(see storage.py's notes pages).
+is the original notes text; the others are storage.py's notes pages. All of
+them sync with the phone (pages since v2.16).
 """
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFileDialog, QLineEdit,
@@ -36,10 +36,11 @@ class NotesTab(QWidget):
         self._set_editor_text(self.storage.get_page_html(self.current_page))
         self.editor.setPlaceholderText("Jot anything here. It saves itself.")
 
-        # The main (synced) notes text as last loaded from / saved to
-        # storage; lets a cloud pull skip reloading (which would reset the
-        # cursor and undo history) when nothing actually changed.
-        self._last_synced_notes = self.storage.get_notes()
+        # The open page's text as last loaded from / saved to storage, and
+        # the page list as last shown; let a cloud pull skip reloading (which
+        # would reset the cursor and undo history) when nothing changed.
+        self._loaded_html = self.storage.get_page_html(self.current_page)
+        self._pages_signature = None
 
         pages_row = QHBoxLayout()
         pages_row.setSpacing(4)
@@ -48,14 +49,14 @@ class NotesTab(QWidget):
         self.page_bar.setMovable(True)
         self.page_bar.setExpanding(False)
         self.page_bar.setDocumentMode(True)
-        self.page_bar.setToolTip("Double-click a page to rename it. Only the first page syncs with the phone.")
+        self.page_bar.setToolTip("Double-click a page to rename it, drag to reorder")
         self.page_bar.currentChanged.connect(self._on_page_changed)
         self.page_bar.tabCloseRequested.connect(self._remove_page)
         self.page_bar.tabBarDoubleClicked.connect(self._rename_page)
         self.page_bar.tabMoved.connect(self._on_page_moved)
         pages_row.addWidget(self.page_bar, 1)
         add_page_btn = QPushButton("+ Page")
-        add_page_btn.setToolTip("Add a notes page (desktop only)")
+        add_page_btn.setToolTip("Add a notes page (Ctrl+N)")
         add_page_btn.clicked.connect(self._add_page)
         pages_row.addWidget(add_page_btn)
         layout.addLayout(pages_row)
@@ -104,8 +105,9 @@ class NotesTab(QWidget):
         save_btn.clicked.connect(self.save_now)
         bottom.addWidget(save_btn)
 
-        export_btn = QPushButton("Export to .txt\u2026")
-        export_btn.clicked.connect(self.export_txt)
+        export_btn = QPushButton("Export page\u2026")
+        export_btn.setToolTip("Save this page as Markdown, plain text or HTML (View → Export everything… saves all of it)")
+        export_btn.clicked.connect(self.export_page)
         bottom.addWidget(export_btn)
 
         layout.addLayout(bottom)
@@ -124,10 +126,12 @@ class NotesTab(QWidget):
             self.editor.setPlainText(stored)
 
     def _rebuild_page_bar(self):
+        pages = self.storage.get_note_pages()
+        self._pages_signature = [(p["id"], p["title"]) for p in pages]
         self.page_bar.blockSignals(True)
         while self.page_bar.count():
             self.page_bar.removeTab(0)
-        for page in self.storage.get_note_pages():
+        for page in pages:
             index = self.page_bar.addTab(page["title"])
             self.page_bar.setTabData(index, page["id"])
             if page["id"] == self.current_page:
@@ -145,11 +149,10 @@ class NotesTab(QWidget):
             self.save_now()  # an unsaved edit belongs to the page being left
         self.current_page = page_id
         self.storage.set_current_note_page(page_id)
+        self._loaded_html = self.storage.get_page_html(page_id)
         self.editor.blockSignals(True)
-        self._set_editor_text(self.storage.get_page_html(page_id))
+        self._set_editor_text(self._loaded_html)
         self.editor.blockSignals(False)
-        if page_id == self.storage.MAIN_NOTES_PAGE:
-            self._last_synced_notes = self.storage.get_notes()
         self.status_label.setText("Autosaved")
 
     def _on_page_changed(self, index):
@@ -220,10 +223,13 @@ class NotesTab(QWidget):
         """Called after a cloud pull was applied: refreshes the editor from
         storage if the notes changed elsewhere (e.g. on the phone) and
         you're not in the middle of typing."""
-        if self.is_busy() or self.storage.get_notes() == self._last_synced_notes:
+        if self.is_busy():
             return
-        if self.current_page != self.storage.MAIN_NOTES_PAGE:
-            return  # picked up when you switch back to it
+        pages = [(p["id"], p["title"]) for p in self.storage.get_note_pages()]
+        page_gone = self.storage.get_current_note_page() != self.current_page
+        if (pages == self._pages_signature and not page_gone
+                and self.storage.get_page_html(self.current_page) == self._loaded_html):
+            return
         self.reload_from_storage()
 
     def reload_from_storage(self):
@@ -232,7 +238,9 @@ class NotesTab(QWidget):
         self.current_page = self.storage.get_current_note_page()
         self._rebuild_page_bar()
         stored = self.storage.get_page_html(self.current_page)
-        self._last_synced_notes = self.storage.get_notes()
+        if stored == self._loaded_html:
+            return  # only the page list changed
+        self._loaded_html = stored
         # keep the caret and scroll position, so a change arriving from the
         # phone while you're reading doesn't throw you back to the top
         position = self.editor.textCursor().position()
@@ -250,8 +258,7 @@ class NotesTab(QWidget):
         self._autosave_timer.stop()  # this save covers whatever the timer was waiting to write
         html = self.editor.toHtml()
         self.storage.set_page_html(self.current_page, html)
-        if self.current_page == self.storage.MAIN_NOTES_PAGE:
-            self._last_synced_notes = html
+        self._loaded_html = html
         self.status_label.setText("Autosaved")
 
     # ---------- Find ----------
@@ -286,9 +293,19 @@ class NotesTab(QWidget):
     def find_previous(self):
         self._find(backward=True)
 
-    def export_txt(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Export notes", "notes.txt", "Text files (*.txt)")
-        if path:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(self.editor.toPlainText())
-            self.status_label.setText(f"Exported to {path}")
+    def export_page(self):
+        title = self.page_bar.tabText(self.page_bar.currentIndex()) or "notes"
+        path, chosen = QFileDialog.getSaveFileName(
+            self, "Export page", f"{title}.md",
+            "Markdown (*.md);;Plain text (*.txt);;HTML (*.html)")
+        if not path:
+            return
+        if chosen.startswith("Plain") or path.lower().endswith(".txt"):
+            text = self.editor.toPlainText()
+        elif chosen.startswith("HTML") or path.lower().endswith((".html", ".htm")):
+            text = self.editor.toHtml()
+        else:
+            text = self.editor.toMarkdown()
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        self.status_label.setText(f"Exported to {path}")

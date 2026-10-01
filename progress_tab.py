@@ -242,6 +242,11 @@ class ProgressTab(QWidget):
         history_layout.addWidget(self.week_label)
         layout.addWidget(self.history_box)
 
+        # --- Which tasks got the focus (Pomodoro tab → "Working on") ---
+        self.task_focus_box = QGroupBox("Focus by task, this week")
+        self.task_focus_layout = QVBoxLayout(self.task_focus_box)
+        layout.addWidget(self.task_focus_box)
+
         self.heatmap_box = QGroupBox(f"Focus over the last {HEATMAP_WEEKS} weeks")
         heatmap_layout = QHBoxLayout(self.heatmap_box)
         self.heatmap = HistoryHeatmap()
@@ -323,6 +328,7 @@ class ProgressTab(QWidget):
             f"{_format_minutes(totals['focus_min'])} focused \u00b7 {totals['tasks']} tasks"
         )
         self._refresh_household()
+        self._refresh_task_focus()
 
         # Only actually rolls a new quote when asked to (tab switch) or on
         # first load — refresh() itself also runs on every 5s cloud-sync
@@ -341,6 +347,41 @@ class ProgressTab(QWidget):
         else:
             self.weekly_reset_label.setText(f"⏳ Resets in {days_left} days (Tuesday)")
         self._rebuild_quests(self.weekly_quests_layout, g.get("weekly_quests", []), "No quests this week.")
+
+    def _refresh_task_focus(self):
+        while self.task_focus_layout.count():
+            widget = self.task_focus_layout.takeAt(0).widget()
+            if widget is not None:
+                widget.setParent(None)
+        rows = self.storage.get_week_focus_by_task()
+        if not rows:
+            hint = QLabel("Pick a task under “Working on” on the Pomodoro tab, and the sessions "
+                          "you spend on it show up here.")
+            hint.setWordWrap(True)
+            hint.setObjectName("task_focus_hint")
+            self.task_focus_layout.addWidget(hint)
+            return
+        peak = max(r["focus_min"] for r in rows) or 1
+        for row in rows[:8]:
+            line = QHBoxLayout()
+            name = QLabel(row["text"])
+            name.setTextFormat(Qt.TextFormat.PlainText)
+            name.setMinimumWidth(160)
+            line.addWidget(name, 2)
+            bar = QProgressBar()
+            bar.setRange(0, peak)
+            bar.setValue(row["focus_min"])
+            bar.setTextVisible(False)
+            bar.setFixedHeight(12)
+            line.addWidget(bar, 3)
+            sessions = row["pomodoros"]
+            amount = QLabel(f"{sessions} session{'s' if sessions != 1 else ''} \u00b7 {_format_minutes(row['focus_min'])}")
+            amount.setMinimumWidth(130)
+            line.addWidget(amount)
+            holder = QWidget()
+            holder.setLayout(line)
+            line.setContentsMargins(0, 0, 0, 0)
+            self.task_focus_layout.addWidget(holder)
 
     def _refresh_household(self):
         household = self.storage.get_household()

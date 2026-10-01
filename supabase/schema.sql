@@ -120,6 +120,9 @@ alter table checklist_tasks add constraint checklist_tasks_source_check check (s
 --    un-checking and re-checking a task can't be farmed for XP.
 alter table app_state add column if not exists tz_offset_min int not null default 0;
 alter table checklist_tasks add column if not exists awarded_on date;
+-- v2.16: the local day a task's reminder was last sent as a phone push
+-- (separate from last_reminded, which the clients use for their own).
+alter table checklist_tasks add column if not exists push_reminded_on date;
 
 -- One row per user per local day: feeds the Progress tab's history chart and
 -- the household "this week" totals.
@@ -136,6 +139,26 @@ alter table daily_stats enable row level security;
 drop policy if exists "own daily_stats rows" on daily_stats;
 create policy "own daily_stats rows"
   on daily_stats for all
+  using (auth.uid() = user_id)
+  with check (auth.uid() = user_id);
+
+-- v2.16: extra notes pages (the tabs above the notes editor). The first
+-- page is still app_state.notes; these are the ones after it. `id` is
+-- chosen by the client (so pages made offline keep their id).
+create table if not exists notes_pages (
+  user_id uuid not null references auth.users(id) on delete cascade,
+  id text not null,
+  title text not null,
+  html text not null default '',
+  sort_order int not null default 0,
+  updated_at timestamptz not null default now(),
+  primary key (user_id, id)
+);
+
+alter table notes_pages enable row level security;
+drop policy if exists "own notes pages" on notes_pages;
+create policy "own notes pages"
+  on notes_pages for all
   using (auth.uid() = user_id)
   with check (auth.uid() = user_id);
 
@@ -632,6 +655,29 @@ language sql security invoker set search_path = public, extensions as $$
   update app_state set notes = p_notes, updated_at = now() where user_id = auth.uid();
 $$;
 
+-- Creates or updates one extra notes page (a new one goes last). Idempotent,
+-- so a retried request from the desktop's offline queue is harmless.
+create or replace function set_note_page(p_id text, p_title text, p_html text) returns void
+language sql security invoker set search_path = public, extensions as $$
+  insert into notes_pages (user_id, id, title, html, sort_order)
+  values (auth.uid(), p_id, p_title, coalesce(p_html, ''),
+          coalesce((select max(sort_order) + 1 from notes_pages where user_id = auth.uid()), 0))
+  on conflict (user_id, id) do update
+    set title = excluded.title, html = excluded.html, updated_at = now();
+$$;
+
+create or replace function remove_note_page(p_id text) returns void
+language sql security invoker set search_path = public, extensions as $$
+  delete from notes_pages where user_id = auth.uid() and id = p_id;
+$$;
+
+create or replace function reorder_note_pages(p_ordered_ids jsonb) returns void
+language sql security invoker set search_path = public, extensions as $$
+  update notes_pages p set sort_order = x.ord
+    from jsonb_array_elements_text(p_ordered_ids) with ordinality as x(id, ord)
+    where p.id = x.id and p.user_id = auth.uid();
+$$;
+
 -- p_id lets the desktop app (which queues edits made offline) create a task
 -- under the id it already gave it locally; calling again with an id that
 -- exists just returns the existing row, so a retried request is harmless.
@@ -684,7 +730,7 @@ $$;
 
 create or replace function set_task_reminder(p_task_id text, p_reminder_time text) returns void
 language sql security invoker set search_path = public, extensions as $$
-  update checklist_tasks set reminder_time = p_reminder_time, last_reminded = null
+  update checklist_tasks set reminder_time = p_reminder_time, last_reminded = null, push_reminded_on = null
   where id = p_task_id and user_id = auth.uid();
 $$;
 
@@ -719,6 +765,7 @@ declare
   s app_state;
   tasks jsonb;
   hist jsonb;
+  pages jsonb;
 begin
   perform roll_recurring_tasks();
   perform ensure_daily_quests();
@@ -730,6 +777,9 @@ begin
   select coalesce(jsonb_agg(jsonb_build_object(
       'day', d.day, 'pomodoros', d.pomodoros, 'focus_min', d.focus_min, 'tasks', d.tasks) order by d.day), '[]'::jsonb) into hist
     from daily_stats d where d.user_id = auth.uid() and d.day >= user_today() - 41;
+  select coalesce(jsonb_agg(jsonb_build_object('id', p.id, 'title', p.title, 'html', p.html)
+      order by p.sort_order, p.updated_at), '[]'::jsonb) into pages
+    from notes_pages p where p.user_id = auth.uid();
 
   return jsonb_build_object(
     'notes', s.notes,
@@ -741,7 +791,8 @@ begin
     'quests', s.quests,
     'weekly_quests', s.weekly_quests,
     'checklist', tasks,
-    'history', hist
+    'history', hist,
+    'notes_pages', pages
   );
 end;
 $$;
@@ -1053,6 +1104,103 @@ create or replace function shared_clear_done() returns void
 language sql security invoker set search_path = public, extensions as $$
   delete from shared_tasks where household_id = my_household_id() and done and recurrence = 'once';
 $$;
+
+-- ============================================================
+-- Phone push reminders (v2.16)
+-- ============================================================
+-- The phone app subscribes to Web Push (one row per phone/browser). Every
+-- minute a scheduled job (supabase/push_reminders.sql) calls the
+-- send-reminders Edge Function (supabase/functions/send-reminders), which
+-- asks due_push_reminders() what's due and sends it. Only the checklist's
+-- daily "remind me at" time is pushed; the desktop's "every N hours"
+-- reminders never reach the cloud.
+
+create table if not exists push_subscriptions (
+  endpoint text primary key,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  p256dh text not null,
+  auth text not null,
+  created_at timestamptz not null default now()
+);
+
+alter table push_subscriptions enable row level security;
+drop policy if exists "own push subscriptions" on push_subscriptions;
+create policy "own push subscriptions"
+  on push_subscriptions for all
+  using (auth.uid() = user_id)
+  with check (auth.uid() = user_id);
+
+-- Upsert: a browser re-subscribing (or another account signing in on the
+-- same phone) takes the endpoint over.
+create or replace function save_push_subscription(p_endpoint text, p_p256dh text, p_auth text) returns void
+language plpgsql security definer set search_path = public, extensions as $$
+begin
+  if auth.uid() is null then
+    raise exception 'not signed in';
+  end if;
+  if length(p_endpoint) > 1000 or p_endpoint !~ '^https://' then
+    raise exception 'not a push endpoint';
+  end if;
+  insert into push_subscriptions (endpoint, user_id, p256dh, auth)
+  values (p_endpoint, auth.uid(), p_p256dh, p_auth)
+  on conflict (endpoint) do update
+    set user_id = auth.uid(), p256dh = excluded.p256dh, auth = excluded.auth, created_at = now();
+end;
+$$;
+
+create or replace function delete_push_subscription(p_endpoint text) returns void
+language sql security invoker set search_path = public, extensions as $$
+  delete from push_subscriptions where endpoint = p_endpoint and user_id = auth.uid();
+$$;
+
+-- For the Edge Function only (service role). Finds every checklist reminder
+-- whose time has come in its owner's local time today, that isn't done
+-- (judged the way roll_recurring_tasks() would, since nobody may have
+-- opened the app since midnight) and wasn't pushed today; marks them
+-- pushed; returns one row per (reminder, subscription) to send.
+create or replace function due_push_reminders()
+returns table (endpoint text, p256dh text, auth text, task_id text, title text, body text)
+language plpgsql security definer set search_path = public, extensions as $$
+begin
+  return query
+  with local_now as (
+    select a.user_id, (now() at time zone 'utc') + a.tz_offset_min * interval '1 minute' as ts
+    from app_state a
+    where exists (select 1 from push_subscriptions s where s.user_id = a.user_id)
+  ),
+  due as (
+    update checklist_tasks t set push_reminded_on = ln.ts::date
+    from local_now ln
+    where t.user_id = ln.user_id
+      and t.source = 'checklist'
+      and t.reminder_time ~ '^[0-2][0-9]:[0-5][0-9]$'
+      and t.reminder_time <= to_char(ln.ts, 'HH24:MI')
+      and t.push_reminded_on is distinct from ln.ts::date
+      and not (
+        t.completed_today and (
+          t.recurrence = 'once'
+          or (t.recurrence = 'daily' and t.last_completed = ln.ts::date)
+          or (t.recurrence = 'weekly' and t.last_completed >= week_start_for(ln.ts::date))
+        )
+      )
+    returning t.id, t.user_id, t.text
+  )
+  select s.endpoint, s.p256dh, s.auth, d.id, 'Task reminder'::text, d.text
+  from due d join push_subscriptions s on s.user_id = d.user_id;
+end;
+$$;
+
+-- The push service said this subscription is gone (uninstalled, revoked).
+create or replace function drop_push_subscription(p_endpoint text) returns void
+language sql security definer set search_path = public, extensions as $$
+  delete from push_subscriptions where endpoint = p_endpoint;
+$$;
+
+-- Only the Edge Function (service role) may run these two.
+revoke all on function due_push_reminders() from public, anon, authenticated;
+revoke all on function drop_push_subscription(text) from public, anon, authenticated;
+grant execute on function due_push_reminders() to service_role;
+grant execute on function drop_push_subscription(text) to service_role;
 
 -- ============================================================
 -- Deckbuilder trading (opt-in public collections + a "for trade" list)

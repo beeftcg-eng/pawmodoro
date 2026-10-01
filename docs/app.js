@@ -7,6 +7,9 @@ const CONFIG_KEY = "pawmodoro_config";       // { url, anonKey }
 const SESSION_KEY = "pawmodoro_session";     // supabase session, persisted by the client itself
 const SETTINGS_KEY = "pawmodoro_settings";   // { workMin, shortBreakMin, longBreakMin, sessionsBeforeLong }
 const THEME_KEY = "pawmodoro_theme";         // theme name, independent per device (matches desktop)
+// Public half of the Web Push key pair; the private half is a secret of the
+// send-reminders Edge Function (supabase/functions/send-reminders).
+const VAPID_PUBLIC_KEY = "BAfduob9rBFf2TCWPKa_6cx_WSq4TTGsEqPKUsfSrVvJ7F1gqtNumo_R5dLgSzVE_thLAltRyRJKR6PDyYWDcso";
 
 // Same palettes as the desktop app's theme.py, minus the desktop-only
 // serif/mono font-fallback machinery — "mono" themes just use a plain
@@ -292,6 +295,7 @@ async function enterApp() {
   renderShell();
   updateLevelBadge();
   startPolling();
+  refreshPushSubscription();
 }
 
 function startPolling() {
@@ -413,8 +417,10 @@ function rerenderActiveTab() {
     // poll landing mid-keystroke can never clobber text being typed
     // right now — it picks up on the next poll after you tap away.
     const editor = document.getElementById("notes-editor");
-    if (editor && document.activeElement !== editor) {
-      editor.innerHTML = state.notes ?? "";
+    if (editor && document.activeElement !== editor && !notesSaveTimer) {
+      if (!notePages().some(p => p.id === notesPage)) setNotesPage("main");
+      if (renderKeys.notesPages !== notePagesKey()) renderNotes();
+      else editor.innerHTML = pageHtml(notesPage);
     }
   } else if (activeTab === "checklist") {
     if (renderKeys.checklist !== checklistKey()) renderChecklist();
@@ -470,6 +476,77 @@ function updateLevelBadge() {
 // ---------- Notes tab ----------
 
 let notesSaveTimer = null;
+let notesSaveNow = null;  // runs the pending save immediately (before switching page)
+
+// Notes pages: "main" is the original notes text (app_state.notes), the
+// rest come from the notes_pages table (desktop v2.16+). An older cloud
+// schema sends no notes_pages at all; then there's just the one page.
+const NOTES_PAGE_KEY = "pawmodoro_notes_page";
+let notesPage = (() => { try { return localStorage.getItem(NOTES_PAGE_KEY) || "main"; } catch { return "main"; } })();
+
+function notePages() {
+  return [{ id: "main", title: "Notes" }, ...(state?.notes_pages ?? [])];
+}
+
+function notePagesKey() {
+  return JSON.stringify([notesPage, notePages().map(p => [p.id, p.title])]);
+}
+
+function pageHtml(id) {
+  if (id === "main") return state?.notes ?? "";
+  return (state?.notes_pages ?? []).find(p => p.id === id)?.html ?? "";
+}
+
+function setNotesPage(id) {
+  notesPage = id;
+  try { localStorage.setItem(NOTES_PAGE_KEY, id); } catch { /* private mode */ }
+}
+
+function newPageId() {
+  const bytes = crypto.getRandomValues(new Uint8Array(4));
+  return Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function notesPageCall(name, params, failText) {
+  const { error } = await supabaseClient.rpc(name, params);
+  if (error) toast(`⚠️ ${failText}`, error.message || "Check your connection and try again.");
+  await pullAndRender();
+  return !error;
+}
+
+async function switchNotesPage(id) {
+  if (notesSaveNow) await notesSaveNow();
+  setNotesPage(id);
+  renderNotes();
+}
+
+async function addNotesPage() {
+  const title = (prompt("New page name") ?? "").trim();
+  if (!title) return;
+  if (notesSaveNow) await notesSaveNow();
+  const id = newPageId();
+  setNotesPage(id);
+  await notesPageCall("set_note_page", { p_id: id, p_title: title, p_html: "" }, "Couldn't add the page");
+  renderNotes();
+}
+
+async function renameNotesPage(page) {
+  const title = (prompt("Rename page", page.title) ?? "").trim();
+  if (!title || title === page.title) return;
+  if (notesSaveNow) await notesSaveNow();
+  await notesPageCall("set_note_page", { p_id: page.id, p_title: title, p_html: pageHtml(page.id) }, "Couldn't rename the page");
+  renderNotes();
+}
+
+async function removeNotesPage(page) {
+  if (!confirm(`Delete the page “${page.title}” and everything on it?`)) return;
+  clearTimeout(notesSaveTimer);
+  notesSaveTimer = null;
+  notesSaveNow = null;
+  setNotesPage("main");
+  await notesPageCall("remove_note_page", { p_id: page.id }, "Couldn't delete the page");
+  renderNotes();
+}
 
 // Simple contenteditable formatting toolbar. document.execCommand is
 // long-deprecated but still the only broadly-supported way to do basic
@@ -490,14 +567,33 @@ function renderNotes() {
   const toolbarHtml = NOTES_TOOLBAR
     .map(b => `<button type="button" data-cmd="${b.cmd}" title="${b.title}">${b.label}</button>`)
     .join("");
+  if (!notePages().some(p => p.id === notesPage)) setNotesPage("main");
+  renderKeys.notesPages = notePagesKey();
+  const pagesSupported = Array.isArray(state?.notes_pages);
+  const current = notePages().find(p => p.id === notesPage);
+  const pageTabs = pagesSupported ? `
+      <div class="notes-pages">
+        ${notePages().map(p => `<button type="button" class="notes-page-tab${p.id === notesPage ? " active" : ""}" data-page="${escapeHtml(p.id)}">${escapeHtml(p.title)}</button>`).join("")}
+        <button type="button" class="notes-page-add" title="Add a page">+ Page</button>
+        ${notesPage !== "main" ? `
+          <button type="button" class="rename-btn notes-page-rename" title="Rename this page">✎</button>
+          <button type="button" class="remove-btn notes-page-remove" title="Delete this page">✕</button>` : ""}
+      </div>` : "";
   view.innerHTML = `
     <div class="pane">
+      ${pageTabs}
       <div class="notes-toolbar">${toolbarHtml}</div>
       <div id="notes-editor" class="notes-editor" contenteditable="true" data-placeholder="Jot anything here. It saves itself."></div>
       <p id="notes-status" class="hint">Autosaved</p>
     </div>`;
   const editor = document.getElementById("notes-editor");
-  editor.innerHTML = state?.notes ?? "";
+  editor.innerHTML = pageHtml(notesPage);
+  view.querySelectorAll(".notes-page-tab").forEach(btn => {
+    btn.addEventListener("click", () => switchNotesPage(btn.dataset.page));
+  });
+  view.querySelector(".notes-page-add")?.addEventListener("click", addNotesPage);
+  view.querySelector(".notes-page-rename")?.addEventListener("click", () => renameNotesPage(current));
+  view.querySelector(".notes-page-remove")?.addEventListener("click", () => removeNotesPage(current));
 
   document.querySelectorAll(".notes-toolbar button").forEach(btn => {
     btn.addEventListener("click", () => {
@@ -520,13 +616,26 @@ function scheduleNotesSave(editor) {
   const savingStatus = document.getElementById("notes-status");
   if (savingStatus) savingStatus.textContent = "Saving…";
   clearTimeout(notesSaveTimer);
-  notesSaveTimer = setTimeout(async () => {
+  const pageId = notesPage;  // the page this edit belongs to, even if you switch before it saves
+  const save = async () => {
+    clearTimeout(notesSaveTimer);
+    notesSaveTimer = null;
+    notesSaveNow = null;
     const html = editor.innerHTML;
-    await supabaseClient.rpc("set_notes", { p_notes: html });
-    if (state) state.notes = html;
+    if (pageId === "main") {
+      await supabaseClient.rpc("set_notes", { p_notes: html });
+      if (state) state.notes = html;
+    } else {
+      const page = (state?.notes_pages ?? []).find(p => p.id === pageId);
+      if (!page) return;  // deleted meanwhile
+      await supabaseClient.rpc("set_note_page", { p_id: pageId, p_title: page.title, p_html: html });
+      page.html = html;
+    }
     const status = document.getElementById("notes-status");
     if (status) status.textContent = "Autosaved";
-  }, 800);
+  };
+  notesSaveNow = save;
+  notesSaveTimer = setTimeout(save, 800);
 }
 
 // ---------- Checklist tab ----------
@@ -607,6 +716,7 @@ function renderChecklist() {
   const wishlistTasks = allTasks.filter(t => t.source === "wishlist");
   view.innerHTML = `
     <div class="pane">
+      <div id="push-row" class="push-row"></div>
       <ul id="task-list" class="task-list"></ul>
       <div class="add-row">
         <input id="task-text" type="text" placeholder="e.g. Walk the dogs">
@@ -624,6 +734,7 @@ function renderChecklist() {
     </div>`;
 
   renderTaskList(document.getElementById("task-list"), tasks, { showRecurrence: true, reminders: true });
+  updatePushRow();
   const wishlistList = document.getElementById("wishlist-task-list");
   if (wishlistList) renderTaskList(wishlistList, wishlistTasks);
 
@@ -636,6 +747,89 @@ function renderChecklist() {
     await pullAndRender();
   });
   restoreDraft();
+}
+
+// ---------- Phone push notifications ----------
+// With these on, a task's 🔔 time reaches the phone even when this app is
+// closed: the cloud sends it (see supabase/functions/send-reminders).
+
+function pushSupported() {
+  return "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+}
+
+function isIos() {
+  return /iphone|ipad|ipod/i.test(navigator.userAgent);
+}
+
+function vapidKeyBytes() {
+  const padded = VAPID_PUBLIC_KEY + "=".repeat((4 - VAPID_PUBLIC_KEY.length % 4) % 4);
+  const raw = atob(padded.replace(/-/g, "+").replace(/_/g, "/"));
+  return Uint8Array.from(raw, c => c.charCodeAt(0));
+}
+
+async function currentPushSubscription() {
+  if (!pushSupported()) return null;
+  const reg = await navigator.serviceWorker.ready;
+  return reg.pushManager.getSubscription();
+}
+
+async function savePushSubscription(sub) {
+  const json = sub.toJSON();
+  return supabaseClient.rpc("save_push_subscription", {
+    p_endpoint: json.endpoint, p_p256dh: json.keys.p256dh, p_auth: json.keys.auth,
+  });
+}
+
+async function enablePush() {
+  if (await Notification.requestPermission() !== "granted") {
+    toast("Notifications are blocked", "Allow them for this app in your phone's settings, then try again.");
+    return updatePushRow();
+  }
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    const sub = await reg.pushManager.getSubscription()
+      ?? await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: vapidKeyBytes() });
+    const { error } = await savePushSubscription(sub);
+    if (error) throw new Error(error.message);
+    toast("\u{1F514} Phone notifications on", "Your checklist reminders will arrive even with the app closed.");
+  } catch (err) {
+    toast("⚠️ Couldn't turn on notifications", err.message || String(err));
+  }
+  updatePushRow();
+}
+
+async function disablePush() {
+  const sub = await currentPushSubscription();
+  if (sub) {
+    await supabaseClient.rpc("delete_push_subscription", { p_endpoint: sub.endpoint });
+    await sub.unsubscribe();
+  }
+  updatePushRow();
+}
+
+// Re-registers an existing subscription with whoever is signed in now
+// (e.g. after logging into another account on the same phone).
+async function refreshPushSubscription() {
+  try {
+    const sub = await currentPushSubscription();
+    if (sub && Notification.permission === "granted") await savePushSubscription(sub);
+  } catch { /* best-effort */ }
+}
+
+async function updatePushRow() {
+  const row = document.getElementById("push-row");
+  if (!row) return;
+  if (!pushSupported()) {
+    row.innerHTML = isIos()
+      ? `<p class="hint">\u{1F514} For reminders with the app closed, add Pawmodoro to your Home Screen (Share → Add to Home Screen) and open it from there.</p>`
+      : `<p class="hint">\u{1F514} This browser can't show reminders while the app is closed.</p>`;
+    return;
+  }
+  const on = Boolean(await currentPushSubscription()) && Notification.permission === "granted";
+  row.innerHTML = on
+    ? `<span class="hint">\u{1F514} Phone notifications are on</span> <button id="push-toggle" class="secondary-btn">Turn off</button>`
+    : `<span class="hint">\u{1F514} Get your reminders even with the app closed</span> <button id="push-toggle">Turn on</button>`;
+  document.getElementById("push-toggle").addEventListener("click", on ? disablePush : enablePush);
 }
 
 async function setTaskReminder(taskId, time) {

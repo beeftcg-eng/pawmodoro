@@ -28,6 +28,7 @@ from datetime import datetime
 from supabase_sync import SupabaseSync, SyncError
 
 POLL_SECONDS = 5           # how often to pull while things are healthy
+BACKGROUND_POLL_SECONDS = 60  # ...and while no Pawmodoro window is on screen (sitting in the tray)
 SLOW_RETRY_SECONDS = 60    # when the session is dead / schema is outdated
 HOUSEHOLD_PROBE_SECONDS = 60  # how often to look for a household created elsewhere
 
@@ -66,6 +67,9 @@ class SyncEngine:
         self._tz_retry_at = 0.0
         self._household_supported = True
         self._next_household_probe = 0.0
+        # Set from the UI thread: True while no window is showing. Pulls then
+        # slow right down; local edits still upload immediately (wake()).
+        self.background = False
 
     # ---------- lifecycle ----------
 
@@ -83,6 +87,16 @@ class SyncEngine:
     def wake(self):
         """Ask for a sync cycle right away (after a local edit)."""
         self._wake.set()
+
+    def set_background(self, background):
+        """A window appearing again gets a fresh pull right away."""
+        if self.background and not background:
+            self._last_pull = 0.0
+            self.wake()
+        self.background = background
+
+    def _poll_seconds(self):
+        return BACKGROUND_POLL_SECONDS if self.background else POLL_SECONDS
 
     def reconfigure(self):
         """Sync settings changed (connected / disconnected / different
@@ -132,7 +146,7 @@ class SyncEngine:
                 self._cycle()
             except Exception:  # noqa: BLE001 - the sync thread must never die
                 traceback.print_exc()
-            delay = SLOW_RETRY_SECONDS if self.status in ("auth", "schema") else POLL_SECONDS
+            delay = SLOW_RETRY_SECONDS if self.status in ("auth", "schema") else self._poll_seconds()
             self._wake.wait(delay)
             self._wake.clear()
 
@@ -155,7 +169,7 @@ class SyncEngine:
 
         # A wake-up caused by a local edit shouldn't also trigger a pull
         # every time; only pull on the regular poll interval.
-        if time.monotonic() - self._last_pull < POLL_SECONDS - 0.5:
+        if time.monotonic() - self._last_pull < self._poll_seconds() - 0.5:
             return
         self._pull()
 
@@ -212,6 +226,13 @@ class SyncEngine:
                 with self._io_lock:
                     self._execute(op)
             except SyncError as e:
+                if e.schema_outdated and op["op"].startswith("note_page"):
+                    # The cloud predates notes pages: don't let them hold up
+                    # everything else (see Storage.outbox_note_pages_unsupported).
+                    print(f"[sync] cloud has no notes pages yet; dropping {op['op']}")
+                    self.storage.outbox_note_pages_unsupported()
+                    self.storage.outbox_done(op["seq"])
+                    continue
                 if e.transient:
                     self.storage.outbox_release()
                     self._note_failure(e)
@@ -257,6 +278,12 @@ class SyncEngine:
             c.shared_remove_task(a["id"])
         elif name == "shared_clear_done":
             c.shared_clear_done()
+        elif name == "note_page_set":
+            c.set_note_page(a["id"], a["title"], a["html"])
+        elif name == "note_page_remove":
+            c.remove_note_page(a["id"])
+        elif name == "note_pages_reorder":
+            c.reorder_note_pages(a["ids"])
         else:
             print(f"[sync] unknown queued operation {name!r}; dropping it")
 
