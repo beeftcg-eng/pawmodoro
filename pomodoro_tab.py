@@ -537,7 +537,9 @@ class PomodoroTab(QWidget):
         self._last_tick = now
         if gap > STALL_GAP_SECONDS:
             self._deadline += gap - TICK_MS / 1000  # forgive time spent asleep / frozen
-        self.seconds_left = max(0, math.ceil(self._deadline - now))
+        # (-1e-6: on a coarse clock, deadline - now can come out a hair over a
+        # whole second, which would round up to a phantom extra second)
+        self.seconds_left = max(0, math.ceil(self._deadline - now - 1e-6))
 
     def reset_phase(self):
         self._hide_away()
