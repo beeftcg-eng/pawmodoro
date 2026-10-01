@@ -82,6 +82,14 @@ once more for them. Until you do, extra notes pages simply stay on the
 desktop (they never hold up the rest of the queue) and the phone gets no
 pushes. Everything else syncs as before.
 
+**v2.17.0** changes the schema again (notes conflict protection, synced
+every-N-hours reminders, snoozes and quiet hours, more push notifications).
+Re-run `schema.sql`, then re-run `supabase/push_reminders.sql` too: the
+scheduled job now runs every 30 seconds and sends a secret the push
+function checks, and the old job would be turned away. If you use phone
+push, redeploy the function first (`supabase functions deploy
+send-reminders`, or the **Deploy push function** GitHub workflow).
+
 ## Phone reminders with the app closed (v2.16.0, optional)
 
 The phone app can receive your checklist's daily 🔔 reminders as real
@@ -112,8 +120,11 @@ minutes, from a computer with this repo:
    works once Pawmodoro is added to the Home Screen and opened from there
    (iOS 16.4 or later).
 
-Only the daily "remind me at" time is pushed. The desktop's "every N hours"
-reminders stay on the desktop.
+Pushed: your checklist reminders (a daily time, every N hours, snoozes),
+shared-list items that have a time (to every household member with
+notifications on), and the phone timer's "session over" when you started it
+on that phone. Reminder notifications have **✅ Done** and **💤 15 min**
+buttons that work without opening the app.
 
 ## The shared household list (two people)
 

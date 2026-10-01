@@ -55,6 +55,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $dir 'pawmodoro\i
 
 ## What changed from the first version
 
+**v2.17.0 — notes never overwrite each other, more phone notifications (shared items, every N hours, the timer), and Done / Snooze buttons on them.** **Schema change: re-run `supabase/schema.sql`, then `supabase/push_reminders.sql`** (see MOBILE_SYNC.md).
+- **Notes can't silently overwrite each other any more.** Every save now says which version of the notes it was based on. If the notes changed on another device in between (say the desktop was offline while you wrote on the phone), the cloud refuses the save. The other device's version is then kept as its own page, "Notes (other device, 14:32)", before yours is saved, and you get a notification. The same goes for every notes page.
+- **Phone notifications for more things**: shared-list items with a time now reach every household member's phone, and so do "every N hours" reminders and snoozes. These two used to be desktop-only and now sync both ways, along with quiet hours. The phone app can set "every N hours" too.
+- **The phone timer works with the screen off**: with notifications on, starting a session on the phone books a "session over" push for its end time. Pausing or resetting cancels it. The page itself no longer has to stay awake.
+- **Done and Snooze buttons on phone notifications**: tick a task off (with its XP) or snooze it 15 minutes right from the notification, without opening the app.
+- **Push is more reliable**: a reminder only counts as sent once a push actually goes through, so a hiccup at the push service means a retry a couple of minutes later, not a lost reminder. The server function now only runs when the scheduled job calls it, with a secret generated inside the database, so nobody else can make it run. It now checks every 30 seconds instead of every minute.
+- **Behind the scenes**: the cloud schema now has an automated test suite (`tests/sql/`, run against a real Postgres 17 on every push), and so does the phone app (`tests/pwa/`, in a simulated browser). The Python tests also run on Windows, and every push does a real Windows install and launches the installed app. The push function redeploys itself when it changes. `WINDOWS_TESTING.md` lists the checks that still need a real Windows desktop, and `tools/winget_manifest.py` writes the winget package files for a release.
+- **Licensed MIT** (see `LICENSE`), and `install.ps1` now finds Python even when it was installed moments ago and isn't on this window's PATH yet (what happens when winget installs Python first as a dependency).
+- **Honest testing note**: the schema was loaded as an upgrade from v2.16, re-run, and loaded fresh into a real local Postgres, then tested as signed-in users and as the push function: conflicts, every reminder kind, quiet hours, retries after a failed send, the timer push, the Done/Snooze buttons acting as the task's owner, and who may call what. The phone app's code was run in a simulated browser against a fake cloud, and the push function was type-checked with Deno. Not yet run for real: the new function sending to a real phone (it needs the schema re-run and a redeploy), and the notification buttons on a real Android phone.
+
 **v2.16.0 — phone push reminders, synced notes pages, a timer that survives restarts, backups you can restore, and keyboard shortcuts.** **Schema change: re-run `supabase/schema.sql`** (see MOBILE_SYNC.md); phone pushes also need a one-time server setup described there.
 - **Phone reminders with the app closed**: Checklist tab on the phone → **🔔 Turn on**. A task's daily 🔔 time then arrives as a real notification even when the phone app isn't open (on an iPhone, once it's added to the Home Screen). It's sent by a small Supabase function that runs every minute.
 - **Notes pages sync**: extra notes pages now sync with the phone, which can add, rename, delete and edit them too. Pages made in v2.15 upload once, automatically. Before the schema is re-run they simply stay on the desktop, as before.
@@ -327,3 +337,7 @@ Pawmodoro deliberately keeps running in the system tray when you close its windo
 1. Right-click the tray icon and choose **Quit** explicitly, just in case.
 2. Confirm you're running the installer from a freshly extracted copy of the *new* zip, not an old folder.
 3. Relaunch and check the window title — it should read the current version (e.g. `Pawmodoro v1.3.0`). If it still shows an old version, something's still holding onto the old process; run `pkill -f pawmodoro` in a terminal, then launch again.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

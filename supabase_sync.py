@@ -152,6 +152,24 @@ class SupabaseSync:
     def set_notes(self, text):
         return self._rpc("set_notes", {"p_notes": text})
 
+    def set_notes_checked(self, text, base_rev):
+        return self._rpc("set_notes_checked", {"p_notes": text, "p_base_rev": base_rev})
+
+    def set_note_page_checked(self, page_id, title, html, base_rev):
+        return self._rpc("set_note_page_checked",
+                         {"p_id": page_id, "p_title": title, "p_html": html, "p_base_rev": base_rev})
+
+    def set_task_reminder_mode(self, task_id, reminder_time, every_h):
+        return self._rpc("set_task_reminder_mode",
+                         {"p_task_id": task_id, "p_reminder_time": reminder_time, "p_every_h": every_h})
+
+    def snooze_task(self, task_id, until_iso):
+        return self._rpc("snooze_task", {"p_task_id": task_id, "p_until": until_iso})
+
+    def set_reminder_settings(self, quiet_enabled, quiet_start, quiet_end):
+        return self._rpc("set_reminder_settings", {
+            "p_quiet_enabled": quiet_enabled, "p_quiet_start": quiet_start, "p_quiet_end": quiet_end})
+
     def set_note_page(self, page_id, title, html):
         return self._rpc("set_note_page", {"p_id": page_id, "p_title": title, "p_html": html})
 

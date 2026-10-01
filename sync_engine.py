@@ -249,7 +249,7 @@ class SyncEngine:
         c = self.client
         name = op["op"]
         if name == "set_notes":
-            c.set_notes(a["text"])
+            self._save_page_checked(self.storage.MAIN_NOTES_PAGE, None, a["text"])
         elif name == "add_task":
             c.add_task(a["text"], a["recurrence"], a.get("reminder_time"), a.get("source", "checklist"), a["id"])
         elif name == "remove_task":
@@ -258,6 +258,18 @@ class SyncEngine:
             c.rename_task(a["id"], a["text"])
         elif name == "set_task_reminder":
             c.set_task_reminder(a["id"], a["reminder_time"])
+        elif name == "set_task_reminder_mode":
+            try:
+                c.set_task_reminder_mode(a["id"], a.get("reminder_time"), a.get("every_h"))
+            except SyncError as e:
+                if not e.schema_outdated:
+                    raise
+                # Cloud older than v2.17: it only knows a daily time.
+                c.set_task_reminder(a["id"], None if a.get("every_h") else a.get("reminder_time"))
+        elif name == "snooze_task":
+            self._new_in_v217(lambda: c.snooze_task(a["id"], a["until"]))
+        elif name == "set_reminder_settings":
+            self._new_in_v217(lambda: c.set_reminder_settings(a["quiet_enabled"], a["quiet_start"], a["quiet_end"]))
         elif name == "reorder_tasks":
             c.reorder_tasks(a["ids"])
         elif name == "complete_task":
@@ -279,13 +291,50 @@ class SyncEngine:
         elif name == "shared_clear_done":
             c.shared_clear_done()
         elif name == "note_page_set":
-            c.set_note_page(a["id"], a["title"], a["html"])
+            self._save_page_checked(a["id"], a["title"], a["html"])
         elif name == "note_page_remove":
             c.remove_note_page(a["id"])
         elif name == "note_pages_reorder":
             c.reorder_note_pages(a["ids"])
         else:
             print(f"[sync] unknown queued operation {name!r}; dropping it")
+
+    def _new_in_v217(self, call):
+        """Something an older cloud schema simply doesn't have (it stays on
+        this computer): skip it rather than hold up the queue."""
+        try:
+            call()
+        except SyncError as e:
+            if not e.schema_outdated:
+                raise
+
+    def _save_page_checked(self, page_id, title, html):
+        """Saves notes (page_id "main") or a page, refused by the cloud if
+        another device saved it since this computer last saw it. Then their
+        version is kept as a separate page (Storage.outbox_notes_conflict)
+        and ours goes on top. A cloud older than v2.17 just takes it."""
+        c = self.client
+        main = page_id == self.storage.MAIN_NOTES_PAGE
+        for _attempt in range(3):
+            base = self.storage.outbox_base_rev(page_id)
+            try:
+                result = (c.set_notes_checked(html, base) if main
+                          else c.set_note_page_checked(page_id, title, html, base))
+            except SyncError as e:
+                if not e.schema_outdated:
+                    raise
+                if main:
+                    c.set_notes(html)
+                else:
+                    c.set_note_page(page_id, title, html)
+                return
+            if result.get("ok"):
+                self.storage.outbox_saved_rev(page_id, result.get("rev"))
+                return
+            print(f"[sync] {page_id} notes changed elsewhere; keeping both versions")
+            self.storage.outbox_notes_conflict(
+                page_id, result.get("title", title), result.get("notes" if main else "html", ""), result.get("rev"))
+        raise SyncError("notes kept changing while saving", status=None)
 
     def _pull(self):
         rev = self.storage.rev

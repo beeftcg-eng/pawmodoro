@@ -245,6 +245,7 @@ class MainWindow(QMainWindow):
             self.widget_window.refresh_tasks()
 
     def _refresh_sync_status(self):
+        self._keep_conflicting_notes()
         engine = self.storage.sync
         if not self.storage.sync_configured():
             self.sync_btn.setText("☁️ Sync")
@@ -261,6 +262,19 @@ class MainWindow(QMainWindow):
         if engine.status != self._last_sync_status and engine.status in ("auth", "schema"):
             notifier.send("Pawmodoro cloud sync", engine.status_text())
         self._last_sync_status = engine.status
+
+    def _keep_conflicting_notes(self):
+        """Notes changed here and on another device before they met: the
+        other version is kept as its own page rather than lost."""
+        made = self.storage.take_notes_conflicts()
+        if not made:
+            return
+        self.notes_checklist_tab.notes_tab.maybe_reload_from_remote()
+        notifier.send(
+            "Notes changed in two places",
+            f"Both versions are kept. The other device's is now the page “{made[0]}”"
+            + (f" (and {len(made) - 1} more)" if len(made) > 1 else "") + ".",
+            on_click=lambda: (self.restore_from_widget(), self.tabs.setCurrentWidget(self.notes_checklist_tab)))
 
     def _open_sync_settings(self):
         dialog = SyncSettingsDialog(self.storage, self)

@@ -507,6 +507,35 @@ function newPageId() {
   return Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
 }
 
+// Saves a page only if nobody else saved it since this phone last saw it
+// (e.g. the desktop catching up after being offline). If they did, their
+// version is kept as a new page first, then ours is saved -- nothing lost.
+async function saveNotesChecked(pageId, title, html) {
+  const main = pageId === "main";
+  const page = main ? null : (state?.notes_pages ?? []).find(p => p.id === pageId);
+  let base = main ? (state?.notes_rev ?? null) : (page?.rev ?? null);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const { data, error } = main
+      ? await supabaseClient.rpc("set_notes_checked", { p_notes: html, p_base_rev: base })
+      : await supabaseClient.rpc("set_note_page_checked", { p_id: pageId, p_title: title, p_html: html, p_base_rev: base });
+    if (error && isMissingFunction(error)) {  // older cloud: plain save
+      return main ? supabaseClient.rpc("set_notes", { p_notes: html })
+                  : supabaseClient.rpc("set_note_page", { p_id: pageId, p_title: title, p_html: html });
+    }
+    if (error) { toast("⚠️ Couldn't save notes", error.message || "Check your connection."); return; }
+    if (data.ok) {
+      if (main && state) state.notes_rev = data.rev;
+      else if (page) page.rev = data.rev;
+      return;
+    }
+    const theirs = main ? data.notes : data.html;
+    const copyTitle = `${title} (other device, ${new Date().toTimeString().slice(0, 5)})`;
+    await supabaseClient.rpc("set_note_page_checked", { p_id: newPageId(), p_title: copyTitle, p_html: theirs ?? "", p_base_rev: null });
+    toast("Notes changed in two places", `Both kept: the other version is now the page “${copyTitle}”.`);
+    base = data.rev;
+  }
+}
+
 async function notesPageCall(name, params, failText) {
   const { error } = await supabaseClient.rpc(name, params);
   if (error) toast(`⚠️ ${failText}`, error.message || "Check your connection and try again.");
@@ -526,7 +555,7 @@ async function addNotesPage() {
   if (notesSaveNow) await notesSaveNow();
   const id = newPageId();
   setNotesPage(id);
-  await notesPageCall("set_note_page", { p_id: id, p_title: title, p_html: "" }, "Couldn't add the page");
+  await notesPageCall("set_note_page_checked", { p_id: id, p_title: title, p_html: "", p_base_rev: null }, "Couldn't add the page");
   renderNotes();
 }
 
@@ -534,7 +563,7 @@ async function renameNotesPage(page) {
   const title = (prompt("Rename page", page.title) ?? "").trim();
   if (!title || title === page.title) return;
   if (notesSaveNow) await notesSaveNow();
-  await notesPageCall("set_note_page", { p_id: page.id, p_title: title, p_html: pageHtml(page.id) }, "Couldn't rename the page");
+  await notesPageCall("set_note_page_checked", { p_id: page.id, p_title: title, p_html: pageHtml(page.id), p_base_rev: null }, "Couldn't rename the page");
   renderNotes();
 }
 
@@ -623,12 +652,12 @@ function scheduleNotesSave(editor) {
     notesSaveNow = null;
     const html = editor.innerHTML;
     if (pageId === "main") {
-      await supabaseClient.rpc("set_notes", { p_notes: html });
+      await saveNotesChecked("main", "Notes", html);
       if (state) state.notes = html;
     } else {
       const page = (state?.notes_pages ?? []).find(p => p.id === pageId);
       if (!page) return;  // deleted meanwhile
-      await supabaseClient.rpc("set_note_page", { p_id: pageId, p_title: page.title, p_html: html });
+      await saveNotesChecked(pageId, page.title, html);
       page.html = html;
     }
     const status = document.getElementById("notes-status");
@@ -650,7 +679,12 @@ function renderTaskList(container, tasks, { showRecurrence = false, reminders = 
   tasks.forEach((task, index) => {
     const li = document.createElement("li");
     li.className = "task-item" + (task.completed_today ? " done" : "");
-    const bell = reminders && task.reminder_time ? ` <em>\u{1F514} ${escapeHtml(task.reminder_time)}</em>` : "";
+    const bell = !reminders ? ""
+      : task.reminder_every_h ? ` <em>\u{1F514} every ${Number(task.reminder_every_h)}h</em>`
+      : task.reminder_time ? ` <em>\u{1F514} ${escapeHtml(task.reminder_time)}</em>` : "";
+    const snoozed = reminders && task.snoozed_until && new Date(task.snoozed_until) > new Date()
+      ? ` <em>\u{1F4A4} ${new Date(task.snoozed_until).toTimeString().slice(0, 5)}</em>` : "";
+    const everyMode = Boolean(task.reminder_every_h);
     li.innerHTML = `
       <div class="reorder-col">
         <button class="reorder-btn" data-dir="up" title="Move up" ${index === 0 ? "disabled" : ""}>▲</button>
@@ -658,15 +692,21 @@ function renderTaskList(container, tasks, { showRecurrence = false, reminders = 
       </div>
       <label>
         <input type="checkbox" ${task.completed_today ? "checked" : ""}>
-        <span>${escapeHtml(task.text)}${showRecurrence ? ` <em>[${task.recurrence}]</em>` : ""}${bell}</span>
+        <span>${escapeHtml(task.text)}${showRecurrence ? ` <em>[${task.recurrence}]</em>` : ""}${bell}${snoozed}</span>
       </label>
-      ${reminders ? `<button class="rename-btn reminder-btn" title="Daily reminder">\u{1F514}</button>` : ""}
+      ${reminders ? `<button class="rename-btn reminder-btn" title="Reminder">\u{1F514}</button>` : ""}
       <button class="rename-btn" title="Rename">✎</button>
       <button class="remove-btn" title="Remove">✕</button>
       ${reminders ? `
         <div class="reminder-edit" hidden>
-          <span class="hint">Remind me daily at</span>
-          <input type="time" value="${escapeHtml(task.reminder_time ?? "")}">
+          <select class="reminder-mode">
+            <option value="time" ${everyMode ? "" : "selected"}>Remind me daily at</option>
+            <option value="every" ${everyMode ? "selected" : ""}>Remind me every</option>
+          </select>
+          <input class="reminder-time" type="time" value="${escapeHtml(task.reminder_time ?? "")}" ${everyMode ? "hidden" : ""}>
+          <span class="reminder-every" ${everyMode ? "" : "hidden"}>
+            <input type="number" min="1" max="24" value="${Number(task.reminder_every_h) || 8}"> hours
+          </span>
           <button class="reminder-save">Set</button>
           <button class="reminder-clear">Clear</button>
         </div>` : ""}`;
@@ -675,12 +715,23 @@ function renderTaskList(container, tasks, { showRecurrence = false, reminders = 
     });
     if (reminders) {
       const editor = li.querySelector(".reminder-edit");
+      const mode = editor.querySelector(".reminder-mode");
       li.querySelector(".reminder-btn").addEventListener("click", () => { editor.hidden = !editor.hidden; });
-      li.querySelector(".reminder-save").addEventListener("click", () => {
-        const time = editor.querySelector("input").value;
-        if (time) setTaskReminder(task.id, time);
+      mode.addEventListener("change", () => {
+        editor.querySelector(".reminder-time").hidden = mode.value !== "time";
+        editor.querySelector(".reminder-every").hidden = mode.value !== "every";
       });
-      li.querySelector(".reminder-clear").addEventListener("click", () => setTaskReminder(task.id, null));
+      li.querySelector(".reminder-save").addEventListener("click", () => {
+        if (mode.value === "every") {
+          const hours = Math.round(Number(editor.querySelector(".reminder-every input").value));
+          if (hours >= 1 && hours <= 24) setTaskReminder(task.id, null, hours);
+          else toast("Every 1 to 24 hours", "Pick a number of hours between 1 and 24.");
+        } else {
+          const time = editor.querySelector(".reminder-time").value;
+          if (time) setTaskReminder(task.id, time, null);
+        }
+      });
+      li.querySelector(".reminder-clear").addEventListener("click", () => setTaskReminder(task.id, null, null));
     }
     li.querySelector('.rename-btn[title="Rename"]').addEventListener("click", async () => {
       const text = (prompt("Rename task", task.text) ?? "").trim();
@@ -753,6 +804,9 @@ function renderChecklist() {
 // With these on, a task's 🔔 time reaches the phone even when this app is
 // closed: the cloud sends it (see supabase/functions/send-reminders).
 
+let pushOn = false;          // this phone gets push notifications (cached; see updatePushRow)
+let pushEndpoint = null;
+
 function pushSupported() {
   return "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
 }
@@ -812,7 +866,9 @@ async function disablePush() {
 async function refreshPushSubscription() {
   try {
     const sub = await currentPushSubscription();
-    if (sub && Notification.permission === "granted") await savePushSubscription(sub);
+    pushOn = Boolean(sub) && Notification.permission === "granted";
+    pushEndpoint = pushOn ? sub.endpoint : null;
+    if (pushOn) await savePushSubscription(sub);
   } catch { /* best-effort */ }
 }
 
@@ -825,27 +881,39 @@ async function updatePushRow() {
       : `<p class="hint">\u{1F514} This browser can't show reminders while the app is closed.</p>`;
     return;
   }
-  const on = Boolean(await currentPushSubscription()) && Notification.permission === "granted";
+  const sub = await currentPushSubscription();
+  const on = Boolean(sub) && Notification.permission === "granted";
+  pushOn = on;
+  pushEndpoint = on ? sub.endpoint : null;
   row.innerHTML = on
     ? `<span class="hint">\u{1F514} Phone notifications are on</span> <button id="push-toggle" class="secondary-btn">Turn off</button>`
     : `<span class="hint">\u{1F514} Get your reminders even with the app closed</span> <button id="push-toggle">Turn on</button>`;
   document.getElementById("push-toggle").addEventListener("click", on ? disablePush : enablePush);
 }
 
-async function setTaskReminder(taskId, time) {
-  const { error } = await supabaseClient.rpc("set_task_reminder", { p_task_id: taskId, p_reminder_time: time });
+async function setTaskReminder(taskId, time, everyHours) {
+  let { error } = await supabaseClient.rpc("set_task_reminder_mode",
+    { p_task_id: taskId, p_reminder_time: time, p_every_h: everyHours });
+  if (error && isMissingFunction(error) && !everyHours) {
+    ({ error } = await supabaseClient.rpc("set_task_reminder", { p_task_id: taskId, p_reminder_time: time }));
+  }
   if (error) toast("⚠️ Couldn't save the reminder", error.message || "Check your connection and try again.");
   else if (time && window.Notification && Notification.permission === "default") Notification.requestPermission();
   await pullAndRender();
 }
 
-// Fires the daily reminders while this page is open (a closed web app can't
-// wake itself up -- the desktop app is what reminds you otherwise). Each
-// one fires at most once a day per device.
+// The cloud's database is older than this page (schema.sql not re-run).
+function isMissingFunction(error) {
+  return error?.code === "PGRST202" || /could not find the function/i.test(error?.message ?? "");
+}
+
+// Fires the daily reminders while this page is open, for phones without
+// push turned on (with it, the cloud sends them, open or not). Each one
+// fires at most once a day per device.
 const REMINDED_KEY = "pawmodoro_reminded";  // { taskId: "YYYY-MM-DD" }
 
 function checkTaskReminders() {
-  if (!state?.checklist) return;
+  if (!state?.checklist || pushOn) return;
   const now = new Date();
   const today = localISODate(now);
   const hm = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
@@ -975,10 +1043,31 @@ function startPomodoro() {
   pomodoro.intervalId = setInterval(tickPomodoro, 500);
   requestWakeLock();
   updateTimerDisplay();
+  scheduleTimerPush();
+}
+
+// With push on, the cloud also sends "session over" at the end time, so it
+// arrives even if the screen locks and the page is paused. Cancelled when
+// paused, reset, or finished here first.
+function scheduleTimerPush() {
+  if (!pushOn || !pushEndpoint) return;
+  const work = pomodoro.phase === "work";
+  supabaseClient.rpc("schedule_timer_push", {
+    p_endpoint: pushEndpoint,
+    p_fire_at: new Date(pomodoro.deadline).toISOString(),
+    p_title: work ? "Focus session complete!" : "Break's over",
+    p_body: work ? "Open Pawmodoro to collect your XP and start your break." : "Back to it when you're ready.",
+  }).then(({ error }) => { if (error && !isMissingFunction(error)) console.warn("timer push", error); });
+}
+
+function cancelTimerPush() {
+  if (!pushOn || !pushEndpoint) return;
+  supabaseClient.rpc("cancel_timer_push", { p_endpoint: pushEndpoint }).then(() => {});
 }
 
 function pausePomodoro() {
   settlePomodoro();
+  cancelTimerPush();
   pomodoro.running = false;
   clearInterval(pomodoro.intervalId);
   releaseWakeLock();
@@ -991,6 +1080,7 @@ function settlePomodoro() {
 }
 
 function resetPomodoro() {
+  cancelTimerPush();
   clearInterval(pomodoro.intervalId);
   pomodoro.running = false;
   releaseWakeLock();
@@ -1036,10 +1126,15 @@ function releaseWakeLock() {
 
 async function onPhaseComplete() {
   const s = getSettings();
+  // Finishing late means the page was asleep and the push already told you;
+  // then just show it in the app instead of buzzing a second time.
+  const pushed = pushOn && Date.now() - pomodoro.deadline > 15000;
+  if (!pushed) cancelTimerPush();
+  const announce = pushed ? toast : notify;
   if (pomodoro.phase === "work") {
     pomodoro.sessionCount += 1;
     const { data } = await supabaseClient.rpc("record_pomodoro_completed", { p_minutes: s.workMin });
-    notify("Focus session complete!", data ? `+${data.xp_gained} XP` : "Nice work!");
+    announce("Focus session complete!", data ? `+${data.xp_gained} XP` : "Nice work!");
     if (data) {
       for (const q of data.completed_quests ?? []) {
         toast("\u{1F31F} Quest complete!", `${q.desc} — +${q.bonus_xp} XP`);
@@ -1048,7 +1143,7 @@ async function onPhaseComplete() {
     pomodoro.phase = (pomodoro.sessionCount % s.sessionsBeforeLong === 0) ? "long_break" : "short_break";
   } else {
     await supabaseClient.rpc("record_break_completed");
-    notify("Break's over", "Back to it when you're ready.");
+    announce("Break's over", "Back to it when you're ready.");
     pomodoro.phase = "work";
   }
   pomodoro.secondsLeft = phaseSeconds(pomodoro.phase, s);

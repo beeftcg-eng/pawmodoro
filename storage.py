@@ -33,6 +33,8 @@ HISTORY_KEEP_DAYS = 120
 
 DEFAULT_DATA = {
     "notes": "",  # the main notes page (the one that syncs)
+    "notes_rev": None,  # the cloud revision of `notes` this computer last saw (conflict check)
+    "notes_conflicts": [],  # other devices' versions to keep as pages: {page_id, title, html, at}
     "notes_pages": [],  # extra notes pages: list of {id, title, html} (sync from v2.16, table notes_pages)
     "notes_pages_synced": False,  # every local page has been queued for upload to this account
     "notes_current_page": "main",  # "main" or a notes_pages id
@@ -41,7 +43,8 @@ DEFAULT_DATA = {
                        #          awarded_on (date or None), weekday, source,
                        #          reminder_every_h (int or None), last_reminded_at (datetime or None),
                        #          snoozed_until (datetime or None), focus_pomodoros, focus_min}
-                       # (the last five are local-only: the cloud never sees them)
+                       # (reminder_every_h and snoozed_until sync from v2.17; last_reminded_at
+                       # and the 🍅 counts stay local)
     "pomodoro": {
         "work_min": 25,
         "short_break_min": 5,
@@ -390,6 +393,63 @@ class Storage:
         self.data["notes_pages_synced"] = True
         self.save()
 
+    # ---- conflict-checked notes saves (called by the sync thread) ----
+    def outbox_base_rev(self, page_id):
+        """The cloud revision this computer's copy of a page is based on."""
+        with self._lock:
+            if page_id == self.MAIN_NOTES_PAGE:
+                return self.data.get("notes_rev")
+            page = self._find_note_page(page_id)
+            return page.get("rev") if page else None
+
+    def outbox_saved_rev(self, page_id, rev):
+        with self._lock:
+            if page_id == self.MAIN_NOTES_PAGE:
+                self.data["notes_rev"] = rev
+            else:
+                page = self._find_note_page(page_id)
+                if page is not None:
+                    page["rev"] = rev
+            self.save()
+
+    def outbox_notes_conflict(self, page_id, title, html, rev):
+        """Someone else saved this page since we last saw it. Their version
+        is kept (the UI thread turns it into a page, take_notes_conflicts),
+        and ours then goes up on top of the revision we were just told."""
+        with self._lock:
+            self.data.setdefault("notes_conflicts", []).append({
+                "page_id": page_id, "title": title, "html": html,
+                "at": datetime.now().isoformat(timespec="minutes"),
+            })
+            if page_id == self.MAIN_NOTES_PAGE:
+                self.data["notes_rev"] = rev
+            else:
+                page = self._find_note_page(page_id)
+                if page is not None:
+                    page["rev"] = rev
+            self.save()
+
+    def take_notes_conflicts(self):
+        """UI thread: keeps each other-device version as a new page.
+        Returns the titles of the pages made."""
+        with self._lock:
+            conflicts = self.data.get("notes_conflicts", [])
+            self.data["notes_conflicts"] = []
+        made = []
+        for conflict in conflicts:
+            if conflict["page_id"] == self.MAIN_NOTES_PAGE:
+                base = "Notes"
+            else:
+                page = self._find_note_page(conflict["page_id"])
+                base = page["title"] if page else (conflict.get("title") or "Page")
+            title = f"{base} (other device, {conflict['at'][11:16]})"
+            page_id = self.add_note_page(title)
+            self.set_page_html(page_id, conflict["html"] or "")
+            made.append(title)
+        if conflicts:
+            self.save()
+        return made
+
     def outbox_note_pages_unsupported(self):
         """Called by the sync thread when the cloud schema has no notes
         pages yet (schema.sql not re-run): page edits are dropped from the
@@ -543,8 +603,8 @@ class Storage:
         """reminder_time: "HH:MM" string for a once-a-day reminder, or
         every_hours: an int for a reminder repeating every that many hours
         (counted from now). Neither clears the task's reminder. A task has
-        at most one kind; the repeating one is local-only (the cloud only
-        knows reminder_time), so setting it clears the synced time."""
+        at most one kind. Both sync (the repeating one from v2.17; an older
+        cloud just gets the time cleared, see SyncEngine)."""
         task = self._find_task(task_id)
         if task is None:
             return
@@ -555,14 +615,21 @@ class Storage:
         task["reminder_every_h"] = every_hours or None
         task["last_reminded_at"] = datetime.now().isoformat(timespec="seconds") if every_hours else None
         if task["recurrence"] != "weekday":
-            self._enqueue("set_task_reminder", {"id": task_id, "reminder_time": reminder_time})
+            self._enqueue("set_task_reminder_mode",
+                          {"id": task_id, "reminder_time": reminder_time, "every_h": every_hours or None})
         self.save()
 
     def get_reminder_settings(self):
         return dict(self.data.get("reminders", {}))
 
     def set_reminder_settings(self, **changes):
-        self.data.setdefault("reminders", {}).update(changes)
+        settings = self.data.setdefault("reminders", {})
+        settings.update(changes)
+        self._enqueue("set_reminder_settings", {
+            "quiet_enabled": bool(settings.get("quiet_enabled")),
+            "quiet_start": settings.get("quiet_start", "22:00"),
+            "quiet_end": settings.get("quiet_end", "08:00"),
+        }, key="reminders")
         self.save()
 
     def _in_quiet_hours(self, now):
@@ -582,7 +649,10 @@ class Storage:
         task = self._find_task(task_id)
         if task is None:
             return
-        task["snoozed_until"] = (datetime.now() + timedelta(minutes=minutes)).isoformat(timespec="seconds")
+        until = datetime.now() + timedelta(minutes=minutes)
+        task["snoozed_until"] = until.isoformat(timespec="seconds")
+        if task["recurrence"] != "weekday":
+            self._enqueue("snooze_task", {"id": task_id, "until": until.astimezone().isoformat(timespec="seconds")})
         self.save()
 
     def check_due_reminders(self):
@@ -604,6 +674,9 @@ class Storage:
                     changed = True
                 elif now.isoformat(timespec="seconds") >= snoozed:
                     task["snoozed_until"] = None
+                    # The cloud clears its copy once it has pushed it; until a
+                    # pull shows that, don't let the old value fire again here.
+                    task["snooze_fired_for"] = snoozed
                     due.append(task)
                     continue
                 else:
@@ -814,6 +887,13 @@ class Storage:
         connected)."""
         if not keep_notes:
             self.data["notes"] = remote["notes"]
+            # Only with the text: while you're typing, the revision stays at
+            # the one your text is based on, so the upload is conflict-checked.
+            if "notes_rev" in remote:
+                self.data["notes_rev"] = remote["notes_rev"]
+        if isinstance(remote.get("reminders"), dict):
+            self.data.setdefault("reminders", {}).update(
+                {k: remote["reminders"][k] for k in ("quiet_enabled", "quiet_start", "quiet_end") if k in remote["reminders"]})
         self._apply_remote_pages(remote, keep_notes)
         local_tasks = {t["id"]: t for t in self.data.get("checklist", [])}
         # "weekday" (specific-day) tasks are local-only — the cloud
@@ -834,12 +914,7 @@ class Storage:
                 # learns when we notified), so keep our own record instead
                 # of letting every pull reset it and re-fire the reminder.
                 "last_reminded": (local_tasks.get(t["id"]) or {}).get("last_reminded") or t.get("last_reminded"),
-                # Repeating reminders never reach the server at all (setting
-                # one clears the synced time, so a time coming back means it
-                # was set again elsewhere, e.g. on the phone, and wins).
-                "reminder_every_h": None if t.get("reminder_time") else (local_tasks.get(t["id"]) or {}).get("reminder_every_h"),
-                "last_reminded_at": (local_tasks.get(t["id"]) or {}).get("last_reminded_at"),
-                "snoozed_until": (local_tasks.get(t["id"]) or {}).get("snoozed_until"),
+                **self._remote_reminder_fields(t, local_tasks.get(t["id"]) or {}),
                 "focus_pomodoros": (local_tasks.get(t["id"]) or {}).get("focus_pomodoros", 0),
                 "focus_min": (local_tasks.get(t["id"]) or {}).get("focus_min", 0),
                 "awarded_on": t.get("awarded_on"),
@@ -860,6 +935,42 @@ class Storage:
         g["weekly_quests_start"] = gamification.week_start_for(today).isoformat()
         self._merge_remote_history(remote.get("history") or [])
 
+    @staticmethod
+    def _cloud_time_to_local(value):
+        """A timestamptz from the cloud as the naive local ISO string this
+        file uses for times (or None)."""
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone().replace(tzinfo=None)
+        return parsed.isoformat(timespec="seconds")
+
+    def _remote_reminder_fields(self, remote_task, local_task):
+        """Every-N-hours and snooze for a task from a pull. A v2.17 cloud
+        sends both (and wins); an older one has neither, and then a time
+        set elsewhere (e.g. the phone) replaces a local repeating reminder."""
+        last_at = local_task.get("last_reminded_at")
+        if "reminder_every_h" in remote_task:
+            every_h = remote_task.get("reminder_every_h")
+            snoozed = self._cloud_time_to_local(remote_task.get("snoozed_until"))
+            if snoozed and snoozed == local_task.get("snooze_fired_for"):
+                snoozed = None  # already reminded here; the cloud just hasn't caught up
+            if every_h and not last_at:
+                last_at = datetime.now().isoformat(timespec="seconds")  # set on another device
+        else:
+            every_h = None if remote_task.get("reminder_time") else local_task.get("reminder_every_h")
+            snoozed = local_task.get("snoozed_until")
+        return {
+            "reminder_every_h": every_h,
+            "last_reminded_at": last_at if every_h else None,
+            "snoozed_until": snoozed,
+            "snooze_fired_for": local_task.get("snooze_fired_for"),
+        }
+
     def _apply_remote_pages(self, remote, keep_notes):
         """Pages from the cloud replace the local ones, once this computer's
         pages have been uploaded (or a pull could delete pages that only
@@ -871,7 +982,8 @@ class Storage:
             self._queue_unsynced_pages()  # the cloud just gained pages support
             return
         open_page = self._find_note_page(self.data.get("notes_current_page")) if keep_notes else None
-        pages = [{"id": p["id"], "title": p["title"], "html": p.get("html") or ""} for p in remote["notes_pages"]]
+        pages = [{"id": p["id"], "title": p["title"], "html": p.get("html") or "", "rev": p.get("rev")}
+                 for p in remote["notes_pages"]]
         if open_page is not None:
             pages = [open_page if p["id"] == open_page["id"] else p for p in pages]
         self.data["notes_pages"] = pages

@@ -88,7 +88,7 @@ class ChecklistTab(QWidget):
         self.reminder_hours_spin.setValue(8)
         self.reminder_hours_spin.setSuffix(" hours")
         self.reminder_hours_spin.setToolTip(
-            "Repeats this often, starting from when you press Set (desktop only, doesn't sync)")
+            "Repeats this often, starting from when you press Set (also on your phone, if it has notifications on)")
         self.reminder_hours_spin.setVisible(False)
         reminder_row.addWidget(self.reminder_hours_spin)
 

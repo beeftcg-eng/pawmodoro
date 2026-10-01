@@ -45,14 +45,39 @@ Get-ChildItem -Path $InstallDir -Force -ErrorAction SilentlyContinue |
 Copy-Item -Path (Join-Path $SrcDir "*.py") -Destination $InstallDir
 Copy-Item -Recurse -Path (Join-Path $SrcDir "resources") -Destination $InstallDir
 
+# Finds a Python 3 to build the venv with. PATH first; then the places
+# Python's own installers put it, because right after Python was installed
+# (e.g. by winget, as this package's dependency, or by hand without
+# reopening the terminal) this process's PATH doesn't have it yet.
+function Find-Python {
+    $py = Get-Command py -ErrorAction SilentlyContinue
+    if ($py) { return @($py.Source, "-3") }
+    $python = Get-Command python -ErrorAction SilentlyContinue
+    if ($python -and $python.Source -notlike "*WindowsApps*") { return @($python.Source) }
+    $candidates = @(
+        "$env:LOCALAPPDATA\Programs\Python\Launcher\py.exe",
+        "$env:WINDIR\py.exe"
+    ) + (Get-ChildItem -Path "$env:LOCALAPPDATA\Programs\Python\Python3*\python.exe", "$env:ProgramFiles\Python3*\python.exe" `
+            -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | ForEach-Object { $_.FullName })
+    foreach ($candidate in $candidates) {
+        if (Test-Path $candidate) {
+            if ($candidate -like "*py.exe") { return @($candidate, "-3") }
+            return @($candidate)
+        }
+    }
+    if ($python) { return @($python.Source) }  # the Microsoft Store stub: last resort
+    throw "Python 3 wasn't found. Install it from python.org (tick 'Add python.exe to PATH') and run this again."
+}
+
 if (-not (Test-Path $VenvDir)) {
     Write-Host "Creating virtual environment..."
-    $pythonCmd = Get-Command py -ErrorAction SilentlyContinue
-    if ($pythonCmd) {
-        py -3 -m venv $VenvDir
+    $pythonExe = Find-Python
+    if ($pythonExe.Count -gt 1) {
+        & $pythonExe[0] $pythonExe[1] -m venv $VenvDir
     } else {
-        python -m venv $VenvDir
+        & $pythonExe[0] -m venv $VenvDir
     }
+    if (-not (Test-Path "$VenvDir\Scripts\python.exe")) { throw "Couldn't create the Python environment in $VenvDir" }
 }
 
 & "$VenvDir\Scripts\python.exe" -m pip install --upgrade pip --quiet

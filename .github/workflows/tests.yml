@@ -7,8 +7,12 @@ on:
   workflow_call: {}  # release.yml runs these before building anything
 
 jobs:
-  tests:
-    runs-on: ubuntu-latest
+  python:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -16,8 +20,9 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Qt's offscreen platform still needs a few system libraries.
+      # Qt's offscreen platform still needs a few system libraries on Linux.
       - name: Install Qt runtime libraries
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3
 
       - name: Install dependencies
@@ -27,3 +32,82 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: python -m unittest discover -s tests -v
+
+  # supabase/schema.sql against a real Postgres (the version Supabase runs),
+  # loaded twice, then tests/sql/schema_tests.sql's assertions.
+  schema:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run schema tests
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
+        run: tests/sql/run.sh
+
+  # The phone app (docs/) in a simulated browser.
+  pwa:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Run phone app tests
+        working-directory: tests/pwa
+        run: |
+          npm install --no-audit --no-fund
+          npm test
+
+  # The real Windows install (install.ps1, what install.bat and the in-app
+  # update run), then the installed app launched for a few seconds.
+  windows-install:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install with install.ps1
+        shell: pwsh
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1
+
+      - name: Check what it installed
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:LOCALAPPDATA "Pawmodoro"
+          foreach ($file in "version.py", "main.py", "Pawmodoro.exe", "run.bat", "venv\Scripts\pythonw.exe") {
+            if (-not (Test-Path (Join-Path $dir $file))) { throw "missing $file" }
+          }
+          if (-not (Test-Path "$env:USERPROFILE\Desktop\Pawmodoro.lnk")) { throw "no Desktop shortcut" }
+          & "$dir\venv\Scripts\python.exe" -c "import PyQt6.QtWidgets; print('PyQt6 OK')"
+
+      - name: Launch the installed app
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PAWMODORO_DISABLE_UPDATE_CHECK: "1"
+          PYTHONUNBUFFERED: "1"
+        run: |
+          $dir = Join-Path $env:LOCALAPPDATA "Pawmodoro"
+          $app = Start-Process -FilePath "$dir\venv\Scripts\python.exe" -ArgumentList "main.py" -WorkingDirectory $dir `
+            -RedirectStandardOutput out.txt -RedirectStandardError err.txt -PassThru
+          Start-Sleep -Seconds 20
+          $alive = -not $app.HasExited
+          if ($alive) { Stop-Process -Id $app.Id -Force }
+          Get-Content out.txt, err.txt
+          if (-not $alive) { throw "the app exited within 20 seconds" }
+          if (-not (Select-String -Path out.txt -Pattern "Pawmodoro v.* starting")) { throw "no startup line" }
+          # The Windows media controls (smtc_windows.py) need the optional winsdk package.
+          if (Select-String -Path out.txt -Pattern "winsdk loaded OK") { "Windows media controls: available" }
+          else { "::warning::winsdk didn't load, so browser media controls won't work on this Python" }

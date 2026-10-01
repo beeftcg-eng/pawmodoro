@@ -16,3 +16,5 @@ data.json
 # Supabase CLI working files (project link, cached versions).
 supabase/.temp/
 dist/
+
+node_modules

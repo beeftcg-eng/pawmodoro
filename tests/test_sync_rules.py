@@ -22,12 +22,26 @@ class OutboxTests(StorageTestCase):
         self.assertNotIn("set_task_reminder", self.outbox_ops())
         self.assertNotIn("remove_task", self.outbox_ops())
 
-    def test_repeating_reminder_clears_the_synced_time(self):
+    def test_repeating_reminder_is_queued(self):
         task = self.storage.add_task("Water", "daily", reminder_time="09:00")
         self.storage.set_task_reminder(task["id"], None, every_hours=4)
         last = self.storage.data["sync_outbox"][-1]
-        self.assertEqual(last["op"], "set_task_reminder")
-        self.assertIsNone(last["args"]["reminder_time"])
+        self.assertEqual(last["op"], "set_task_reminder_mode")
+        self.assertEqual((last["args"]["reminder_time"], last["args"]["every_h"]), (None, 4))
+
+    def test_snooze_and_quiet_hours_are_queued(self):
+        task = self.storage.add_task("Water", "daily")
+        self.storage.snooze_task_reminder(task["id"], 15)
+        snooze = self.storage.data["sync_outbox"][-1]
+        self.assertEqual(snooze["op"], "snooze_task")
+        from datetime import datetime
+        self.assertIsNotNone(datetime.fromisoformat(snooze["args"]["until"]).tzinfo,
+                             "the cloud needs a timezone-aware time")
+        self.storage.set_reminder_settings(quiet_enabled=True)
+        self.storage.set_reminder_settings(quiet_start="23:00")
+        settings = [o for o in self.storage.data["sync_outbox"] if o["op"] == "set_reminder_settings"]
+        self.assertEqual(len(settings), 1)
+        self.assertEqual(settings[0]["args"], {"quiet_enabled": True, "quiet_start": "23:00", "quiet_end": "08:00"})
 
     def test_notes_edits_collapse_to_the_latest(self):
         for text in ("a", "ab", "abc"):
@@ -95,27 +109,143 @@ class PagesPullTests(StorageTestCase):
         self.assertEqual(self.storage.get_page_html(page), "<p>mine</p>")
 
     def test_old_cloud_schema_drops_page_uploads_instead_of_blocking(self):
-        from supabase_sync import SyncError
         self.enable_sync()
         self.storage.add_note_page("Ideas")
         self.storage.add_task("Walk", "daily")
-        engine = self.storage.sync
-
-        class OldCloud:
-            sent = []
-            refresh_token = "t"
-
-            def set_note_page(self, *a):
-                raise SyncError("no such function", status=404, code="PGRST202")
-
-            def add_task(self, *a):
-                OldCloud.sent.append("add_task")
-
-        engine.client = OldCloud()
-        self.assertTrue(engine._flush())
-        self.assertEqual(OldCloud.sent, ["add_task"])
+        cloud = FakeCloud(set_note_page_checked=outdated(), set_note_page=outdated())
+        self.storage.sync.client = cloud
+        self.assertTrue(self.storage.sync._flush())
+        self.assertIn("add_task", [c[0] for c in cloud.calls])
         self.assertFalse(self.storage.data["notes_pages_synced"])
         self.assertEqual(self.storage.outbox_len(), 0)
+
+
+class FakeCloud:
+    """Stands in for SupabaseSync in SyncEngine tests: records calls, and
+    raises `errors[name]` for the named RPC if given."""
+    refresh_token = "t"
+
+    def __init__(self, **errors):
+        self.calls = []
+        self.errors = errors
+        self.notes = {"rev": 5, "text": "the phone's notes"}
+
+    def __getattr__(self, name):
+        def call(*args):
+            self.calls.append((name, args))
+            if name in self.errors:
+                raise self.errors[name]
+            if name == "set_notes_checked":
+                text, base = args
+                if base is not None and base != self.notes["rev"] and text != self.notes["text"]:
+                    return {"ok": False, "rev": self.notes["rev"], "notes": self.notes["text"]}
+                self.notes = {"rev": self.notes["rev"] + 1, "text": text}
+                return {"ok": True, "rev": self.notes["rev"]}
+            return None
+        return call
+
+
+def outdated():
+    from supabase_sync import SyncError
+    return SyncError("no such function", status=404, code="PGRST202")
+
+
+class ConflictTests(StorageTestCase):
+    def setUp(self):
+        super().setUp()
+        self.enable_sync()
+
+    def flush(self, cloud):
+        self.storage.sync.client = cloud
+        self.assertTrue(self.storage.sync._flush())
+
+    def test_up_to_date_save_goes_straight_through(self):
+        cloud = FakeCloud()
+        self.storage.data["notes_rev"] = 5
+        self.storage.set_notes("mine")
+        self.flush(cloud)
+        self.assertEqual(cloud.notes, {"rev": 6, "text": "mine"})
+        self.assertEqual(self.storage.data["notes_rev"], 6)
+        self.assertEqual(self.storage.take_notes_conflicts(), [])
+
+    def test_conflict_keeps_both_versions(self):
+        cloud = FakeCloud()
+        self.storage.data["notes_rev"] = 3  # the phone saved twice since
+        self.storage.set_notes("written offline here")
+        self.flush(cloud)
+        self.assertEqual(cloud.notes["text"], "written offline here")
+        made = self.storage.take_notes_conflicts()
+        self.assertEqual(len(made), 1)
+        page = next(p for p in self.storage.get_note_pages() if p["title"] == made[0])
+        self.assertEqual(self.storage.get_page_html(page["id"]), "the phone's notes")
+        self.assertEqual(self.storage.get_notes(), "written offline here")
+
+    def test_a_second_edit_after_our_own_upload_is_not_a_conflict(self):
+        cloud = FakeCloud()
+        self.storage.data["notes_rev"] = 5
+        self.storage.set_notes("first")
+        self.flush(cloud)
+        self.storage.set_notes("second")
+        self.flush(cloud)
+        self.assertEqual(self.storage.take_notes_conflicts(), [])
+        self.assertEqual(cloud.notes["text"], "second")
+
+    def test_typing_during_a_pull_keeps_the_old_revision(self):
+        self.storage.data["notes_rev"] = 2
+        self.storage._apply_remote_state(dict(remote_state([], notes="theirs"), notes_rev=4), keep_notes=True)
+        self.assertEqual(self.storage.data["notes_rev"], 2, "else the upload would overwrite theirs unchecked")
+        self.storage._apply_remote_state(dict(remote_state([], notes="theirs"), notes_rev=4))
+        self.assertEqual(self.storage.data["notes_rev"], 4)
+
+    def test_older_cloud_gets_a_plain_save(self):
+        cloud = FakeCloud(set_notes_checked=outdated())
+        self.storage.set_notes("mine")
+        self.flush(cloud)
+        self.assertEqual([c[0] for c in cloud.calls], ["set_notes_checked", "set_notes"])
+
+    def test_older_cloud_and_new_reminder_ops(self):
+        task = self.storage.add_task("Water", "daily")
+        self.storage.set_task_reminder(task["id"], None, every_hours=3)
+        self.storage.snooze_task_reminder(task["id"], 15)
+        self.storage.set_reminder_settings(quiet_enabled=True)
+        cloud = FakeCloud(set_task_reminder_mode=outdated(), snooze_task=outdated(), set_reminder_settings=outdated())
+        self.flush(cloud)
+        self.assertIn(("set_task_reminder", (task["id"], None)), cloud.calls)
+        self.assertEqual(self.storage.outbox_len(), 0, "nothing may wedge the queue")
+
+
+class ReminderPullTests(StorageTestCase):
+    def test_every_n_hours_and_snooze_come_from_the_cloud(self):
+        task = self.storage.add_task("Meds", "daily")
+        remote = [{"id": task["id"], "text": "Meds", "recurrence": "daily", "reminder_time": None,
+                   "reminder_every_h": 6, "snoozed_until": "2099-01-01T12:00:00+00:00"}]
+        self.storage._apply_remote_state(remote_state(remote))
+        pulled = self.storage._find_task(task["id"])
+        self.assertEqual(pulled["reminder_every_h"], 6)
+        self.assertTrue(pulled["last_reminded_at"], "a repeating reminder set elsewhere starts counting now")
+        self.assertTrue(pulled["snoozed_until"].startswith("2099-01-01"))
+        self.assertNotIn("+", pulled["snoozed_until"], "stored as local time")
+
+    def test_a_snooze_that_already_fired_here_does_not_fire_again(self):
+        from datetime import datetime, timedelta
+        task = self.storage.add_task("Meds", "daily")
+        self.storage.snooze_task_reminder(task["id"], 0)
+        task["snoozed_until"] = (datetime.now() - timedelta(seconds=5)).isoformat(timespec="seconds")
+        fired_value = task["snoozed_until"]
+        self.assertEqual(len(self.storage.check_due_reminders()), 1)
+        cloud_copy = datetime.fromisoformat(fired_value).astimezone().isoformat()
+        remote = [{"id": task["id"], "text": "Meds", "recurrence": "daily", "reminder_time": None,
+                   "reminder_every_h": None, "snoozed_until": cloud_copy}]
+        self.storage._apply_remote_state(remote_state(remote))
+        self.assertIsNone(self.storage._find_task(task["id"])["snoozed_until"])
+        self.assertEqual(self.storage.check_due_reminders(), [])
+
+    def test_quiet_hours_come_from_the_cloud(self):
+        remote = remote_state([])
+        remote["reminders"] = {"quiet_enabled": True, "quiet_start": "21:00", "quiet_end": "06:30"}
+        self.storage._apply_remote_state(remote)
+        self.assertEqual(self.storage.get_reminder_settings(),
+                         {"quiet_enabled": True, "quiet_start": "21:00", "quiet_end": "06:30"})
 
 
 class PullTests(StorageTestCase):

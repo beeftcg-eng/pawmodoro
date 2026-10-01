@@ -201,7 +201,9 @@ html, body {
 .notes-page-add { color: var(--ink-soft); border-style: dashed; }
 .reminder-edit { flex-basis: 100%; display: flex; align-items: center; gap: 6px; padding: 8px 0 0 28px; }
 .reminder-edit[hidden] { display: none; }
-.reminder-edit input[type="time"] { font: inherit; padding: 4px; }
+.reminder-edit input[type="time"], .reminder-edit select { font: inherit; padding: 4px; }
+.reminder-edit input[type="number"] { font: inherit; padding: 4px; width: 4em; }
+.reminder-edit [hidden] { display: none; }
 .rename-btn { background: none; border: none; color: var(--ink-soft); font-size: 15px; flex-shrink: 0; padding: 0 6px; }
 .reorder-col { display: flex; flex-direction: column; margin-right: 6px; flex-shrink: 0; }
 .reorder-btn {

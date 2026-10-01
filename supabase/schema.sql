@@ -123,6 +123,20 @@ alter table checklist_tasks add column if not exists awarded_on date;
 -- v2.16: the local day a task's reminder was last sent as a phone push
 -- (separate from last_reminded, which the clients use for their own).
 alter table checklist_tasks add column if not exists push_reminded_on date;
+-- v2.17: reminders every N hours and snoozes sync (they were desktop-only),
+-- the push bookkeeping for them, and quiet hours for repeating reminders.
+-- notes_rev / notes_pages.rev: bumped on every save, so a save based on an
+-- older version is refused instead of silently overwriting it.
+alter table checklist_tasks add column if not exists reminder_every_h int;
+alter table checklist_tasks add column if not exists snoozed_until timestamptz;
+alter table checklist_tasks add column if not exists push_last_at timestamptz;
+alter table checklist_tasks add column if not exists push_claimed_at timestamptz;
+alter table checklist_tasks drop constraint if exists checklist_tasks_every_h_check;
+alter table checklist_tasks add constraint checklist_tasks_every_h_check check (reminder_every_h is null or reminder_every_h between 1 and 24);
+alter table app_state add column if not exists quiet_enabled boolean not null default false;
+alter table app_state add column if not exists quiet_start text not null default '22:00';
+alter table app_state add column if not exists quiet_end text not null default '08:00';
+alter table app_state add column if not exists notes_rev int not null default 0;
 
 -- One row per user per local day: feeds the Progress tab's history chart and
 -- the household "this week" totals.
@@ -154,6 +168,7 @@ create table if not exists notes_pages (
   updated_at timestamptz not null default now(),
   primary key (user_id, id)
 );
+alter table notes_pages add column if not exists rev int not null default 0;
 
 alter table notes_pages enable row level security;
 drop policy if exists "own notes pages" on notes_pages;
@@ -652,7 +667,26 @@ $$;
 
 create or replace function set_notes(p_notes text) returns void
 language sql security invoker set search_path = public, extensions as $$
-  update app_state set notes = p_notes, updated_at = now() where user_id = auth.uid();
+  update app_state set notes = p_notes, notes_rev = notes_rev + 1, updated_at = now() where user_id = auth.uid();
+$$;
+
+-- v2.17: saves only if nobody else saved since p_base_rev (the revision the
+-- caller last saw); otherwise returns the current text so the caller can
+-- keep both. p_base_rev null = save regardless. {ok, rev[, notes]}.
+create or replace function set_notes_checked(p_notes text, p_base_rev int) returns jsonb
+language plpgsql security invoker set search_path = public, extensions as $$
+declare
+  cur app_state;
+begin
+  perform ensure_app_state();
+  select * into cur from app_state where user_id = auth.uid() for update;
+  if p_base_rev is not null and p_base_rev <> cur.notes_rev and cur.notes is distinct from p_notes then
+    return jsonb_build_object('ok', false, 'rev', cur.notes_rev, 'notes', cur.notes);
+  end if;
+  update app_state set notes = p_notes, notes_rev = notes_rev + 1, updated_at = now()
+  where user_id = auth.uid() returning notes_rev into cur.notes_rev;
+  return jsonb_build_object('ok', true, 'rev', cur.notes_rev);
+end;
 $$;
 
 -- Creates or updates one extra notes page (a new one goes last). Idempotent,
@@ -663,7 +697,27 @@ language sql security invoker set search_path = public, extensions as $$
   values (auth.uid(), p_id, p_title, coalesce(p_html, ''),
           coalesce((select max(sort_order) + 1 from notes_pages where user_id = auth.uid()), 0))
   on conflict (user_id, id) do update
-    set title = excluded.title, html = excluded.html, updated_at = now();
+    set title = excluded.title, html = excluded.html, rev = notes_pages.rev + 1, updated_at = now();
+$$;
+
+-- v2.17: like set_notes_checked, for one page. {ok, rev[, title, html]}.
+create or replace function set_note_page_checked(p_id text, p_title text, p_html text, p_base_rev int) returns jsonb
+language plpgsql security invoker set search_path = public, extensions as $$
+declare
+  cur notes_pages;
+begin
+  select * into cur from notes_pages where user_id = auth.uid() and id = p_id for update;
+  if found and p_base_rev is not null and p_base_rev <> cur.rev and cur.html is distinct from coalesce(p_html, '') then
+    return jsonb_build_object('ok', false, 'rev', cur.rev, 'title', cur.title, 'html', cur.html);
+  end if;
+  insert into notes_pages (user_id, id, title, html, sort_order, rev)
+  values (auth.uid(), p_id, p_title, coalesce(p_html, ''),
+          coalesce((select max(sort_order) + 1 from notes_pages where user_id = auth.uid()), 0), 1)
+  on conflict (user_id, id) do update
+    set title = excluded.title, html = excluded.html, rev = notes_pages.rev + 1, updated_at = now()
+  returning rev into cur.rev;
+  return jsonb_build_object('ok', true, 'rev', cur.rev);
+end;
 $$;
 
 create or replace function remove_note_page(p_id text) returns void
@@ -728,10 +782,47 @@ language sql security invoker set search_path = public, extensions as $$
     where t.id = x.id and t.user_id = auth.uid();
 $$;
 
+-- (Older desktop versions send a null time when they switch a task to a
+-- desktop-only repeating reminder, so a null here leaves reminder_every_h be.)
 create or replace function set_task_reminder(p_task_id text, p_reminder_time text) returns void
 language sql security invoker set search_path = public, extensions as $$
-  update checklist_tasks set reminder_time = p_reminder_time, last_reminded = null, push_reminded_on = null
+  update checklist_tasks set reminder_time = p_reminder_time, last_reminded = null, push_reminded_on = null,
+    reminder_every_h = case when p_reminder_time is null then reminder_every_h end
   where id = p_task_id and user_id = auth.uid();
+$$;
+
+-- v2.17: a task has a daily time OR a reminder every N hours (or neither).
+create or replace function set_task_reminder_mode(p_task_id text, p_reminder_time text, p_every_h int) returns void
+language plpgsql security invoker set search_path = public, extensions as $$
+begin
+  if p_every_h is not null and (p_every_h < 1 or p_every_h > 24) then
+    raise exception 'every N hours must be 1-24';
+  end if;
+  update checklist_tasks set
+    reminder_time = case when p_every_h is null then p_reminder_time end,
+    reminder_every_h = p_every_h,
+    last_reminded = null, push_reminded_on = null, push_claimed_at = null,
+    push_last_at = case when p_every_h is not null then now() end
+  where id = p_task_id and user_id = auth.uid();
+end;
+$$;
+
+create or replace function snooze_task(p_task_id text, p_until timestamptz) returns void
+language sql security invoker set search_path = public, extensions as $$
+  update checklist_tasks set snoozed_until = p_until, push_claimed_at = null
+  where id = p_task_id and user_id = auth.uid();
+$$;
+
+create or replace function set_reminder_settings(p_quiet_enabled boolean, p_quiet_start text, p_quiet_end text) returns void
+language plpgsql security invoker set search_path = public, extensions as $$
+begin
+  if p_quiet_start !~ '^([01][0-9]|2[0-3]):[0-5][0-9]$' or p_quiet_end !~ '^([01][0-9]|2[0-3]):[0-5][0-9]$' then
+    raise exception 'times must be HH:MM';
+  end if;
+  perform ensure_app_state();
+  update app_state set quiet_enabled = p_quiet_enabled, quiet_start = p_quiet_start, quiet_end = p_quiet_end
+  where user_id = auth.uid();
+end;
 $$;
 
 -- One-time bootstrap: seeds this user's cloud row with the desktop app's
@@ -777,12 +868,14 @@ begin
   select coalesce(jsonb_agg(jsonb_build_object(
       'day', d.day, 'pomodoros', d.pomodoros, 'focus_min', d.focus_min, 'tasks', d.tasks) order by d.day), '[]'::jsonb) into hist
     from daily_stats d where d.user_id = auth.uid() and d.day >= user_today() - 41;
-  select coalesce(jsonb_agg(jsonb_build_object('id', p.id, 'title', p.title, 'html', p.html)
+  select coalesce(jsonb_agg(jsonb_build_object('id', p.id, 'title', p.title, 'html', p.html, 'rev', p.rev)
       order by p.sort_order, p.updated_at), '[]'::jsonb) into pages
     from notes_pages p where p.user_id = auth.uid();
 
   return jsonb_build_object(
     'notes', s.notes,
+    'notes_rev', s.notes_rev,
+    'reminders', jsonb_build_object('quiet_enabled', s.quiet_enabled, 'quiet_start', s.quiet_start, 'quiet_end', s.quiet_end),
     'xp', s.xp,
     'total_pomodoros', s.total_pomodoros,
     'total_tasks', s.total_tasks,
@@ -1106,14 +1199,16 @@ language sql security invoker set search_path = public, extensions as $$
 $$;
 
 -- ============================================================
--- Phone push reminders (v2.16)
+-- Phone push notifications (v2.16, extended in v2.17)
 -- ============================================================
--- The phone app subscribes to Web Push (one row per phone/browser). Every
--- minute a scheduled job (supabase/push_reminders.sql) calls the
--- send-reminders Edge Function (supabase/functions/send-reminders), which
--- asks due_push_reminders() what's due and sends it. Only the checklist's
--- daily "remind me at" time is pushed; the desktop's "every N hours"
--- reminders never reach the cloud.
+-- The phone app subscribes to Web Push (one row per phone/browser). A
+-- scheduled job (supabase/push_reminders.sql) calls the send-reminders Edge
+-- Function (supabase/functions/send-reminders) every 30 seconds; it asks
+-- due_push_reminders() what's due, sends it, and reports what got through
+-- with mark_push_sent(), so a failed send is retried a couple of minutes
+-- later instead of being lost. Pushed: checklist reminders (daily time,
+-- every N hours, snoozes), shared-list items with a time, and the phone's
+-- own pomodoro timer ending while the screen is off.
 
 create table if not exists push_subscriptions (
   endpoint text primary key,
@@ -1130,6 +1225,59 @@ create policy "own push subscriptions"
   using (auth.uid() = user_id)
   with check (auth.uid() = user_id);
 
+-- Settings only the server sees: RLS on with no policies, and no access
+-- for the API roles (the Edge Function reads it with the service role).
+-- cron_secret: the scheduled job sends it, the function checks it, so
+-- nobody else can make the function run.
+create table if not exists server_settings (
+  name text primary key,
+  value text not null
+);
+alter table server_settings enable row level security;
+revoke all on server_settings from anon, authenticated;
+insert into server_settings (name, value) values ('cron_secret', encode(gen_random_bytes(24), 'hex'))
+  on conflict (name) do nothing;
+
+-- Which shared-list occurrences have been pushed to which member.
+create table if not exists shared_push_sent (
+  task_id text not null,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  occurrence date not null,
+  claimed_at timestamptz,
+  sent boolean not null default false,
+  primary key (task_id, user_id, occurrence)
+);
+alter table shared_push_sent enable row level security;
+revoke all on shared_push_sent from anon, authenticated;
+
+-- The phone's running pomodoro: one pending "session over" push per phone.
+create table if not exists timer_pushes (
+  endpoint text primary key references push_subscriptions(endpoint) on delete cascade,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  fire_at timestamptz not null,
+  title text not null,
+  body text not null,
+  claimed_at timestamptz
+);
+alter table timer_pushes enable row level security;
+drop policy if exists "own timer pushes" on timer_pushes;
+create policy "own timer pushes"
+  on timer_pushes for all
+  using (auth.uid() = user_id)
+  with check (auth.uid() = user_id);
+
+-- One-time tokens behind a notification's Snooze / Done buttons, so they
+-- work without the app (or a login) being open. Kept a day.
+create table if not exists push_action_tokens (
+  token text primary key,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  kind text not null,      -- 'task' or 'shared'
+  ref text not null,       -- the task id
+  expires_at timestamptz not null
+);
+alter table push_action_tokens enable row level security;
+revoke all on push_action_tokens from anon, authenticated;
+
 -- Upsert: a browser re-subscribing (or another account signing in on the
 -- same phone) takes the endpoint over.
 create or replace function save_push_subscription(p_endpoint text, p_p256dh text, p_auth text) returns void
@@ -1145,6 +1293,7 @@ begin
   values (p_endpoint, auth.uid(), p_p256dh, p_auth)
   on conflict (endpoint) do update
     set user_id = auth.uid(), p256dh = excluded.p256dh, auth = excluded.auth, created_at = now();
+  delete from timer_pushes where endpoint = p_endpoint and user_id <> auth.uid();
 end;
 $$;
 
@@ -1153,40 +1302,190 @@ language sql security invoker set search_path = public, extensions as $$
   delete from push_subscriptions where endpoint = p_endpoint and user_id = auth.uid();
 $$;
 
--- For the Edge Function only (service role). Finds every checklist reminder
--- whose time has come in its owner's local time today, that isn't done
--- (judged the way roll_recurring_tasks() would, since nobody may have
--- opened the app since midnight) and wasn't pushed today; marks them
--- pushed; returns one row per (reminder, subscription) to send.
-create or replace function due_push_reminders()
-returns table (endpoint text, p256dh text, auth text, task_id text, title text, body text)
-language plpgsql security definer set search_path = public, extensions as $$
+-- The phone timer: book / cancel the "session over" push for this phone.
+create or replace function schedule_timer_push(p_endpoint text, p_fire_at timestamptz, p_title text, p_body text) returns void
+language plpgsql security invoker set search_path = public, extensions as $$
 begin
-  return query
-  with local_now as (
-    select a.user_id, (now() at time zone 'utc') + a.tz_offset_min * interval '1 minute' as ts
+  if not exists (select 1 from push_subscriptions where endpoint = p_endpoint and user_id = auth.uid()) then
+    raise exception 'push not turned on for this phone';
+  end if;
+  if p_fire_at > now() + interval '1 day' then
+    raise exception 'too far ahead';
+  end if;
+  insert into timer_pushes (endpoint, user_id, fire_at, title, body)
+  values (p_endpoint, auth.uid(), p_fire_at, left(p_title, 100), left(p_body, 300))
+  on conflict (endpoint) do update
+    set fire_at = excluded.fire_at, title = excluded.title, body = excluded.body, claimed_at = null;
+end;
+$$;
+
+create or replace function cancel_timer_push(p_endpoint text) returns void
+language sql security invoker set search_path = public, extensions as $$
+  delete from timer_pushes where endpoint = p_endpoint and user_id = auth.uid();
+$$;
+
+-- Whether a personal checklist task counts as done on local day d, judged
+-- the way roll_recurring_tasks() would: nobody may have opened the app (and
+-- so rolled the tasks over) since midnight.
+create or replace function checklist_done_on(p_completed boolean, p_recurrence text, p_last date, d date)
+returns boolean language sql immutable set search_path = public, extensions as $$
+  select p_completed and (
+    p_recurrence = 'once'
+    or (p_recurrence = 'daily' and p_last = d)
+    or (p_recurrence = 'weekly' and p_last >= week_start_for(d))
+  );
+$$;
+
+-- Quiet hours (mirrors Storage._in_quiet_hours): "HH:MM" strings, a window
+-- spanning midnight when start > end.
+create or replace function in_quiet_hours(p_enabled boolean, p_start text, p_end text, p_hm text)
+returns boolean language sql immutable set search_path = public, extensions as $$
+  select coalesce(p_enabled, false) and p_start <> p_end and (
+    case when p_start < p_end then p_hm >= p_start and p_hm < p_end
+         else p_hm >= p_start or p_hm < p_end end
+  );
+$$;
+
+-- For the Edge Function only (service role). Claims everything due (a claim
+-- holds for two minutes, so a failed send comes round again) and returns one
+-- row per (item, subscription). `kind`/`ref`/`owner`/`occurrence` go back
+-- to mark_push_sent() for whatever was delivered.
+drop function if exists due_push_reminders();
+create or replace function due_push_reminders()
+returns table (endpoint text, p256dh text, auth text, kind text, ref text, owner uuid,
+               occurrence date, title text, body text, token text)
+language plpgsql security definer set search_path = public, extensions as $$
+#variable_conflict use_column
+declare
+  stale timestamptz := now() - interval '2 minutes';
+begin
+  delete from push_action_tokens where expires_at < now();
+
+  create temp table due_items (kind text, ref text, owner uuid, occurrence date, title text, body text, token text)
+    on commit drop;
+
+  -- Personal checklist: the daily time, every N hours, and snoozes.
+  with people as (
+    select a.user_id, (now() at time zone 'utc') + a.tz_offset_min * interval '1 minute' as ts,
+           a.quiet_enabled, a.quiet_start, a.quiet_end
     from app_state a
     where exists (select 1 from push_subscriptions s where s.user_id = a.user_id)
   ),
-  due as (
-    update checklist_tasks t set push_reminded_on = ln.ts::date
-    from local_now ln
-    where t.user_id = ln.user_id
-      and t.source = 'checklist'
-      and t.reminder_time ~ '^[0-2][0-9]:[0-5][0-9]$'
-      and t.reminder_time <= to_char(ln.ts, 'HH24:MI')
-      and t.push_reminded_on is distinct from ln.ts::date
-      and not (
-        t.completed_today and (
-          t.recurrence = 'once'
-          or (t.recurrence = 'daily' and t.last_completed = ln.ts::date)
-          or (t.recurrence = 'weekly' and t.last_completed >= week_start_for(ln.ts::date))
-        )
-      )
-    returning t.id, t.user_id, t.text
+  candidates as (
+    select t.id, t.user_id, t.text, p.ts,
+      case
+        when t.snoozed_until is not null and t.snoozed_until <= now() then 'snooze'
+        when t.snoozed_until is not null then null  -- snoozed: its other reminders wait
+        when t.reminder_every_h is not null then
+          case when now() - coalesce(t.push_last_at, t.created_at) >= t.reminder_every_h * interval '1 hour'
+                    and not in_quiet_hours(p.quiet_enabled, p.quiet_start, p.quiet_end, to_char(p.ts, 'HH24:MI'))
+               then 'every' end
+        when t.reminder_time ~ '^[0-2][0-9]:[0-5][0-9]$'
+             and t.reminder_time <= to_char(p.ts, 'HH24:MI')
+             and t.push_reminded_on is distinct from p.ts::date then 'daily'
+      end as kind
+    from checklist_tasks t join people p on p.user_id = t.user_id
+    where t.source = 'checklist'
+      and (t.push_claimed_at is null or t.push_claimed_at < stale)
+      and not checklist_done_on(t.completed_today, t.recurrence, t.last_completed, p.ts::date)
+  ),
+  claimed as (
+    update checklist_tasks t set push_claimed_at = now()
+    from candidates c where t.id = c.id and c.kind is not null
+    returning c.kind, c.id, c.user_id, c.ts::date as day, c.text
   )
-  select s.endpoint, s.p256dh, s.auth, d.id, 'Task reminder'::text, d.text
-  from due d join push_subscriptions s on s.user_id = d.user_id;
+  insert into due_items
+  select c.kind, c.id, c.user_id, c.day,
+         case c.kind when 'snooze' then 'Snoozed reminder' else 'Task reminder' end, c.text,
+         encode(gen_random_bytes(16), 'hex')
+  from claimed c;
+
+  -- Shared list items with a time, for every member of the household.
+  with members as (
+    select m.user_id, m.household_id, (now() at time zone 'utc') + coalesce(a.tz_offset_min, 0) * interval '1 minute' as ts
+    from household_members m left join app_state a on a.user_id = m.user_id
+    where exists (select 1 from push_subscriptions s where s.user_id = m.user_id)
+  ),
+  candidates as (
+    select t.id, mb.user_id, t.text,
+      case when t.recurrence = 'once' then t.due_date
+           else shared_last_occurrence(t.recurrence, t.weekday, t.month_day, mb.ts::date) end as occ,
+      mb.ts, t.recurrence, t.due_time, t.done, t.done_at, coalesce(a.tz_offset_min, 0) as off
+    from shared_tasks t
+    join members mb on mb.household_id = t.household_id
+    left join app_state a on a.user_id = mb.user_id
+    where t.due_time is not null
+  ),
+  due as (
+    select c.* from candidates c
+    where c.occ is not null
+      and (
+        (c.recurrence = 'once' and (c.occ + c.due_time::time) <= c.ts and (c.occ + c.due_time::time) > c.ts - interval '1 day')
+        or (c.recurrence <> 'once' and c.occ = c.ts::date and c.due_time <= to_char(c.ts, 'HH24:MI'))
+      )
+      and not (c.done and (c.recurrence = 'once' or c.done_at is null
+               or ((c.done_at at time zone 'utc') + c.off * interval '1 minute')::date >= c.occ))
+      and not exists (
+        select 1 from shared_push_sent x
+        where x.task_id = c.id and x.user_id = c.user_id and x.occurrence = c.occ
+          and (x.sent or x.claimed_at >= stale))
+  ),
+  claimed as (
+    insert into shared_push_sent (task_id, user_id, occurrence, claimed_at)
+    select d.id, d.user_id, d.occ, now() from due d
+    on conflict on constraint shared_push_sent_pkey do update set claimed_at = now()
+    returning shared_push_sent.task_id, shared_push_sent.user_id, shared_push_sent.occurrence
+  )
+  insert into due_items
+  select 'shared', d.id, d.user_id, d.occ, 'Shared list reminder', d.text, encode(gen_random_bytes(16), 'hex')
+  from due d join claimed c on c.task_id = d.id and c.user_id = d.user_id and c.occurrence = d.occ;
+
+  -- The phone timer: only to the phone that started it.
+  with claimed as (
+    update timer_pushes tp set claimed_at = now()
+    where tp.fire_at <= now() and (tp.claimed_at is null or tp.claimed_at < stale)
+    returning tp.endpoint, tp.user_id, tp.title, tp.body
+  )
+  insert into due_items select 'timer', c.endpoint, c.user_id, null, c.title, c.body, null from claimed c;
+
+  insert into push_action_tokens (token, user_id, kind, ref, expires_at)
+  select d.token, d.owner, case when d.kind = 'shared' then 'shared' else 'task' end, d.ref, now() + interval '1 day'
+  from due_items d where d.token is not null;
+
+  return query
+  select s.endpoint, s.p256dh, s.auth, d.kind, d.ref, d.owner, d.occurrence, d.title, d.body, d.token
+  from due_items d
+  join push_subscriptions s on s.user_id = d.owner and (d.kind <> 'timer' or s.endpoint = d.ref);
+end;
+$$;
+
+-- For the Edge Function only: records what was delivered (to at least one
+-- of that person's phones). p_items: [{kind, ref, owner, occurrence}].
+create or replace function mark_push_sent(p_items jsonb) returns void
+language plpgsql security definer set search_path = public, extensions as $$
+declare
+  item jsonb;
+begin
+  for item in select * from jsonb_array_elements(p_items) loop
+    case item->>'kind'
+      when 'daily' then
+        update checklist_tasks t set push_reminded_on = ((now() at time zone 'utc') + a.tz_offset_min * interval '1 minute')::date,
+                                     push_claimed_at = null
+        from app_state a where a.user_id = t.user_id and t.id = item->>'ref';
+      when 'every' then
+        update checklist_tasks set push_last_at = now(), push_claimed_at = null where id = item->>'ref';
+      when 'snooze' then
+        update checklist_tasks set push_claimed_at = null,
+               snoozed_until = case when snoozed_until <= now() then null else snoozed_until end
+        where id = item->>'ref';
+      when 'shared' then
+        update shared_push_sent set sent = true
+        where task_id = item->>'ref' and user_id = (item->>'owner')::uuid and occurrence = (item->>'occurrence')::date;
+      when 'timer' then
+        delete from timer_pushes where endpoint = item->>'ref' and fire_at <= now();
+      else null;
+    end case;
+  end loop;
 end;
 $$;
 
@@ -1196,11 +1495,51 @@ language sql security definer set search_path = public, extensions as $$
   delete from push_subscriptions where endpoint = p_endpoint;
 $$;
 
--- Only the Edge Function (service role) may run these two.
+-- For the Edge Function: is this the scheduled job calling?
+create or replace function check_cron_secret(p_secret text) returns boolean
+language sql stable security definer set search_path = public, extensions as $$
+  select exists (select 1 from server_settings where name = 'cron_secret' and value = p_secret);
+$$;
+
+-- A notification's Snooze / Done button (called by the phone's service
+-- worker with the token from that push, no login). One use per token.
+create or replace function push_action(p_token text, p_action text) returns text
+language plpgsql security definer set search_path = public, extensions as $$
+declare
+  t push_action_tokens;
+begin
+  delete from push_action_tokens where token = p_token and expires_at > now() returning * into t;
+  if t.token is null then
+    return 'expired';
+  end if;
+  -- Act as the task's owner, so the normal functions (XP, quests, who
+  -- ticked a shared item) behave exactly as if they'd tapped it in the app.
+  perform set_config('request.jwt.claim.sub', t.user_id::text, true);
+  if t.kind = 'task' and p_action = 'snooze' then
+    update checklist_tasks set snoozed_until = now() + interval '15 minutes', push_claimed_at = null
+    where id = t.ref and user_id = t.user_id;
+  elsif t.kind = 'task' and p_action = 'done' then
+    perform complete_task(t.ref, true);
+  elsif t.kind = 'shared' and p_action = 'done' then
+    perform shared_set_done(t.ref, true);
+  else
+    return 'unsupported';
+  end if;
+  return 'ok';
+end;
+$$;
+
+-- Only the Edge Function (service role) may run these; push_action is for
+-- anyone holding a token (signed out included).
 revoke all on function due_push_reminders() from public, anon, authenticated;
+revoke all on function mark_push_sent(jsonb) from public, anon, authenticated;
 revoke all on function drop_push_subscription(text) from public, anon, authenticated;
+revoke all on function check_cron_secret(text) from public, anon, authenticated;
 grant execute on function due_push_reminders() to service_role;
+grant execute on function mark_push_sent(jsonb) to service_role;
 grant execute on function drop_push_subscription(text) to service_role;
+grant execute on function check_cron_secret(text) to service_role;
+grant execute on function push_action(text, text) to anon, authenticated;
 
 -- ============================================================
 -- Deckbuilder trading (opt-in public collections + a "for trade" list)
