@@ -9,7 +9,7 @@ from datetime import date
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QSpinBox,
     QFormLayout, QGroupBox, QSlider, QCheckBox, QFileDialog, QInputDialog,
-    QScrollArea, QComboBox
+    QScrollArea, QComboBox, QFrame
 )
 from PyQt6.QtCore import QTimer, Qt, QEvent, pyqtSignal
 
@@ -18,6 +18,7 @@ from theme import serif_font
 from circular_timer import CircularTimer
 from ambient_loop import AmbientLoop, AMBIENT_SOUNDS, MAX_CONCURRENT
 import chime
+import idle
 import notifier
 import quotes
 
@@ -37,6 +38,8 @@ VOLUME_APPLY_DELAY_MS = 200
 # doesn't finish -- and credit -- a pomodoro.
 STALL_GAP_SECONDS = 3
 TICK_MS = 250
+# How often a running work session asks whether you're still at the computer.
+IDLE_CHECK_MS = 10000
 
 PHASE_NAMES = {
     "work": "\U0001F43E Work session",
@@ -148,6 +151,29 @@ class PomodoroTab(QWidget):
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
+        # Shown when the work session paused itself because nobody touched the
+        # keyboard or mouse for a while (see _check_idle).
+        self._away = None  # (seconds_left had the time been counted, seconds away)
+        self.away_banner = QFrame()
+        self.away_banner.setObjectName("away_banner")
+        away_layout = QVBoxLayout(self.away_banner)
+        away_layout.setContentsMargins(8, 6, 8, 6)
+        self.away_label = QLabel("")
+        self.away_label.setWordWrap(True)
+        away_layout.addWidget(self.away_label)
+        away_buttons = QHBoxLayout()
+        resume_btn = QPushButton("▶  Resume")
+        resume_btn.clicked.connect(self._start)
+        away_buttons.addWidget(resume_btn)
+        count_btn = QPushButton("I was here — count it")
+        count_btn.setToolTip("Reading or thinking away from the keyboard counts too")
+        count_btn.clicked.connect(self._count_away_time)
+        away_buttons.addWidget(count_btn)
+        away_buttons.addStretch()
+        away_layout.addLayout(away_buttons)
+        self.away_banner.setVisible(False)
+        layout.addWidget(self.away_banner)
+
         # Optionally attach work sessions to a checklist task: each finished
         # one adds to that task's 🍅 count (shown in the checklist).
         focus_row = QHBoxLayout()
@@ -208,6 +234,20 @@ class PomodoroTab(QWidget):
         self.ambient_auto_check.setChecked(settings.get("ambient_auto", False))
         form.addRow(self.ambient_auto_check)
 
+        self.idle_spin = QSpinBox()
+        self.idle_spin.setRange(0, 60)
+        self.idle_spin.setSuffix(" min")
+        self.idle_spin.setSpecialValueText("Never")
+        self.idle_spin.setValue(settings.get("idle_pause_min", 5))
+        if idle.available():
+            self.idle_spin.setToolTip(
+                "With no keyboard or mouse input for this long, a work session pauses itself and "
+                "that time isn't counted (unless you say you were there)")
+        else:
+            self.idle_spin.setEnabled(False)
+            self.idle_spin.setToolTip("This desktop doesn't tell apps when you're away")
+        form.addRow("Pause a work session when I'm away for:", self.idle_spin)
+
         save_settings_btn = QPushButton("Save settings")
         save_settings_btn.clicked.connect(self.save_settings)
         form.addRow(save_settings_btn)
@@ -262,6 +302,10 @@ class PomodoroTab(QWidget):
         self.timer = QTimer(self)
         self.timer.setInterval(TICK_MS)
         self.timer.timeout.connect(self._on_tick)
+
+        self.idle_timer = QTimer(self)
+        self.idle_timer.setInterval(IDLE_CHECK_MS)
+        self.idle_timer.timeout.connect(self._check_idle)
 
         self.refresh_theme()
         self._restore_timer_state()
@@ -436,11 +480,13 @@ class PomodoroTab(QWidget):
             self._start()
 
     def _start(self):
+        self._hide_away()
         self.running = True
         now = time.monotonic()
         self._deadline = now + self.seconds_left
         self._last_tick = now
         self.timer.start()
+        self.idle_timer.start()
         self.start_btn.setText("⏸  Pause")
         self._sync_ambient_to_phase()
         self._save_timer_state()
@@ -449,8 +495,41 @@ class PomodoroTab(QWidget):
         self._update_seconds_left()  # settle the exact time remaining
         self.running = False
         self.timer.stop()
+        self.idle_timer.stop()
         self.start_btn.setText("▶  Start")
         self._save_timer_state()
+
+    # ---------- Pausing when you're away ----------
+    def _check_idle(self):
+        """While a work session runs: if nobody has touched the keyboard or
+        mouse for the set time, pause it and take that time back off (you
+        weren't focusing). The banner offers to count it after all."""
+        minutes = self.storage.get_pomodoro_settings().get("idle_pause_min", 5)
+        if not (self.running and self.phase == "work" and minutes):
+            return
+        away = idle.idle_seconds()
+        if away is None or away < minutes * 60:
+            return
+        self._pause()
+        counted_left = self.seconds_left
+        self.seconds_left = min(self._phase_minutes("work") * 60, self.seconds_left + int(away))
+        self._away = (counted_left, int(away))
+        self._refresh_labels()
+        self._save_timer_state()
+        away_min = max(1, round(away / 60))
+        self.away_label.setText(
+            f"⏸ Paused: no keyboard or mouse for {away_min} min, so that time wasn't counted. Still there?")
+        self.away_banner.setVisible(True)
+        notify("Pomodoro paused", f"No activity for {away_min} min. The work session waits until you're back.")
+
+    def _count_away_time(self):
+        if self._away is not None:
+            self.seconds_left = self._away[0]
+        self._start()
+
+    def _hide_away(self):
+        self._away = None
+        self.away_banner.setVisible(False)
 
     def _update_seconds_left(self):
         now = time.monotonic()
@@ -461,7 +540,9 @@ class PomodoroTab(QWidget):
         self.seconds_left = max(0, math.ceil(self._deadline - now))
 
     def reset_phase(self):
+        self._hide_away()
         self.timer.stop()
+        self.idle_timer.stop()
         self.running = False
         self.start_btn.setText("▶  Start")
         self.seconds_left = self._phase_minutes(self.phase) * 60
@@ -473,7 +554,9 @@ class PomodoroTab(QWidget):
         ran out; only then does the phase earn credit (XP, a finished
         session, quest progress) and a notification. Skip passes False, so
         mashing Skip can't be used to farm XP."""
+        self._hide_away()
         self.timer.stop()
+        self.idle_timer.stop()
         self.running = False
         self.start_btn.setText("▶  Start")
 
@@ -595,6 +678,10 @@ class PomodoroTab(QWidget):
         """Re-apply colors for the current palette. Call after a theme switch."""
         p = theme.current()
         self.ambient_status_label.setStyleSheet(f"color: {p['ACCENT']}; font-size: 10px;")
+        self.away_banner.setStyleSheet(
+            f"QFrame#away_banner {{ background: {p['PAPER_LIGHT']}; border: 2px solid {p['ACCENT']};"
+            f" border-radius: 8px; }}"
+            f"QFrame#away_banner QLabel {{ color: {p['INK']}; }}")
         self.circular_timer.set_colors(self._phase_ring_color(), *self._track_and_ink_colors())
         self._update_session_dots()
 
@@ -681,6 +768,7 @@ class PomodoroTab(QWidget):
             "chime": self.chime_check.isChecked(),
             "auto_start_next": self.auto_next_check.isChecked(),
             "ambient_auto": self.ambient_auto_check.isChecked(),
+            "idle_pause_min": self.idle_spin.value(),
         }
         self.storage.set_pomodoro_settings(settings)
         if not self.running:

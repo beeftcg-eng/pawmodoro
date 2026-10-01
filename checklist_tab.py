@@ -1,11 +1,12 @@
 """
 checklist_tab.py - Configurable checklist with repeatable
-(daily/weekly/once/specific-day) tasks. Daily tasks automatically
+(daily/weekly/monthly/once/specific-day) tasks. Daily tasks automatically
 un-check themselves at the start of a new day; a "specific day" task
 (e.g. "take out the trash" on your collection day) un-checks itself the
-next time that weekday comes around - a distinct recurrence type from
-plain "weekly", which is unrelated and never auto-resets. Tasks can be
-dragged to reorder.
+next time that weekday comes around; a monthly one when its day of the
+month comes round. A one-off task can have a due date (shown in red once
+it's overdue). Any task can have a note and subtasks (Details…). Tasks can
+be dragged to reorder.
 
 Also renders a separate, independently-reorderable "Card Wishlist"
 section (hidden when empty) for tasks pushed here from the Deckbuilder
@@ -19,14 +20,18 @@ from datetime import date
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem,
     QPushButton, QLineEdit, QComboBox, QLabel, QTimeEdit, QSpinBox, QAbstractItemView,
-    QInputDialog, QCheckBox, QFrame
+    QInputDialog, QCheckBox, QFrame, QDateEdit
 )
-from PyQt6.QtCore import Qt, QTime, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QDate, QTime, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QFont
 
 import quotes
+import task_dates
 import theme
+from task_details_dialog import TaskDetailsDialog
 
 WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+OVERDUE_COLOR = "#d9453b"
 
 
 class ChecklistTab(QWidget):
@@ -67,7 +72,7 @@ class ChecklistTab(QWidget):
         self.list_widget = QListWidget()
         self.list_widget.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.list_widget.setDefaultDropAction(Qt.DropAction.MoveAction)
-        self.list_widget.setToolTip("Double-click a task to rename it")
+        self.list_widget.setToolTip("Double-click a task for its details: steps, a note, a due date")
         layout.addWidget(self.list_widget)
 
         reminder_row = QHBoxLayout()
@@ -133,6 +138,7 @@ class ChecklistTab(QWidget):
         self.recurrence_box = QComboBox()
         self.recurrence_box.addItem("daily", "daily")
         self.recurrence_box.addItem("weekly", "weekly")
+        self.recurrence_box.addItem("monthly", "monthly")
         self.recurrence_box.addItem("once", "once")
         self.recurrence_box.addItem("specific day", "weekday")
         self.recurrence_box.currentIndexChanged.connect(self._on_recurrence_changed)
@@ -145,6 +151,27 @@ class ChecklistTab(QWidget):
         self.weekday_box.setToolTip("Which day of the week this task is for (e.g. trash collection day)")
         add_row.addWidget(self.weekday_box)
 
+        self.month_day_spin = QSpinBox()
+        self.month_day_spin.setRange(1, 31)
+        self.month_day_spin.setValue(date.today().day)
+        self.month_day_spin.setPrefix("on the ")
+        self.month_day_spin.setToolTip("Day of the month (in a shorter month, the 31st means its last day)")
+        self.month_day_spin.setVisible(False)
+        add_row.addWidget(self.month_day_spin)
+
+        self.due_check = QCheckBox("due")
+        self.due_check.setToolTip("Give this task a due date: it's shown in red once overdue, "
+                                  "and its reminder waits until that day")
+        self.due_check.setVisible(False)
+        add_row.addWidget(self.due_check)
+        self.due_date_edit = QDateEdit(QDate.currentDate())
+        self.due_date_edit.setCalendarPopup(True)
+        self.due_date_edit.setDisplayFormat("ddd d MMM")
+        self.due_date_edit.setVisible(False)
+        self.due_date_edit.setEnabled(False)
+        self.due_check.toggled.connect(self.due_date_edit.setEnabled)
+        add_row.addWidget(self.due_date_edit)
+
         add_btn = QPushButton("Add")
         add_btn.clicked.connect(self.add_task)
         add_row.addWidget(add_btn)
@@ -152,6 +179,10 @@ class ChecklistTab(QWidget):
         layout.addLayout(add_row)
 
         edit_row = QHBoxLayout()
+        details_btn = QPushButton("Details…")
+        details_btn.setToolTip("Steps, a note and a due date for the selected task")
+        details_btn.clicked.connect(self.open_details)
+        edit_row.addWidget(details_btn)
         edit_btn = QPushButton("Rename selected…")
         edit_btn.clicked.connect(self.rename_selected)
         edit_row.addWidget(edit_btn)
@@ -191,7 +222,8 @@ class ChecklistTab(QWidget):
 
         self._last_signature = None
         self.list_widget.itemChanged.connect(self._on_item_changed)
-        self.list_widget.itemDoubleClicked.connect(lambda item: self.rename_selected())
+        self.list_widget.itemDoubleClicked.connect(lambda item: self.open_details())
+        self._details_dialog = None
         self.list_widget.model().rowsMoved.connect(self._on_rows_moved)
         self.wishlist_list_widget.itemChanged.connect(self._on_item_changed)
         self.wishlist_list_widget.model().rowsMoved.connect(self._on_wishlist_rows_moved)
@@ -204,21 +236,29 @@ class ChecklistTab(QWidget):
         self.reminder_hours_spin.setVisible(interval)
 
     def _on_recurrence_changed(self, index=None):
-        self.weekday_box.setVisible(self.recurrence_box.currentData() == "weekday")
+        recurrence = self.recurrence_box.currentData()
+        self.weekday_box.setVisible(recurrence == "weekday")
+        self.month_day_spin.setVisible(recurrence == "monthly")
+        self.due_check.setVisible(recurrence == "once")
+        self.due_date_edit.setVisible(recurrence == "once")
 
     def refresh(self, force=False):
         tasks = self.storage.get_checklist()
         # Cloud sync calls this every few seconds; rebuilding the lists
         # throws away the current selection (and can interrupt a drag), so
         # only rebuild when something visible actually changed.
+        today = date.today()
         signature = [
             (t["id"], t["text"], t["recurrence"], t.get("weekday"), t.get("reminder_time"), t.get("reminder_every_h"),
              t.get("snoozed_until"), t.get("focus_pomodoros", 0),
-             bool(t.get("completed_today")), t.get("source"))
+             bool(t.get("completed_today")), t.get("source"), t.get("month_day"), t.get("due_date"),
+             t.get("note"), str(t.get("subtasks")))
             for t in tasks
-        ]
+        ] + [today]  # "due today" turns into "overdue" at midnight
         if not force and signature == self._last_signature:
             return
+        if self._details_dialog is not None:
+            self._details_dialog.reload()
         if self._due_reminders:
             QTimer.singleShot(0, self._refresh_banner)
         self._last_signature = signature
@@ -237,8 +277,16 @@ class ChecklistTab(QWidget):
             if task["recurrence"] == "weekday" and task.get("weekday") is not None:
                 recurrence_label = WEEKDAY_NAMES[task["weekday"]]
             else:
-                recurrence_label = task["recurrence"]
+                recurrence_label = task_dates.describe(task, today)
+            due = task_dates.due_status(task, today)
             label = f"{task['text']}  \u2014  [{recurrence_label}]"
+            if due == "overdue":
+                label = "⚠ " + label + "  overdue"
+            subtasks = task.get("subtasks") or []
+            if subtasks:
+                label += f"  ☑ {sum(1 for s in subtasks if s.get('done'))}/{len(subtasks)}"
+            if (task.get("note") or "").strip():
+                label += "  \U0001F4DD"
             if task.get("reminder_every_h"):
                 label += f"  \U0001F514 every {task['reminder_every_h']}h"
             elif task.get("reminder_time"):
@@ -253,6 +301,15 @@ class ChecklistTab(QWidget):
             item.setCheckState(
                 Qt.CheckState.Checked if task.get("completed_today") else Qt.CheckState.Unchecked
             )
+            if due:
+                font = QFont(item.font())
+                font.setBold(True)
+                item.setFont(font)
+                if due == "overdue":
+                    item.setForeground(QColor(OVERDUE_COLOR))
+            tooltip = self._task_tooltip(task)
+            if tooltip:
+                item.setToolTip(tooltip)
             self.list_widget.addItem(item)
         self.list_widget.blockSignals(False)
 
@@ -280,6 +337,14 @@ class ChecklistTab(QWidget):
         self.wishlist_label.setVisible(has_wishlist)
         self.wishlist_list_widget.setVisible(has_wishlist)
         self.wishlist_remove_btn.setVisible(has_wishlist)
+
+    @staticmethod
+    def _task_tooltip(task):
+        lines = [("☑ " if s.get("done") else "☐ ") + html.escape(s["text"]) for s in task.get("subtasks") or []]
+        note = (task.get("note") or "").strip()
+        if note:
+            lines.append("<i>" + html.escape(note).replace("\n", "<br>") + "</i>")
+        return "<br>".join(lines)
 
     def _on_rows_moved(self):
         ordered_ids = [
@@ -318,8 +383,12 @@ class ChecklistTab(QWidget):
             return
         recurrence = self.recurrence_box.currentData()
         weekday = self.weekday_box.currentIndex() if recurrence == "weekday" else None
-        self.storage.add_task(text, recurrence, weekday=weekday)
+        month_day = self.month_day_spin.value() if recurrence == "monthly" else None
+        due_date = (self.due_date_edit.date().toString("yyyy-MM-dd")
+                    if recurrence == "once" and self.due_check.isChecked() else None)
+        self.storage.add_task(text, recurrence, weekday=weekday, month_day=month_day, due_date=due_date)
         self.text_input.clear()
+        self.due_check.setChecked(False)
         self.refresh()
 
     def _remove_selected(self, list_widget):
@@ -361,6 +430,17 @@ class ChecklistTab(QWidget):
         if ok and text and text != task["text"]:
             self.storage.rename_task(task_id, text)
             self.refresh()
+
+    def open_details(self):
+        item = self.list_widget.currentItem()
+        if not item:
+            return
+        self._details_dialog = TaskDetailsDialog(self.storage, item.data(Qt.ItemDataRole.UserRole), self)
+        try:
+            self._details_dialog.exec()
+        finally:
+            self._details_dialog = None
+        self.refresh()
 
     def remove_selected(self):
         self._remove_selected(self.list_widget)

@@ -669,6 +669,129 @@ function scheduleNotesSave(editor) {
 
 // ---------- Checklist tab ----------
 
+// Monthly tasks and due dates: the same rules as task_dates.py and
+// month_occurrence() / task_reminds_on() in schema.sql.
+const openTaskDetails = new Set();  // task ids whose steps & note panel is open
+
+function monthOccurrence(monthDay, now) {
+  const inMonth = (y, m) => new Date(y, m, Math.min(monthDay || 1, new Date(y, m + 1, 0).getDate()));
+  const candidate = inMonth(now.getFullYear(), now.getMonth());
+  return localISODate(candidate <= now ? candidate : inMonth(now.getFullYear(), now.getMonth() - 1));
+}
+
+function taskRemindsToday(task, now) {
+  const today = localISODate(now);
+  if (task.recurrence === "monthly") return monthOccurrence(task.month_day, now) === today;
+  if (task.recurrence === "once" && task.due_date) return task.due_date <= today;
+  return true;
+}
+
+// "overdue", "today" or null.
+function taskDueStatus(task, now = new Date()) {
+  if (task.recurrence !== "once" || !task.due_date || task.completed_today) return null;
+  const today = localISODate(now);
+  return task.due_date < today ? "overdue" : task.due_date === today ? "today" : null;
+}
+
+function taskScheduleLabel(task, now = new Date()) {
+  if (task.recurrence === "monthly") return `monthly, ${ordinal(task.month_day || 1)}`;
+  if (task.recurrence === "once" && task.due_date) {
+    if (task.due_date === localISODate(now)) return "due today";
+    const [y, m, d] = task.due_date.split("-").map(Number);
+    return "due " + new Date(y, m - 1, d).toLocaleDateString(undefined,
+      { weekday: "short", day: "numeric", month: "short", year: y === now.getFullYear() ? undefined : "numeric" });
+  }
+  return task.recurrence;
+}
+
+async function taskCall(name, params, failTitle) {
+  const { error } = await supabaseClient.rpc(name, params);
+  if (error) {
+    toast(failTitle, isMissingFunction(error)
+      ? "The cloud database needs updating: re-run supabase/schema.sql (see MOBILE_SYNC.md)."
+      : error.message || "Check your connection and try again.");
+  }
+  await pullAndRender();
+}
+
+function saveTaskDetails(task, subtasks, note = task.note ?? "") {
+  return taskCall("set_task_details",
+    { p_task_id: task.id, p_note: note, p_subtasks: subtasks.map(s => ({ id: s.id, text: s.text })) },
+    "⚠️ Couldn't save the steps");
+}
+
+// The steps & note panel under a task.
+function taskDetailsHtml(task) {
+  const subtasks = Array.isArray(task.subtasks) ? task.subtasks : [];
+  return `
+    <div class="task-details" ${openTaskDetails.has(task.id) ? "" : "hidden"}>
+      ${task.recurrence === "once" ? `
+        <label class="due-row">Due date <input class="task-due" type="date" value="${escapeHtml(task.due_date ?? "")}"></label>` : ""}
+      <ul class="subtask-list">
+        ${subtasks.map((sub, i) => `
+          <li class="subtask${sub.done ? " done" : ""}" data-index="${i}">
+            <label><input type="checkbox" ${sub.done ? "checked" : ""}><span>${escapeHtml(sub.text)}</span></label>
+            <button class="remove-btn subtask-remove" title="Remove step">✕</button>
+          </li>`).join("")}
+      </ul>
+      <div class="subtask-add">
+        <input class="subtask-text" type="text" placeholder="Add a step">
+        <button class="subtask-add-btn">Add</button>
+      </div>
+      <textarea class="task-note" rows="2" placeholder="Note">${escapeHtml(task.note ?? "")}</textarea>
+    </div>`;
+}
+
+function wireTaskDetails(li, task) {
+  const panel = li.querySelector(".task-details");
+  const subtasks = Array.isArray(task.subtasks) ? task.subtasks : [];
+  li.querySelector(".details-btn").addEventListener("click", () => {
+    panel.hidden = !panel.hidden;
+    if (panel.hidden) openTaskDetails.delete(task.id); else openTaskDetails.add(task.id);
+  });
+  panel.querySelector(".task-due")?.addEventListener("change", e => taskCall("set_task_due_date",
+    { p_task_id: task.id, p_due_date: e.target.value || null }, "⚠️ Couldn't save the due date"));
+  panel.querySelectorAll(".subtask").forEach(row => {
+    const sub = subtasks[Number(row.dataset.index)];
+    row.querySelector("input").addEventListener("change", e => taskCall("set_subtask_done",
+      { p_task_id: task.id, p_sub_id: sub.id, p_done: e.target.checked }, "⚠️ Couldn't save"));
+    row.querySelector(".subtask-remove").addEventListener("click", () =>
+      saveTaskDetails(task, subtasks.filter(s => s.id !== sub.id)));
+  });
+  const input = panel.querySelector(".subtask-text");
+  const add = () => {
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = "";
+    saveTaskDetails(task, [...subtasks, { id: Math.random().toString(16).slice(2, 10), text }]);
+  };
+  panel.querySelector(".subtask-add-btn").addEventListener("click", add);
+  input.addEventListener("keydown", e => { if (e.key === "Enter") add(); });
+  panel.querySelector(".task-note").addEventListener("change", e => {
+    if (e.target.value !== (task.note ?? "")) saveTaskDetails(task, subtasks, e.target.value);
+  });
+}
+
+// What's typed into the steps & note panels but not saved yet, so a
+// re-render (a poll found a change) doesn't throw it away.
+function keepTaskDetailDrafts() {
+  const drafts = [];
+  document.querySelectorAll(".task-item[data-task-id]").forEach(li => {
+    for (const sel of [".subtask-text", ".task-note"]) {
+      const el = li.querySelector(sel);
+      if (el && (document.activeElement === el || (sel === ".subtask-text" && el.value))) {
+        drafts.push({ id: li.dataset.taskId, sel, value: el.value, focused: document.activeElement === el });
+      }
+    }
+  });
+  return () => drafts.forEach(d => {
+    const el = document.querySelector(`.task-item[data-task-id="${CSS.escape(d.id)}"] ${d.sel}`);
+    if (!el) return;
+    el.value = d.value;
+    if (d.focused) el.focus();
+  });
+}
+
 // Shared row renderer for both the regular checklist and the wishlist
 // section below it — identical markup/behavior except the regular list
 // also shows each task's recurrence tag.
@@ -678,7 +801,13 @@ function scheduleNotesSave(editor) {
 function renderTaskList(container, tasks, { showRecurrence = false, reminders = false } = {}) {
   tasks.forEach((task, index) => {
     const li = document.createElement("li");
-    li.className = "task-item" + (task.completed_today ? " done" : "");
+    const due = showRecurrence ? taskDueStatus(task) : null;
+    li.className = "task-item" + (task.completed_today ? " done" : "") + (due ? ` due-${due}` : "");
+    li.dataset.taskId = task.id;
+    const subtasks = Array.isArray(task.subtasks) ? task.subtasks : [];
+    const extras = !showRecurrence ? ""
+      : (subtasks.length ? ` <em>☑ ${subtasks.filter(s => s.done).length}/${subtasks.length}</em>` : "")
+        + ((task.note ?? "").trim() ? " <em>\u{1F4DD}</em>" : "");
     const bell = !reminders ? ""
       : task.reminder_every_h ? ` <em>\u{1F514} every ${Number(task.reminder_every_h)}h</em>`
       : task.reminder_time ? ` <em>\u{1F514} ${escapeHtml(task.reminder_time)}</em>` : "";
@@ -692,8 +821,9 @@ function renderTaskList(container, tasks, { showRecurrence = false, reminders = 
       </div>
       <label>
         <input type="checkbox" ${task.completed_today ? "checked" : ""}>
-        <span>${escapeHtml(task.text)}${showRecurrence ? ` <em>[${task.recurrence}]</em>` : ""}${bell}${snoozed}</span>
+        <span>${due === "overdue" ? "⚠ " : ""}${escapeHtml(task.text)}${showRecurrence ? ` <em class="schedule">[${escapeHtml(taskScheduleLabel(task))}]</em>` : ""}${bell}${snoozed}${extras}</span>
       </label>
+      ${showRecurrence ? `<button class="rename-btn details-btn" title="Steps & note">☰</button>` : ""}
       ${reminders ? `<button class="rename-btn reminder-btn" title="Reminder">\u{1F514}</button>` : ""}
       <button class="rename-btn" title="Rename">✎</button>
       <button class="remove-btn" title="Remove">✕</button>
@@ -709,10 +839,12 @@ function renderTaskList(container, tasks, { showRecurrence = false, reminders = 
           </span>
           <button class="reminder-save">Set</button>
           <button class="reminder-clear">Clear</button>
-        </div>` : ""}`;
+        </div>` : ""}
+      ${showRecurrence ? taskDetailsHtml(task) : ""}`;
     li.querySelector("input").addEventListener("change", async e => {
       await toggleTask(task.id, e.target.checked);
     });
+    if (showRecurrence) wireTaskDetails(li, task);
     if (reminders) {
       const editor = li.querySelector(".reminder-edit");
       const mode = editor.querySelector(".reminder-mode");
@@ -752,11 +884,14 @@ function renderTaskList(container, tasks, { showRecurrence = false, reminders = 
 }
 
 function checklistKey() {
-  return JSON.stringify(state?.checklist ?? []);
+  // (with the date: "due today" turns into "overdue" at midnight)
+  return JSON.stringify([localISODate(new Date()), state?.checklist ?? []]);
 }
 
 function renderChecklist() {
   const restoreDraft = keepDraft("task-text");
+  const restoreDetailDrafts = keepTaskDetailDrafts();
+  const draftRepeat = document.getElementById("task-recurrence")?.value;
   renderKeys.checklist = checklistKey();
   const view = document.getElementById("view");
   const allTasks = state?.checklist ?? [];
@@ -774,8 +909,11 @@ function renderChecklist() {
         <select id="task-recurrence">
           <option value="daily">daily</option>
           <option value="weekly">weekly</option>
+          <option value="monthly">monthly</option>
           <option value="once">once</option>
         </select>
+        <input id="task-month-day" type="number" min="1" max="31" value="${new Date().getDate()}" title="Day of the month" hidden>
+        <input id="task-due-date" type="date" title="Due date (optional)" hidden>
         <button id="task-add">Add</button>
       </div>
       ${wishlistTasks.length ? `
@@ -789,15 +927,41 @@ function renderChecklist() {
   const wishlistList = document.getElementById("wishlist-task-list");
   if (wishlistList) renderTaskList(wishlistList, wishlistTasks);
 
+  const repeat = document.getElementById("task-recurrence");
+  const monthDay = document.getElementById("task-month-day");
+  const dueDate = document.getElementById("task-due-date");
+  const showPickers = () => {
+    monthDay.hidden = repeat.value !== "monthly";
+    dueDate.hidden = repeat.value !== "once";
+  };
+  if (draftRepeat) repeat.value = draftRepeat;
+  showPickers();
+  repeat.addEventListener("change", showPickers);
   document.getElementById("task-add").addEventListener("click", async () => {
     const text = document.getElementById("task-text").value.trim();
     if (!text) return;
-    const recurrence = document.getElementById("task-recurrence").value;
-    await supabaseClient.rpc("add_task", { p_text: text, p_recurrence: recurrence, p_reminder_time: null });
+    const recurrence = repeat.value;
+    const params = { p_text: text, p_recurrence: recurrence, p_reminder_time: null };
+    // Only sent when used, so plain tasks still work on a cloud schema older than v2.18.
+    if (recurrence === "monthly") {
+      const day = Math.round(Number(monthDay.value));
+      if (!(day >= 1 && day <= 31)) return toast("Day of the month", "Pick a day between 1 and 31.");
+      params.p_month_day = day;
+    }
+    if (recurrence === "once" && dueDate.value) params.p_due_date = dueDate.value;
+    const { error } = await supabaseClient.rpc("add_task", params);
+    if (error) {
+      toast("⚠️ Couldn't add the task", isMissingFunction(error)
+        ? "The cloud database needs updating: re-run supabase/schema.sql (see MOBILE_SYNC.md)."
+        : error.message || "Check your connection and try again.");
+      return;
+    }
     document.getElementById("task-text").value = "";
+    dueDate.value = "";
     await pullAndRender();
   });
   restoreDraft();
+  restoreDetailDrafts();
 }
 
 // ---------- Phone push notifications ----------
@@ -922,6 +1086,7 @@ function checkTaskReminders() {
   let changed = false;
   for (const task of state.checklist) {
     if (!task.reminder_time || task.completed_today || task.source === "wishlist") continue;
+    if (!taskRemindsToday(task, now)) continue;  // a monthly task on its day, a dated one from its date
     if (reminded[task.id] === today || hm < task.reminder_time) continue;
     reminded[task.id] = today;
     changed = true;

@@ -6,6 +6,7 @@ from unittest import mock
 from support import StorageTestCase
 
 try:
+    from PyQt6.QtCore import Qt
     from PyQt6.QtWidgets import QApplication
 except ImportError:  # e.g. a CI job that only runs the logic tests
     QApplication = None
@@ -132,6 +133,81 @@ class MainWindowTests(StorageTestCase):
         window.storage.record_pomodoro_completed(25, task_id=task["id"])
         window.progress_tab.refresh()
         self.assertEqual(window.progress_tab.task_focus_layout.count(), 1)
+
+    def test_checklist_shows_dates_and_steps(self):
+        from datetime import date, timedelta
+        window = self.make_window()
+        st = window.storage
+        tab = window.checklist_tab
+        tab.text_input.setText("Rent")
+        tab.recurrence_box.setCurrentIndex(tab.recurrence_box.findData("monthly"))
+        self.assertTrue(tab.month_day_spin.isVisibleTo(tab))
+        tab.month_day_spin.setValue(3)
+        tab.add_task()
+        late = st.add_task("Taxes", "once", due_date=(date.today() - timedelta(days=1)).isoformat())
+        st.add_subtask(late["id"], "Find receipts")
+        st.set_task_note(late["id"], "ask about the deadline")
+        tab.refresh()
+        labels = [tab.list_widget.item(row).text() for row in range(tab.list_widget.count())]
+        self.assertEqual(st.get_checklist()[0]["month_day"], 3)
+        self.assertIn("[monthly, 3rd]", labels[0])
+        self.assertTrue(labels[1].startswith("⚠ ") and "overdue" in labels[1] and "☑ 0/1" in labels[1])
+        self.assertIn("Find receipts", tab.list_widget.item(1).toolTip())
+
+    def test_task_details_dialog(self):
+        from task_details_dialog import TaskDetailsDialog
+        window = self.make_window()
+        st = window.storage
+        task = st.add_task("Taxes", "once")
+        dialog = TaskDetailsDialog(st, task["id"], window)
+        dialog.subtask_input.setText("Find receipts")
+        dialog._add_subtask()
+        dialog.subtask_list.item(0).setCheckState(Qt.CheckState.Checked)
+        dialog.due_check.setChecked(True)
+        dialog.note_edit.setPlainText("by the 15th")
+        dialog.name_edit.setText("Do taxes")
+        dialog.reject()
+        task = st._find_task(task["id"])
+        self.assertEqual(task["subtasks"][0]["text"], "Find receipts")
+        self.assertTrue(task["subtasks"][0]["done"])
+        self.assertIsNotNone(task["due_date"])
+        self.assertEqual((task["note"], task["text"]), ("by the 15th", "Do taxes"))
+
+    def test_work_session_pauses_when_youre_away(self):
+        window = self.make_window()
+        tab = window.pomodoro_tab
+        tab._start()
+        with mock.patch("pomodoro_tab.idle.idle_seconds", return_value=60):
+            tab._check_idle()
+        self.assertTrue(tab.running, "a minute away is under the 5-minute default")
+        tab.seconds_left = 1000
+        tab._start()
+        with mock.patch("pomodoro_tab.idle.idle_seconds", return_value=6 * 60), \
+                mock.patch("pomodoro_tab.notify") as notify:
+            tab._check_idle()
+        self.assertFalse(tab.running)
+        self.assertFalse(tab.away_banner.isHidden())
+        self.assertEqual(tab.seconds_left, 1000 + 6 * 60, "the time away isn't counted")
+        self.assertEqual(window.storage.get_timer_state()["seconds_left"], 1360)
+        notify.assert_called_once()
+        tab._count_away_time()
+        self.assertTrue(tab.running)
+        self.assertTrue(tab.away_banner.isHidden())
+        self.assertLessEqual(tab.seconds_left, 1000, "\"I was here\" counts it after all")
+
+    def test_away_check_leaves_breaks_and_the_never_setting_alone(self):
+        window = self.make_window()
+        tab = window.pomodoro_tab
+        with mock.patch("pomodoro_tab.idle.idle_seconds", return_value=3600):
+            tab.phase = "short_break"
+            tab._start()
+            tab._check_idle()
+            self.assertTrue(tab.running)
+            tab.phase = "work"
+            tab.idle_spin.setValue(0)
+            tab.save_settings()
+            tab._check_idle()
+            self.assertTrue(tab.running)
 
     def test_tray_shows_the_timer(self):
         window = self.make_window()

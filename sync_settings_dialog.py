@@ -165,8 +165,14 @@ class SyncSettingsDialog(QDialog):
                     continue
                 client.add_task(
                     task["text"], task["recurrence"], task.get("reminder_time"), task.get("source", "checklist"),
-                    task["id"],
+                    task["id"], task.get("month_day"), task.get("due_date"),
                 )
+                if task.get("note") or task.get("subtasks"):
+                    client.set_task_details(task["id"], task.get("note") or "",
+                                            [{"id": s["id"], "text": s["text"]} for s in task["subtasks"]])
+                    for sub in task.get("subtasks") or []:
+                        if sub.get("done"):
+                            client.set_subtask_done(task["id"], sub["id"], True)
             QMessageBox.information(
                 self, "Cloud Sync",
                 "No existing cloud data found — uploaded this computer's current "

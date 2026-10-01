@@ -182,15 +182,30 @@ class SupabaseSync:
     def set_tz_offset(self, minutes):
         return self._rpc("set_tz_offset", {"p_minutes": minutes})
 
-    def add_task(self, text, recurrence, reminder_time=None, source="checklist", task_id=None):
+    def add_task(self, text, recurrence, reminder_time=None, source="checklist", task_id=None,
+                 month_day=None, due_date=None):
         # task_id lets the desktop create the task under the id it already
         # gave it locally (safe to retry: the server returns the existing
         # row). Left out when None so an older cloud schema, which doesn't
-        # know p_id yet, still accepts the call.
+        # know p_id yet, still accepts the call -- likewise the v2.18 month
+        # day and due date, so plain tasks still work before schema.sql is re-run.
         params = {"p_text": text, "p_recurrence": recurrence, "p_reminder_time": reminder_time, "p_source": source}
         if task_id:
             params["p_id"] = task_id
+        if month_day is not None:
+            params["p_month_day"] = month_day
+        if due_date:
+            params["p_due_date"] = due_date
         return self._rpc("add_task", params)
+
+    def set_task_due_date(self, task_id, due_date):
+        return self._rpc("set_task_due_date", {"p_task_id": task_id, "p_due_date": due_date})
+
+    def set_task_details(self, task_id, note, subtasks):
+        return self._rpc("set_task_details", {"p_task_id": task_id, "p_note": note, "p_subtasks": subtasks})
+
+    def set_subtask_done(self, task_id, sub_id, done):
+        return self._rpc("set_subtask_done", {"p_task_id": task_id, "p_sub_id": sub_id, "p_done": done})
 
     def remove_task(self, task_id):
         return self._rpc("remove_task", {"p_task_id": task_id})

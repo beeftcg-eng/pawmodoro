@@ -72,6 +72,7 @@ begin
      and in_quiet_hours(true, '13:00', '14:00', '13:30') and not in_quiet_hours(true, '13:00', '14:00', '14:00'),
      'quiet hours window (mirrors Storage._in_quiet_hours)';
   perform set_reminder_settings(false, '22:00', '08:00');
+  perform set_task_reminder('t1', null);  -- or the push tests below would depend on the time of day
 end $$;
 reset role;
 
@@ -240,6 +241,101 @@ begin
     'ticking it from the notification earns XP like the app does';
   select * into s from shared_tasks where id = 'sh1';
   assert s.done and s.done_by = '22222222-2222-2222-2222-222222222222', 'shared item ticked off as its owner';
+end $$;
+
+-- ============ Monthly tasks, due dates, subtasks (v2.18) ============
+do $$
+begin
+  assert month_occurrence(15, '2026-10-20') = '2026-10-15', 'this month';
+  assert month_occurrence(15, '2026-10-10') = '2026-09-15', 'not yet this month: last month';
+  assert month_occurrence(31, '2026-02-28') = '2026-02-28', 'a short month uses its last day';
+  assert month_occurrence(31, '2026-03-05') = '2026-02-28', 'last month was short';
+  assert month_occurrence(1, '2026-10-01') = '2026-10-01', 'on the day itself';
+end $$;
+insert into app_state (user_id) values (:'C') on conflict do nothing;
+set role authenticated;
+select set_config('request.jwt.claim.sub', :'C', false);
+do $$
+declare t checklist_tasks; r jsonb; today date := user_today();
+begin
+  perform add_task('rent', 'monthly', null, 'checklist', 'm1', extract(day from today)::int);
+  select * into t from checklist_tasks where id = 'm1';
+  assert t.month_day = extract(day from today)::int and t.due_date is null, 'monthly task keeps its day';
+  begin
+    perform add_task('no day', 'monthly', null, 'checklist', 'm2');
+    assert false, 'a monthly task without a day should be refused';
+  exception when raise_exception then null;
+  end;
+  perform add_task('taxes', 'once', null, 'checklist', 'o1', 5, today + 3);
+  select * into t from checklist_tasks where id = 'o1';
+  assert t.month_day is null and t.due_date = today + 3, 'a one-off keeps its due date, not a month day';
+  perform add_task('plain', 'daily', null, 'checklist', 'p1', null, today);
+  assert (select due_date from checklist_tasks where id = 'p1') is null, 'only one-offs have due dates';
+  perform set_task_due_date('o1', today - 1);
+  assert (select due_date from checklist_tasks where id = 'o1') = today - 1, 'due date changed';
+  perform set_task_due_date('p1', today);
+  assert (select due_date from checklist_tasks where id = 'p1') is null, 'due date on a daily task ignored';
+
+  r := complete_task('m1', true);
+  assert (r->>'xp_gained')::int = 20, 'a monthly task pays 20 XP: ' || r;
+  perform complete_task('m1', false);
+  r := complete_task('m1', true);
+  assert r->>'xp_gained' is null, 'and only once a month: ' || r;
+  update checklist_tasks set last_completed = today - 40, awarded_on = today - 40 where id = 'm1';
+  perform roll_recurring_tasks();
+  assert not (select completed_today from checklist_tasks where id = 'm1'), 'it un-ticks when its day comes round';
+  r := complete_task('m1', true);
+  assert (r->>'xp_gained')::int = 20, 'and pays again: ' || r;
+
+  perform set_task_details('o1', 'bring receipts', '[{"id": "a", "text": "Find receipts"}, {"id": "b", "text": "Fill form"}]');
+  perform set_subtask_done('o1', 'b', true);
+  perform set_task_details('o1', 'bring receipts',
+    '[{"id": "b", "text": "Fill the form"}, {"id": "c", "text": "Submit"}, {"id": "a", "text": "Find receipts"}]');
+  select * into t from checklist_tasks where id = 'o1';
+  assert t.note = 'bring receipts', 'note saved';
+  assert t.subtasks = '[{"id": "b", "text": "Fill the form", "done": true}, {"id": "c", "text": "Submit", "done": false},
+                        {"id": "a", "text": "Find receipts", "done": false}]'::jsonb,
+    'edits keep ticks and order: ' || t.subtasks;
+  begin
+    perform set_task_details('o1', '', '{"not": "a list"}');
+    assert false, 'subtasks must be a list';
+  exception when raise_exception then null;
+  end;
+  perform set_task_details('p1', '', '[{"id": "x", "text": "step"}]');
+  perform set_subtask_done('p1', 'x', true);
+  perform complete_task('p1', true);
+  update checklist_tasks set last_completed = today - 1 where id = 'p1';
+  perform roll_recurring_tasks();
+  select * into t from checklist_tasks where id = 'p1';
+  assert not t.completed_today and not (t.subtasks->0->>'done')::boolean, 'a reset un-ticks the subtasks';
+  r := sync_pull();
+  assert (select count(*) from jsonb_array_elements(r->'checklist') e
+          where e ? 'subtasks' and e ? 'note' and e ? 'month_day' and e ? 'due_date') = 3, 'sync_pull carries the new fields';
+end $$;
+-- Reminders: a dated one-off from its date, a monthly task only on its day.
+select 1 from (select add_task('due tomorrow', 'once', '00:00', 'checklist', 'r1', null, user_today() + 1)) x;
+select 1 from (select add_task('was due yesterday', 'once', '00:00', 'checklist', 'r2', null, user_today() - 1)) x;
+select 1 from (select add_task('monthly, today', 'monthly', '00:00', 'checklist', 'r3', extract(day from user_today())::int)) x;
+select 1 from (select add_task('monthly, another day', 'monthly', '00:00', 'checklist', 'r4',
+                               extract(day from user_today())::int % 28 + 1)) x;
+reset role;
+insert into push_subscriptions values ('https://push.example/c', :'C', 'k', 's', now());
+set role service_role;
+do $$
+declare got text;
+begin
+  select string_agg(ref, ',' order by ref) into got from due_push_reminders()
+  where owner = '33333333-3333-3333-3333-333333333333' and kind <> 'shared';
+  assert got = 'r2,r3', 'only the overdue one-off and today''s monthly task remind -- got ' || coalesce(got, 'nothing');
+end $$;
+reset role;
+delete from push_subscriptions where user_id = :'C';
+
+-- An old 3-argument add_task left over in a database would make the phone's
+-- plain add ambiguous to PostgREST; schema.sql must drop it.
+do $$
+begin
+  assert (select count(*) from pg_proc where proname = 'add_task') = 1, 'exactly one add_task';
 end $$;
 
 -- ============ Who may call what ============

@@ -21,6 +21,7 @@ from datetime import date, datetime, timedelta
 
 import gamification
 import shared_schedule
+import task_dates
 from paths import app_data_dir
 from sync_engine import SyncEngine
 
@@ -42,9 +43,10 @@ DEFAULT_DATA = {
                        #          reminder_time ("HH:MM" or None), last_reminded (date or None),
                        #          awarded_on (date or None), weekday, source,
                        #          reminder_every_h (int or None), last_reminded_at (datetime or None),
-                       #          snoozed_until (datetime or None), focus_pomodoros, focus_min}
-                       # (reminder_every_h and snoozed_until sync from v2.17; last_reminded_at
-                       # and the 🍅 counts stay local)
+                       #          snoozed_until (datetime or None), focus_pomodoros, focus_min,
+                       #          month_day (monthly), due_date (once), note, subtasks: [{id, text, done}]}
+                       # (reminder_every_h and snoozed_until sync from v2.17, monthly / due dates /
+                       # notes / subtasks from v2.18; last_reminded_at and the 🍅 counts stay local)
     "pomodoro": {
         "work_min": 25,
         "short_break_min": 5,
@@ -53,6 +55,7 @@ DEFAULT_DATA = {
         "chime": True,             # play a sound when a phase ends
         "auto_start_next": True,   # roll straight into the next phase
         "ambient_auto": False,     # play the ambient mix only during work phases
+        "idle_pause_min": 5,       # pause a work session after this long with no keyboard/mouse (0 = never)
     },
     "timer_state": None,  # the pomodoro timer across restarts, see PomodoroTab._save_timer_state
     "focus_task": None,  # checklist task id the pomodoro timer is "working on", or None
@@ -521,7 +524,9 @@ class Storage:
         """Un-checks tasks whose period has rolled over: daily tasks each new
         day; a "weekday" task (e.g. "take out the trash" pinned to your
         collection day) whenever that weekday comes around; a "weekly" task
-        when the quest week rolls over (Tuesday). "once" tasks never reset."""
+        when the quest week rolls over (Tuesday); a "monthly" task when its
+        day of the month comes round. "once" tasks never reset. A task that
+        resets un-ticks its subtasks too."""
         today_date = date.today()
         today = today_date.isoformat()
         changed = False
@@ -533,9 +538,12 @@ class Storage:
                 or (recurrence == "weekday" and task.get("weekday") is not None
                     and today_date.weekday() == task["weekday"] and last != today)
                 or (recurrence == "weekly" and gamification.weekly_task_needs_reset(last, today_date))
+                or (recurrence == "monthly" and task_dates.monthly_needs_reset(last, task.get("month_day"), today_date))
             )
             if should_reset and task.get("completed_today"):
                 task["completed_today"] = False
+                for sub in task.get("subtasks") or []:
+                    sub["done"] = False
                 changed = True
         if changed:
             self.save()
@@ -559,11 +567,13 @@ class Storage:
     def _find_task(self, task_id):
         return next((t for t in self.data["checklist"] if t["id"] == task_id), None)
 
-    def add_task(self, text, recurrence="daily", reminder_time=None, weekday=None, source="checklist"):
+    def add_task(self, text, recurrence="daily", reminder_time=None, weekday=None, source="checklist",
+                 month_day=None, due_date=None):
+        month_day, due_date = task_dates.normalize(recurrence, month_day, due_date)
         task = {
             "id": uuid.uuid4().hex[:8],
             "text": text,
-            "recurrence": recurrence,  # "daily", "weekly", "once", "weekday"
+            "recurrence": recurrence,  # "daily", "weekly", "once", "weekday", "monthly"
             "last_completed": None,
             "completed_today": False,
             "reminder_time": reminder_time,  # "HH:MM" or None
@@ -574,6 +584,10 @@ class Storage:
             "snoozed_until": None,  # datetime isoformat a snoozed reminder comes back (local-only)
             "awarded_on": None,  # last date this task paid out XP, see gamification.task_already_awarded
             "source": source,  # "checklist" (default) or "wishlist" (pushed from Deckbuilder)
+            "month_day": month_day,  # 1..31 for a "monthly" task
+            "due_date": due_date,  # "YYYY-MM-DD" for a "once" task, or None
+            "note": "",
+            "subtasks": [],  # [{id, text, done}]
         }
         self.data["checklist"].append(task)
         self._enqueue_task_add(task)
@@ -588,7 +602,10 @@ class Storage:
             self._enqueue("add_task", {
                 "id": task["id"], "text": task["text"], "recurrence": task["recurrence"],
                 "reminder_time": task.get("reminder_time"), "source": task.get("source", "checklist"),
+                "month_day": task.get("month_day"), "due_date": task.get("due_date"),
             })
+            if task.get("note") or task.get("subtasks"):  # e.g. a removal being undone
+                self._enqueue_task_details(task)
 
     def rename_task(self, task_id, text):
         task = self._find_task(task_id)
@@ -598,6 +615,76 @@ class Storage:
         if task["recurrence"] != "weekday":
             self._enqueue("rename_task", {"id": task_id, "text": text})
         self.save()
+
+    def set_task_due_date(self, task_id, due_date):
+        """A one-off task's due date ("YYYY-MM-DD"), or None to clear it."""
+        task = self._find_task(task_id)
+        if task is None or task["recurrence"] != "once":
+            return
+        task["due_date"] = task_dates.normalize("once", None, due_date)[1]
+        task["last_reminded"] = None  # a daily-time reminder may fire on the new date
+        self._enqueue("set_task_due_date", {"id": task_id, "due_date": task["due_date"]}, key=f"due:{task_id}")
+        self.save()
+
+    def set_task_note(self, task_id, note):
+        task = self._find_task(task_id)
+        if task is None:
+            return
+        task["note"] = note
+        self._enqueue_task_details(task)
+        self.save()
+
+    def add_subtask(self, task_id, text):
+        task = self._find_task(task_id)
+        if task is None:
+            return None
+        sub = {"id": uuid.uuid4().hex[:8], "text": text, "done": False}
+        task.setdefault("subtasks", []).append(sub)
+        self._enqueue_task_details(task)
+        self.save()
+        return sub
+
+    def rename_subtask(self, task_id, sub_id, text):
+        self._edit_subtasks(task_id, lambda subs: [dict(s, text=text) if s["id"] == sub_id else s for s in subs])
+
+    def remove_subtask(self, task_id, sub_id):
+        self._edit_subtasks(task_id, lambda subs: [s for s in subs if s["id"] != sub_id])
+
+    def move_subtask(self, task_id, sub_id, offset):
+        def move(subs):
+            index = next((i for i, s in enumerate(subs) if s["id"] == sub_id), None)
+            if index is None or not 0 <= index + offset < len(subs):
+                return subs
+            subs.insert(index + offset, subs.pop(index))
+            return subs
+        self._edit_subtasks(task_id, move)
+
+    def _edit_subtasks(self, task_id, change):
+        task = self._find_task(task_id)
+        if task is None:
+            return
+        task["subtasks"] = change(list(task.get("subtasks") or []))
+        self._enqueue_task_details(task)
+        self.save()
+
+    def set_subtask_done(self, task_id, sub_id, done):
+        """Ticks one subtask. Sent on its own (not the whole list), so ticking
+        different steps on two devices at once can't undo either."""
+        task = self._find_task(task_id)
+        sub = next((s for s in (task or {}).get("subtasks") or [] if s["id"] == sub_id), None)
+        if sub is None:
+            return
+        sub["done"] = bool(done)
+        if task["recurrence"] != "weekday":
+            self._enqueue("set_subtask_done", {"id": task_id, "sub_id": sub_id, "done": bool(done)})
+        self.save()
+
+    def _enqueue_task_details(self, task):
+        if task["recurrence"] != "weekday":
+            self._enqueue("set_task_details", {
+                "id": task["id"], "note": task.get("note") or "",
+                "subtasks": [{"id": s["id"], "text": s["text"]} for s in task.get("subtasks") or []],
+            }, key=f"details:{task['id']}")
 
     def set_task_reminder(self, task_id, reminder_time, every_hours=None):
         """reminder_time: "HH:MM" string for a once-a-day reminder, or
@@ -681,11 +768,11 @@ class Storage:
                     continue
                 else:
                     continue  # its regular reminder waits until the snooze is over
+            if not task_dates.reminds_today(task, now.date()):
+                continue  # a specific-day / monthly task only nags on its day, a dated one from its date
             every_h = task.get("reminder_every_h")
             if every_h:
                 if task.get("completed_today") or quiet:
-                    continue
-                if task.get("recurrence") == "weekday" and task.get("weekday") not in (None, now.weekday()):
                     continue
                 try:
                     last = datetime.fromisoformat(task.get("last_reminded_at") or "")
@@ -701,8 +788,6 @@ class Storage:
                 continue
             if task.get("last_reminded") == today:
                 continue
-            if task.get("recurrence") == "weekday" and task.get("weekday") not in (None, now.weekday()):
-                continue  # a specific-day task only nags on its own day
             if current_hm >= reminder_time:
                 task["last_reminded"] = today
                 due.append(task)
@@ -758,7 +843,8 @@ class Storage:
         if done:
             task["last_completed"] = today.isoformat()
         result = {"completed_quests": []}
-        if done and not gamification.task_already_awarded(task["recurrence"], task.get("awarded_on"), today):
+        if done and not gamification.task_already_awarded(task["recurrence"], task.get("awarded_on"), today,
+                                                           task.get("month_day")):
             self._ensure_daily_quests()
             self._ensure_weekly_quests()
             result = self._award_task(task, today)
@@ -919,6 +1005,7 @@ class Storage:
                 "focus_min": (local_tasks.get(t["id"]) or {}).get("focus_min", 0),
                 "awarded_on": t.get("awarded_on"),
                 "source": t.get("source", "checklist"),
+                **self._remote_detail_fields(t, local_tasks.get(t["id"]) or {}),
             }
             for t in remote["checklist"]
         ] + local_weekday_tasks
@@ -948,6 +1035,23 @@ class Storage:
         if parsed.tzinfo is not None:
             parsed = parsed.astimezone().replace(tzinfo=None)
         return parsed.isoformat(timespec="seconds")
+
+    @staticmethod
+    def _remote_detail_fields(remote_task, local_task):
+        """Monthly day, due date, note and subtasks from a pull. A cloud older
+        than v2.18 has none of them; then this computer's own are kept."""
+        if "subtasks" not in remote_task:
+            return {k: local_task.get(k, default) for k, default in
+                    (("month_day", None), ("due_date", None), ("note", ""), ("subtasks", []))}
+        subtasks = remote_task.get("subtasks")
+        return {
+            "month_day": remote_task.get("month_day"),
+            "due_date": remote_task.get("due_date"),
+            "note": remote_task.get("note") or "",
+            "subtasks": [{"id": str(s.get("id")), "text": str(s.get("text", "")), "done": bool(s.get("done"))}
+                         for s in subtasks if isinstance(s, dict) and s.get("id")]
+            if isinstance(subtasks, list) else [],
+        }
 
     def _remote_reminder_fields(self, remote_task, local_task):
         """Every-N-hours and snooze for a task from a pull. A v2.17 cloud

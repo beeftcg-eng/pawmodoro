@@ -1,8 +1,8 @@
 // sw.js - Minimal service worker. Only caches the static app shell (not
 // Supabase data) so the page installs cleanly as a PWA and reloads a
 // touch faster; it does not provide real offline data access.
-const CACHE = "pawmodoro-shell-v19";
-const SHELL = ["./", "index.html", "style.css?v=19", "app.js?v=19", "manifest.json"];
+const CACHE = "pawmodoro-shell-v20";
+const SHELL = ["./", "index.html", "style.css?v=20", "app.js?v=20", "manifest.json"];
 
 self.addEventListener("install", event => {
   event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL)));

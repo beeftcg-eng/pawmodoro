@@ -6,8 +6,10 @@ picking are easy to reason about (and change) on their own.
 import random
 from datetime import timedelta
 
+import task_dates
+
 XP_PER_WORK_SESSION = 20
-XP_PER_TASK = {"daily": 10, "weekly": 15, "once": 25, "weekday": 15}
+XP_PER_TASK = {"daily": 10, "weekly": 15, "once": 25, "weekday": 15, "monthly": 20}
 QUEST_BONUS_XP = 30
 ALL_QUESTS_BONUS_XP = 50
 QUESTS_PER_DAY = 3
@@ -133,11 +135,12 @@ def generate_weekly_quests(week_start_iso, count=QUESTS_PER_WEEK):
     ]
 
 
-def task_already_awarded(recurrence, awarded_on, today):
+def task_already_awarded(recurrence, awarded_on, today, month_day=None):
     """A task pays out XP / quest progress only the first time it's
     completed in its period, so un-checking and re-checking it can't be
     farmed: a "once" task pays out ever, a "weekly" task once per quest
-    week, everything else (daily / specific-day) once per day.
+    week, a "monthly" one once per month (since its day last came round),
+    everything else (daily / specific-day) once per day.
     `awarded_on` is an ISO date string (or None); `today` is a date.
     Mirrored by complete_task() in supabase/schema.sql."""
     if not awarded_on:
@@ -146,6 +149,8 @@ def task_already_awarded(recurrence, awarded_on, today):
         return True
     if recurrence == "weekly":
         return awarded_on >= week_start_for(today).isoformat()
+    if recurrence == "monthly":
+        return awarded_on >= task_dates.month_occurrence(month_day or 1, today).isoformat()
     return awarded_on == today.isoformat()
 
 

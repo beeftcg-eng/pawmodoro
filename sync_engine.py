@@ -251,7 +251,14 @@ class SyncEngine:
         if name == "set_notes":
             self._save_page_checked(self.storage.MAIN_NOTES_PAGE, None, a["text"])
         elif name == "add_task":
-            c.add_task(a["text"], a["recurrence"], a.get("reminder_time"), a.get("source", "checklist"), a["id"])
+            c.add_task(a["text"], a["recurrence"], a.get("reminder_time"), a.get("source", "checklist"), a["id"],
+                       a.get("month_day"), a.get("due_date"))
+        elif name == "set_task_due_date":
+            self._new_in_schema(lambda: c.set_task_due_date(a["id"], a["due_date"]))
+        elif name == "set_task_details":
+            self._new_in_schema(lambda: c.set_task_details(a["id"], a["note"], a["subtasks"]))
+        elif name == "set_subtask_done":
+            self._new_in_schema(lambda: c.set_subtask_done(a["id"], a["sub_id"], a["done"]))
         elif name == "remove_task":
             c.remove_task(a["id"])
         elif name == "rename_task":
@@ -267,9 +274,9 @@ class SyncEngine:
                 # Cloud older than v2.17: it only knows a daily time.
                 c.set_task_reminder(a["id"], None if a.get("every_h") else a.get("reminder_time"))
         elif name == "snooze_task":
-            self._new_in_v217(lambda: c.snooze_task(a["id"], a["until"]))
+            self._new_in_schema(lambda: c.snooze_task(a["id"], a["until"]))
         elif name == "set_reminder_settings":
-            self._new_in_v217(lambda: c.set_reminder_settings(a["quiet_enabled"], a["quiet_start"], a["quiet_end"]))
+            self._new_in_schema(lambda: c.set_reminder_settings(a["quiet_enabled"], a["quiet_start"], a["quiet_end"]))
         elif name == "reorder_tasks":
             c.reorder_tasks(a["ids"])
         elif name == "complete_task":
@@ -299,7 +306,7 @@ class SyncEngine:
         else:
             print(f"[sync] unknown queued operation {name!r}; dropping it")
 
-    def _new_in_v217(self, call):
+    def _new_in_schema(self, call):
         """Something an older cloud schema simply doesn't have (it stays on
         this computer): skip it rather than hold up the queue."""
         try:

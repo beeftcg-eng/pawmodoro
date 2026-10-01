@@ -99,6 +99,89 @@ test("setting 'every 6 hours' calls set_task_reminder_mode", async () => {
   } finally { app.close(); }
 });
 
+const plain = value => JSON.parse(JSON.stringify(value));
+
+test("adding a monthly task or a dated one-off sends the day / date (and a plain one neither)", async () => {
+  const app = await bootApp();
+  try {
+    app.window.eval('switchTab("checklist")');
+    const doc = app.window.document;
+    const add = async (text, repeat, setPicker) => {
+      doc.getElementById("task-text").value = text;
+      const select = doc.getElementById("task-recurrence");
+      select.value = repeat;
+      select.dispatchEvent(new app.window.Event("change"));
+      setPicker?.();
+      doc.getElementById("task-add").click();
+      await settle();
+      return plain(app.calls.filter(c => c.name === "add_task").at(-1).params);
+    };
+    assert.equal(doc.getElementById("task-month-day").hidden, true);
+    const monthly = await add("Rent", "monthly", () => { doc.getElementById("task-month-day").value = "31"; });
+    assert.equal(monthly.p_month_day, 31);
+    assert.equal("p_due_date" in monthly, false);
+    const dated = await add("Taxes", "once", () => { doc.getElementById("task-due-date").value = "2026-10-15"; });
+    assert.equal(dated.p_due_date, "2026-10-15");
+    const daily = await add("Walk", "daily");
+    assert.deepEqual(Object.keys(daily).sort(), ["p_recurrence", "p_reminder_time", "p_text"]);
+  } finally { app.close(); }
+});
+
+test("overdue one-offs, monthly tasks and steps show in the list", async () => {
+  const app = await bootApp();
+  try {
+    app.state.checklist.push(
+      { id: "t3", text: "Taxes", recurrence: "once", due_date: "2020-01-01", completed_today: false, source: "checklist",
+        note: "receipts in the drawer", subtasks: [{ id: "a", text: "Find receipts", done: true }, { id: "b", text: "File", done: false }] },
+      { id: "t4", text: "Rent", recurrence: "monthly", month_day: 1, completed_today: false, source: "checklist", subtasks: [] });
+    app.window.eval('switchTab("checklist")');
+    const rows = app.window.document.querySelectorAll("#task-list .task-item");
+    assert.match(rows[2].className, /due-overdue/);
+    assert.match(rows[2].textContent, /⚠ Taxes/);
+    assert.match(rows[2].textContent, /☑ 1\/2/);
+    assert.match(rows[3].textContent, /\[monthly, 1st\]/);
+    assert.equal(rows[2].querySelector(".task-details").hidden, true);
+    rows[2].querySelector(".details-btn").click();
+    assert.equal(rows[2].querySelector(".task-details").hidden, false);
+  } finally { app.close(); }
+});
+
+test("ticking a step, adding one, and editing the note", async () => {
+  const app = await bootApp();
+  try {
+    app.state.checklist.push(
+      { id: "t3", text: "Taxes", recurrence: "once", due_date: null, completed_today: false, source: "checklist",
+        note: "", subtasks: [{ id: "a", text: "Find receipts", done: false }] });
+    app.window.eval('switchTab("checklist")');
+    const row = () => app.window.document.querySelectorAll("#task-list .task-item")[2];
+    row().querySelector(".details-btn").click();
+    const tick = row().querySelector(".subtask input");
+    tick.checked = true;
+    tick.dispatchEvent(new app.window.Event("change"));
+    await settle();
+    assert.deepEqual(plain(app.calls.find(c => c.name === "set_subtask_done").params),
+      { p_task_id: "t3", p_sub_id: "a", p_done: true });
+    assert.equal(row().querySelector(".task-details").hidden, false, "the panel stays open after a re-render");
+    row().querySelector(".subtask-text").value = "File it";
+    row().querySelector(".subtask-add-btn").click();
+    await settle();
+    const added = plain(app.calls.filter(c => c.name === "set_task_details").at(-1).params);
+    assert.deepEqual(added.p_subtasks.map(s => s.text), ["Find receipts", "File it"]);
+    assert.equal(added.p_subtasks[0].id, "a");
+    const note = row().querySelector(".task-note");
+    note.value = "by the 15th";
+    note.dispatchEvent(new app.window.Event("change"));
+    await settle();
+    assert.equal(app.calls.filter(c => c.name === "set_task_details").at(-1).params.p_note, "by the 15th");
+    const due = row().querySelector(".task-due");
+    due.value = "2026-11-02";
+    due.dispatchEvent(new app.window.Event("change"));
+    await settle();
+    assert.deepEqual(plain(app.calls.find(c => c.name === "set_task_due_date").params),
+      { p_task_id: "t3", p_due_date: "2026-11-02" });
+  } finally { app.close(); }
+});
+
 test("an older cloud falls back to a plain daily time", async () => {
   const missing = { data: null, error: { code: "PGRST202", message: "Could not find the function" } };
   const app = await bootApp({ set_task_reminder_mode: () => missing });

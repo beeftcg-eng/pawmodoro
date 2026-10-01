@@ -11,6 +11,8 @@ from datetime import date
 
 from PyQt6.QtGui import QTextDocument
 
+import task_dates
+
 WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 DATA_NAME = "pawmodoro-data.json"
 
@@ -36,7 +38,8 @@ def checklist_markdown(tasks):
         if task.get("source") == "wishlist":
             continue
         box = "x" if task.get("completed_today") else " "
-        when = WEEKDAYS[task["weekday"]] if task["recurrence"] == "weekday" and task.get("weekday") is not None else task["recurrence"]
+        when = (WEEKDAYS[task["weekday"]] if task["recurrence"] == "weekday" and task.get("weekday") is not None
+                else task_dates.describe(task))
         extra = [when]
         if task.get("reminder_every_h"):
             extra.append(f"reminder every {task['reminder_every_h']}h")
@@ -45,6 +48,10 @@ def checklist_markdown(tasks):
         if task.get("focus_pomodoros"):
             extra.append(f"{task['focus_pomodoros']} pomodoros")
         lines.append(f"- [{box}] {task['text']} ({', '.join(extra)})")
+        for sub in task.get("subtasks") or []:
+            lines.append(f"    - [{'x' if sub.get('done') else ' '}] {sub['text']}")
+        for line in (task.get("note") or "").strip().splitlines():
+            lines.append(f"    > {line}")
     wishlist = [t for t in tasks if t.get("source") == "wishlist"]
     if wishlist:
         lines += ["", "## Card wishlist", ""]

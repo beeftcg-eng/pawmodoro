@@ -27,6 +27,10 @@ if something fails.
 - [ ] Play something on music.youtube.com in Edge or Chrome. Within a few seconds the player bar shows the track; play/pause and next work.
 - [ ] Same with the window closed to the tray and then reopened: the track shows up again within a couple of seconds.
 
+## Timer
+
+- [ ] Start a work session, leave the mouse and keyboard alone for 6 minutes (the default pause is after 5). The timer pauses with a "Paused: no keyboard or mouse for 5 min" banner and a notification, and the time away is added back. **I was here — count it** resumes with that time counted.
+
 ## Keyboard and menus
 
 - [ ] Ctrl+1 to Ctrl+5 switch tabs; Ctrl+P starts/pauses the timer; Ctrl+T jumps to a new checklist task; Ctrl+N asks for a new notes page.

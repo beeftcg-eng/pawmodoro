@@ -88,7 +88,7 @@ create table if not exists checklist_tasks (
   id text primary key default encode(gen_random_bytes(6), 'hex'),
   user_id uuid not null references auth.users(id) on delete cascade,
   text text not null,
-  recurrence text not null check (recurrence in ('daily', 'weekly', 'once')),
+  recurrence text not null check (recurrence in ('daily', 'weekly', 'once', 'monthly')),
   last_completed date,
   completed_today boolean not null default false,
   reminder_time text,
@@ -137,6 +137,19 @@ alter table app_state add column if not exists quiet_enabled boolean not null de
 alter table app_state add column if not exists quiet_start text not null default '22:00';
 alter table app_state add column if not exists quiet_end text not null default '08:00';
 alter table app_state add column if not exists notes_rev int not null default 0;
+-- v2.18: monthly tasks (on month_day; a month too short uses its last day),
+-- a due date on one-off tasks, and a note plus subtasks ([{id, text, done}])
+-- on any task.
+alter table checklist_tasks add column if not exists month_day int;
+alter table checklist_tasks add column if not exists due_date date;
+alter table checklist_tasks add column if not exists note text not null default '';
+alter table checklist_tasks add column if not exists subtasks jsonb not null default '[]'::jsonb;
+alter table checklist_tasks drop constraint if exists checklist_tasks_recurrence_check;
+alter table checklist_tasks add constraint checklist_tasks_recurrence_check
+  check (recurrence in ('daily', 'weekly', 'once', 'monthly'));
+alter table checklist_tasks drop constraint if exists checklist_tasks_month_day_check;
+alter table checklist_tasks add constraint checklist_tasks_month_day_check
+  check ((recurrence = 'monthly') = (month_day is not null) and (month_day is null or month_day between 1 and 31));
 
 -- One row per user per local day: feeds the Progress tab's history chart and
 -- the household "this week" totals.
@@ -295,6 +308,23 @@ $$;
 create or replace function week_start_for(d date) returns date
 language sql immutable as $$
   select d - ((((extract(dow from d)::int + 6) % 7) - 1 + 7) % 7);
+$$;
+
+-- The most recent day on or before p_today that a monthly personal task (on
+-- day p_month_day; a month too short uses its last day) came due. Mirrors
+-- task_dates.month_occurrence() (and shared_last_occurrence's monthly rule).
+create or replace function month_occurrence(p_month_day int, p_today date) returns date
+language plpgsql immutable set search_path = public, extensions as $$
+declare
+  this_first date := date_trunc('month', p_today::timestamp)::date;
+  prev_first date := (date_trunc('month', p_today::timestamp) - interval '1 month')::date;
+  candidate date := this_first + (least(p_month_day, (this_first + interval '1 month - 1 day')::date - this_first + 1) - 1);
+begin
+  if candidate <= p_today then
+    return candidate;
+  end if;
+  return prev_first + (least(p_month_day, this_first - prev_first) - 1);
+end;
 $$;
 
 -- "Today" for this user, at THEIR local midnight rather than the server's
@@ -578,7 +608,7 @@ begin
   perform ensure_daily_quests();
   perform ensure_weekly_quests();
 
-  task_xp := case p_recurrence when 'daily' then 10 when 'weekly' then 15 when 'once' then 25 else 10 end;
+  task_xp := case p_recurrence when 'daily' then 10 when 'weekly' then 15 when 'once' then 25 when 'monthly' then 20 else 10 end;
 
   perform bump_streak();
   update app_state set total_tasks = total_tasks + 1, updated_at = now() where user_id = auth.uid();
@@ -615,14 +645,14 @@ begin
   perform ensure_daily_quests();
   perform ensure_weekly_quests();
   update app_state set total_tasks = greatest(0, total_tasks - 1), updated_at = now() where user_id = auth.uid();
-  perform add_xp(-case p_recurrence when 'daily' then 10 when 'weekly' then 15 when 'once' then 25 else 10 end);
+  perform add_xp(-case p_recurrence when 'daily' then 10 when 'weekly' then 15 when 'once' then 25 when 'monthly' then 20 else 10 end);
   return jsonb_build_object('completed_quests', '[]'::jsonb);
 end;
 $$;
 
 -- Ticks (or un-ticks) a task. A task pays out XP/quest progress only the
 -- FIRST time it's completed in its period (once: ever; weekly: per quest
--- week; daily: per day) and un-ticking never takes XP back -- so
+-- week; monthly: since its day last came round; daily: per day) and un-ticking never takes XP back -- so
 -- check/uncheck/check can't be farmed. Mirrors Storage.set_task_done and
 -- gamification.task_already_awarded.
 create or replace function complete_task(p_task_id text, p_done boolean) returns jsonb
@@ -640,6 +670,7 @@ begin
   already := case t.recurrence
     when 'once' then t.awarded_on is not null
     when 'weekly' then t.awarded_on is not null and t.awarded_on >= week_start_for(today)
+    when 'monthly' then t.awarded_on is not null and t.awarded_on >= month_occurrence(t.month_day, today)
     else t.awarded_on is not null and t.awarded_on = today
   end;
   if already then
@@ -653,15 +684,21 @@ $$;
 
 -- Daily tasks un-check at the start of each (local) day; weekly tasks
 -- un-check when the quest week rolls over (Tuesday), the same reset as the
--- weekly quests. Mirrors Storage._roll_recurring_tasks.
+-- weekly quests; monthly ones when their day of the month comes round. A
+-- task that resets un-ticks its subtasks too. Mirrors
+-- Storage._roll_recurring_tasks.
 create or replace function roll_recurring_tasks() returns void
 language sql security invoker set search_path = public, extensions as $$
-  update checklist_tasks set completed_today = false
+  update checklist_tasks set completed_today = false,
+    subtasks = coalesce((select jsonb_agg(case when jsonb_typeof(s) = 'object' then s || '{"done": false}'::jsonb else s end
+                                          order by i)
+                         from jsonb_array_elements(subtasks) with ordinality as x(s, i)), '[]'::jsonb)
   where user_id = auth.uid()
     and completed_today = true
     and (
       (recurrence = 'daily' and last_completed is distinct from user_today())
       or (recurrence = 'weekly' and (last_completed is null or last_completed < week_start_for(user_today())))
+      or (recurrence = 'monthly' and (last_completed is null or last_completed < month_occurrence(month_day, user_today())))
     );
 $$;
 
@@ -735,9 +772,15 @@ $$;
 -- p_id lets the desktop app (which queues edits made offline) create a task
 -- under the id it already gave it locally; calling again with an id that
 -- exists just returns the existing row, so a retried request is harmless.
--- The old 4-argument version is dropped so the two can't be ambiguous.
+-- The older versions are dropped so they can't be ambiguous with this one.
+-- v2.18: p_month_day (monthly tasks) and p_due_date (one-off tasks); the
+-- one that doesn't apply to p_recurrence is ignored.
+drop function if exists add_task(text, text, text);  -- from before p_source; clashed with the phone's 3-argument call
 drop function if exists add_task(text, text, text, text);
-create or replace function add_task(p_text text, p_recurrence text, p_reminder_time text default null, p_source text default 'checklist', p_id text default null)
+drop function if exists add_task(text, text, text, text, text);
+create or replace function add_task(p_text text, p_recurrence text, p_reminder_time text default null,
+                                    p_source text default 'checklist', p_id text default null,
+                                    p_month_day int default null, p_due_date date default null)
 returns checklist_tasks
 language plpgsql security invoker set search_path = public, extensions as $$
 declare
@@ -751,11 +794,62 @@ begin
     end if;
   end if;
   select coalesce(max(sort_order), 0) + 1 into next_order from checklist_tasks where user_id = auth.uid();
-  insert into checklist_tasks (id, user_id, text, recurrence, reminder_time, sort_order, source)
-    values (coalesce(p_id, encode(gen_random_bytes(6), 'hex')), auth.uid(), p_text, p_recurrence, p_reminder_time, next_order, p_source)
+  if p_recurrence = 'monthly' and (p_month_day is null or p_month_day not between 1 and 31) then
+    raise exception 'a monthly task needs a day of the month (1-31)';
+  end if;
+  insert into checklist_tasks (id, user_id, text, recurrence, reminder_time, sort_order, source, month_day, due_date)
+    values (coalesce(p_id, encode(gen_random_bytes(6), 'hex')), auth.uid(), p_text, p_recurrence, p_reminder_time, next_order, p_source,
+            case when p_recurrence = 'monthly' then p_month_day end,
+            case when p_recurrence = 'once' then p_due_date end)
     returning * into t;
   return t;
 end;
+$$;
+
+-- v2.18: a one-off task's due date (null clears it). A daily-time reminder
+-- may fire again on the new date.
+create or replace function set_task_due_date(p_task_id text, p_due_date date) returns void
+language sql security invoker set search_path = public, extensions as $$
+  update checklist_tasks set due_date = p_due_date, last_reminded = null, push_reminded_on = null
+  where id = p_task_id and user_id = auth.uid() and recurrence = 'once';
+$$;
+
+-- v2.18: a task's note and its subtasks, in order: p_subtasks is
+-- [{id, text}]. Each subtask keeps the done flag it already had (ticks go
+-- through set_subtask_done, so two devices ticking different steps can't
+-- undo each other); a new one starts unticked.
+create or replace function set_task_details(p_task_id text, p_note text, p_subtasks jsonb) returns void
+language plpgsql security invoker set search_path = public, extensions as $$
+begin
+  if jsonb_typeof(p_subtasks) is distinct from 'array' or jsonb_array_length(p_subtasks) > 100 then
+    raise exception 'subtasks must be a list of at most 100';
+  end if;
+  if length(coalesce(p_note, '')) > 20000 then
+    raise exception 'note too long';
+  end if;
+  update checklist_tasks t set
+    note = coalesce(p_note, ''),
+    subtasks = coalesce((
+      select jsonb_agg(jsonb_build_object(
+               'id', left(n->>'id', 64),
+               'text', left(coalesce(n->>'text', ''), 500),
+               'done', coalesce((select (o->>'done')::boolean from jsonb_array_elements(t.subtasks) o
+                                 where jsonb_typeof(o) = 'object' and o->>'id' = n->>'id' limit 1), false))
+             order by i)
+      from jsonb_array_elements(p_subtasks) with ordinality as x(n, i)
+      where jsonb_typeof(n) = 'object' and coalesce(n->>'id', '') <> ''), '[]'::jsonb)
+  where t.id = p_task_id and t.user_id = auth.uid();
+end;
+$$;
+
+-- v2.18: ticks or un-ticks one subtask.
+create or replace function set_subtask_done(p_task_id text, p_sub_id text, p_done boolean) returns void
+language sql security invoker set search_path = public, extensions as $$
+  update checklist_tasks set subtasks = (
+      select jsonb_agg(case when jsonb_typeof(s) = 'object' and s->>'id' = p_sub_id
+                            then s || jsonb_build_object('done', p_done) else s end order by i)
+      from jsonb_array_elements(subtasks) with ordinality as x(s, i))
+  where id = p_task_id and user_id = auth.uid() and jsonb_array_length(subtasks) > 0;
 $$;
 
 create or replace function rename_task(p_task_id text, p_text text) returns void
@@ -1327,13 +1421,28 @@ $$;
 -- Whether a personal checklist task counts as done on local day d, judged
 -- the way roll_recurring_tasks() would: nobody may have opened the app (and
 -- so rolled the tasks over) since midnight.
-create or replace function checklist_done_on(p_completed boolean, p_recurrence text, p_last date, d date)
+drop function if exists checklist_done_on(boolean, text, date, date);
+create or replace function checklist_done_on(p_completed boolean, p_recurrence text, p_last date, d date,
+                                             p_month_day int default null)
 returns boolean language sql immutable set search_path = public, extensions as $$
   select p_completed and (
     p_recurrence = 'once'
     or (p_recurrence = 'daily' and p_last = d)
     or (p_recurrence = 'weekly' and p_last >= week_start_for(d))
+    or (p_recurrence = 'monthly' and p_last >= month_occurrence(coalesce(p_month_day, 1), d))
   );
+$$;
+
+-- Whether a task's reminders may go out on local day d (mirrors
+-- task_dates.reminds_today): a monthly task only on its day, a one-off with
+-- a due date not before that date.
+create or replace function task_reminds_on(p_recurrence text, p_month_day int, p_due_date date, d date)
+returns boolean language sql immutable set search_path = public, extensions as $$
+  select case
+    when p_recurrence = 'monthly' then month_occurrence(coalesce(p_month_day, 1), d) = d
+    when p_recurrence = 'once' and p_due_date is not null then p_due_date <= d
+    else true
+  end;
 $$;
 
 -- Quiet hours (mirrors Storage._in_quiet_hours): "HH:MM" strings, a window
@@ -1376,6 +1485,7 @@ begin
       case
         when t.snoozed_until is not null and t.snoozed_until <= now() then 'snooze'
         when t.snoozed_until is not null then null  -- snoozed: its other reminders wait
+        when not task_reminds_on(t.recurrence, t.month_day, t.due_date, p.ts::date) then null
         when t.reminder_every_h is not null then
           case when now() - coalesce(t.push_last_at, t.created_at) >= t.reminder_every_h * interval '1 hour'
                     and not in_quiet_hours(p.quiet_enabled, p.quiet_start, p.quiet_end, to_char(p.ts, 'HH24:MI'))
@@ -1387,7 +1497,7 @@ begin
     from checklist_tasks t join people p on p.user_id = t.user_id
     where t.source = 'checklist'
       and (t.push_claimed_at is null or t.push_claimed_at < stale)
-      and not checklist_done_on(t.completed_today, t.recurrence, t.last_completed, p.ts::date)
+      and not checklist_done_on(t.completed_today, t.recurrence, t.last_completed, p.ts::date, t.month_day)
   ),
   claimed as (
     update checklist_tasks t set push_claimed_at = now()
@@ -2152,3 +2262,7 @@ end;
 $$;
 
 grant execute on function deckbuilder_report_bug(text, text, jsonb) to anon, authenticated;
+
+-- Tell PostgREST to re-read the functions now, rather than whenever its
+-- cache next refreshes (a dropped overload would linger until then).
+notify pgrst, 'reload schema';

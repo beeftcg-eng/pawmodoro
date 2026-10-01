@@ -204,6 +204,19 @@ html, body {
 .reminder-edit input[type="time"], .reminder-edit select { font: inherit; padding: 4px; }
 .reminder-edit input[type="number"] { font: inherit; padding: 4px; width: 4em; }
 .reminder-edit [hidden] { display: none; }
+.task-item.due-overdue > label span { color: #d9453b; font-weight: bold; }
+.task-item.due-today > label span { font-weight: bold; }
+.task-details { flex-basis: 100%; display: flex; flex-direction: column; gap: 6px; padding: 8px 0 0 28px; }
+.task-details[hidden] { display: none; }
+.task-details .due-row { display: flex; align-items: center; gap: 8px; color: var(--ink-soft); font-size: 14px; }
+.task-details input, .task-details textarea { font: inherit; padding: 4px; }
+.task-details textarea { width: 100%; box-sizing: border-box; resize: vertical; }
+.subtask-list { list-style: none; padding: 0; margin: 0; }
+.subtask { display: flex; align-items: center; justify-content: space-between; padding: 2px 0; }
+.subtask label { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; }
+.subtask.done span { color: var(--ink-soft); text-decoration: line-through; }
+.subtask-add { display: flex; gap: 6px; }
+.subtask-add input { flex: 1; min-width: 0; }
 .rename-btn { background: none; border: none; color: var(--ink-soft); font-size: 15px; flex-shrink: 0; padding: 0 6px; }
 .reorder-col { display: flex; flex-direction: column; margin-right: 6px; flex-shrink: 0; }
 .reorder-btn {

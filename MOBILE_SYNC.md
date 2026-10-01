@@ -90,6 +90,13 @@ function checks, and the old job would be turned away. If you use phone
 push, redeploy the function first (`supabase functions deploy
 send-reminders`, or the **Deploy push function** GitHub workflow).
 
+**v2.18.0** adds monthly tasks, due dates on one-off tasks, and a note and
+steps (subtasks) on any task. Re-run `schema.sql` only (`push_reminders.sql`
+and the push function are unchanged). Until you do, tasks without these
+sync as before; adding a monthly task or a dated one waits in the upload
+queue (the ☁️ Sync button says the schema needs updating), and notes and
+steps stay on the computer they were made on.
+
 ## Phone reminders with the app closed (v2.16.0, optional)
 
 The phone app can receive your checklist's daily 🔔 reminders as real
