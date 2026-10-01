@@ -13,16 +13,18 @@ app's card wishlist — same tab, same underlying checklist_tasks table,
 kept apart by a "source" field so it neither mixes into the regular
 list nor counts toward the "clear your whole checklist" quest.
 """
+import html
 from datetime import date
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem,
     QPushButton, QLineEdit, QComboBox, QLabel, QTimeEdit, QSpinBox, QAbstractItemView,
-    QInputDialog
+    QInputDialog, QCheckBox, QFrame
 )
 from PyQt6.QtCore import Qt, QTime, QTimer, pyqtSignal
 
 import quotes
+import theme
 
 WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
@@ -37,6 +39,30 @@ class ChecklistTab(QWidget):
 
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("Recurring checklist"))
+
+        # Shown when a reminder fires, so it can be dealt with right here:
+        # the desktop notification itself can't carry buttons on every
+        # platform. Reminders that fire while one is showing queue up.
+        self._due_reminders = []  # task ids, oldest first
+        self.reminder_banner = QFrame()
+        self.reminder_banner.setObjectName("reminder_banner")
+        banner_layout = QVBoxLayout(self.reminder_banner)
+        banner_layout.setContentsMargins(8, 6, 8, 6)
+        self.reminder_banner_label = QLabel("")
+        self.reminder_banner_label.setWordWrap(True)
+        banner_layout.addWidget(self.reminder_banner_label)
+        banner_buttons = QHBoxLayout()
+        for text, handler in (("✅ Done", self._banner_done),
+                              ("Snooze 15 min", lambda: self._banner_snooze(15)),
+                              ("Snooze 1 h", lambda: self._banner_snooze(60)),
+                              ("Dismiss", self._banner_dismiss)):
+            btn = QPushButton(text)
+            btn.clicked.connect(handler)
+            banner_buttons.addWidget(btn)
+        banner_buttons.addStretch()
+        banner_layout.addLayout(banner_buttons)
+        self.reminder_banner.setVisible(False)
+        layout.addWidget(self.reminder_banner)
 
         self.list_widget = QListWidget()
         self.list_widget.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
@@ -77,6 +103,26 @@ class ChecklistTab(QWidget):
         reminder_row.addStretch()
 
         layout.addLayout(reminder_row)
+
+        quiet_row = QHBoxLayout()
+        reminders = self.storage.get_reminder_settings()
+        self.quiet_check = QCheckBox("\U0001F319 Quiet hours for repeating reminders:")
+        self.quiet_check.setToolTip(
+            "\"Every N hours\" reminders wait until the quiet hours end, then remind you once")
+        self.quiet_check.setChecked(bool(reminders.get("quiet_enabled")))
+        quiet_row.addWidget(self.quiet_check)
+        self.quiet_start_edit = QTimeEdit(QTime.fromString(reminders.get("quiet_start", "22:00"), "HH:mm"))
+        self.quiet_start_edit.setDisplayFormat("HH:mm")
+        quiet_row.addWidget(self.quiet_start_edit)
+        quiet_row.addWidget(QLabel("to"))
+        self.quiet_end_edit = QTimeEdit(QTime.fromString(reminders.get("quiet_end", "08:00"), "HH:mm"))
+        self.quiet_end_edit.setDisplayFormat("HH:mm")
+        quiet_row.addWidget(self.quiet_end_edit)
+        quiet_row.addStretch()
+        self.quiet_check.toggled.connect(self._save_quiet_hours)
+        self.quiet_start_edit.timeChanged.connect(self._save_quiet_hours)
+        self.quiet_end_edit.timeChanged.connect(self._save_quiet_hours)
+        layout.addLayout(quiet_row)
 
         add_row = QHBoxLayout()
         self.text_input = QLineEdit()
@@ -150,6 +196,7 @@ class ChecklistTab(QWidget):
         self.wishlist_list_widget.itemChanged.connect(self._on_item_changed)
         self.wishlist_list_widget.model().rowsMoved.connect(self._on_wishlist_rows_moved)
         self.refresh()
+        self.refresh_theme()
 
     def _on_reminder_mode_changed(self, index=None):
         interval = self.reminder_mode_box.currentData() == "interval"
@@ -166,11 +213,14 @@ class ChecklistTab(QWidget):
         # only rebuild when something visible actually changed.
         signature = [
             (t["id"], t["text"], t["recurrence"], t.get("weekday"), t.get("reminder_time"), t.get("reminder_every_h"),
+             t.get("snoozed_until"), t.get("focus_pomodoros", 0),
              bool(t.get("completed_today")), t.get("source"))
             for t in tasks
         ]
         if not force and signature == self._last_signature:
             return
+        if self._due_reminders:
+            QTimer.singleShot(0, self._refresh_banner)
         self._last_signature = signature
         selected = {
             widget: (widget.currentItem().data(Qt.ItemDataRole.UserRole) if widget.currentItem() else None)
@@ -193,6 +243,10 @@ class ChecklistTab(QWidget):
                 label += f"  \U0001F514 every {task['reminder_every_h']}h"
             elif task.get("reminder_time"):
                 label += f"  \U0001F514 {task['reminder_time']}"
+            if task.get("snoozed_until"):
+                label += f"  \U0001F4A4 {task['snoozed_until'][11:16]}"
+            if task.get("focus_pomodoros"):
+                label += f"  \U0001F345 {task['focus_pomodoros']}"
             item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, task["id"])
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
@@ -333,6 +387,81 @@ class ChecklistTab(QWidget):
         task_id = item.data(Qt.ItemDataRole.UserRole)
         self.storage.set_task_reminder(task_id, None)
         self.refresh()
+
+    def refresh_theme(self):
+        p = theme.current()
+        self.reminder_banner.setStyleSheet(
+            f"QFrame#reminder_banner {{ background: {p['PAPER_LIGHT']}; border: 2px solid {p['ACCENT']};"
+            f" border-radius: 8px; }}"
+            f"QFrame#reminder_banner QLabel {{ color: {p['INK']}; }}"
+        )
+
+    def _save_quiet_hours(self, *_):
+        self.storage.set_reminder_settings(
+            quiet_enabled=self.quiet_check.isChecked(),
+            quiet_start=self.quiet_start_edit.time().toString("HH:mm"),
+            quiet_end=self.quiet_end_edit.time().toString("HH:mm"),
+        )
+
+    def select_task(self, task_id):
+        for row in range(self.list_widget.count()):
+            if self.list_widget.item(row).data(Qt.ItemDataRole.UserRole) == task_id:
+                self.list_widget.setCurrentRow(row)
+                self.list_widget.scrollToItem(self.list_widget.item(row))
+                return
+
+    # ---------- Reminder banner ----------
+    def show_reminder(self, task_id):
+        if task_id in self._due_reminders:
+            self._due_reminders.remove(task_id)
+        self._due_reminders.append(task_id)
+        self._refresh_banner()
+
+    def _banner_task(self):
+        """The task the banner is about, dropping ids whose task is gone or
+        was ticked off in the meantime (here, in the widget, on the phone)."""
+        while self._due_reminders:
+            task = next((t for t in self.storage.get_checklist() if t["id"] == self._due_reminders[-1]), None)
+            if task is not None and not task.get("completed_today"):
+                return task
+            self._due_reminders.pop()
+        return None
+
+    def _refresh_banner(self):
+        task = self._banner_task()
+        self.reminder_banner.setVisible(task is not None)
+        if task is None:
+            return
+        more = len(self._due_reminders) - 1
+        text = f"\U0001F514 Reminder: <b>{html.escape(task['text'])}</b>"
+        if more:
+            text += f"  (+{more} more)"
+        self.reminder_banner_label.setText(text)
+
+    def _banner_done(self):
+        task = self._banner_task()
+        if task is not None:
+            self._due_reminders.pop()
+            # Same path as ticking the box (XP, quests, celebration).
+            for row in range(self.list_widget.count()):
+                item = self.list_widget.item(row)
+                if item.data(Qt.ItemDataRole.UserRole) == task["id"]:
+                    item.setCheckState(Qt.CheckState.Checked)
+                    break
+        self._refresh_banner()
+
+    def _banner_snooze(self, minutes):
+        task = self._banner_task()
+        if task is not None:
+            self._due_reminders.pop()
+            self.storage.snooze_task_reminder(task["id"], minutes)
+            self.refresh()
+        self._refresh_banner()
+
+    def _banner_dismiss(self):
+        if self._banner_task() is not None:
+            self._due_reminders.pop()
+        self._refresh_banner()
 
     def pending_tasks(self):
         """Used by widget mode: tasks not yet done today."""

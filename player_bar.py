@@ -30,6 +30,8 @@ from PyQt6.QtCore import Qt, QTimer, QUrl, QSize, pyqtSignal
 from PyQt6.QtGui import QDesktopServices
 
 import platform
+import threading
+import time
 if platform.system() == "Windows":
     import smtc_windows as mpris  # same function names/shapes as mpris.py, see that file
 else:
@@ -40,16 +42,33 @@ import player_icons
 YOUTUBE_MUSIC_URL = "https://music.youtube.com"
 ICON_SIZE = 18
 SPOTIFY_LABEL = "Spotify"
+STATUS_POLL_MS = 1500
+PLAYERS_POLL_SECONDS = 5
+
+
+def run_player_query(fn, done):
+    """Runs a player query off the UI thread on Linux, where every query
+    spawns a playerctl process that can stall for up to its timeout. On
+    Windows SMTC queries are in-process and stay on the calling thread
+    (WinRT from a worker thread hasn't been verified there). `done(result)`
+    must be a signal's emit, so the result lands back on the UI thread."""
+    if platform.system() == "Windows":
+        done(fn())
+    else:
+        threading.Thread(target=lambda: done(fn()), daemon=True).start()
 
 
 class PlayerBar(QWidget):
     _spotify_status_ready = pyqtSignal(object, object)  # (status_dict_or_None, error_or_None)
     _spotify_command_done = pyqtSignal(object)  # error_or_None
+    _poll_done = pyqtSignal(object)  # (players list or None, player, snapshot or None)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.current_player = None
         self.spotify_client = None
+        self._polling = False
+        self._players_polled_at = 0.0
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(12, 6, 12, 6)
@@ -127,19 +146,59 @@ class PlayerBar(QWidget):
 
         outer.addLayout(row2)
 
-        self._players_timer = QTimer(self)
-        self._players_timer.timeout.connect(self._refresh_players)
-        self._players_timer.start(5000)
-
-        self._status_timer = QTimer(self)
-        self._status_timer.timeout.connect(self._refresh_status)
-        self._status_timer.start(1500)
+        # One timer drives both the player list (every few seconds) and the
+        # now-playing status. It does nothing while the bar isn't on screen
+        # (the app sitting in the tray, or widget mode), and showEvent
+        # catches up immediately when it reappears.
+        self._poll_timer = QTimer(self)
+        self._poll_timer.timeout.connect(self._poll)
+        self._poll_timer.start(STATUS_POLL_MS)
 
         self._spotify_status_ready.connect(self._on_spotify_status)
         self._spotify_command_done.connect(self._on_spotify_command_done)
+        self._poll_done.connect(self._on_poll_done)
 
         self.refresh_theme()
-        self._refresh_players()
+        self._poll(force_players=True)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._poll(force_players=True)
+
+    def _poll(self, force_players=False):
+        if self._polling or not self.isVisible():
+            return
+        want_players = force_players or time.monotonic() - self._players_polled_at >= PLAYERS_POLL_SECONDS
+        player = None if self._is_spotify() else self.current_player
+        if not mpris.available():
+            if want_players:
+                self._players_polled_at = time.monotonic()
+                self._apply_players([])
+            self._refresh_status()
+            return
+        if want_players:
+            self._players_polled_at = time.monotonic()
+        self._polling = True
+
+        def query():
+            players = mpris.list_players() if want_players else None
+            # A freshly listed player list may drop the current one; then the
+            # status is fetched after the UI has picked a new player.
+            if player and (players is None or player in players):
+                return players, player, mpris.snapshot(player)
+            return players, player, None
+
+        run_player_query(query, self._poll_done.emit)
+
+    def _on_poll_done(self, result):
+        self._polling = False
+        players, player, snap = result
+        if players is not None:
+            self._apply_players(players)
+        if snap is not None and player == self.current_player:
+            self._apply_snapshot(snap)
+        elif self._is_spotify() or (players is not None and self.current_player != player):
+            self._refresh_status()
 
     def set_spotify_client(self, spotify_client):
         """Called once from main.py; Spotify only appears in the player
@@ -181,12 +240,12 @@ class PlayerBar(QWidget):
             self.spotify_client.run_async(fn, self._spotify_command_done.emit)
         else:
             mpris.command(self.current_player, action)
-            QTimer.singleShot(300, self._refresh_status)
+            QTimer.singleShot(300, self._poll)
 
     def _on_spotify_command_done(self, error):
         if error:
             self.track_label.setText(f"Spotify: {error}")
-        QTimer.singleShot(300, self._refresh_status)
+        QTimer.singleShot(300, self._poll)
 
     def _on_volume_changed(self):
         if not self.current_player:
@@ -222,11 +281,13 @@ class PlayerBar(QWidget):
             mpris.set_loop_status(self.current_player, "Track" if self.loop_btn.isChecked() else "None")
 
     def _refresh_players(self):
+        self._poll(force_players=True)
+
+    def _apply_players(self, mpris_players):
         players = []
         if self.spotify_client is not None and self.spotify_client.is_connected():
             players.append(SPOTIFY_LABEL)
-        if mpris.available():
-            players.extend(mpris.list_players())
+        players.extend(mpris_players)
 
         current_text = self.player_combo.currentText()
 
@@ -295,29 +356,29 @@ class PlayerBar(QWidget):
                 self.spotify_client.get_full_status_async(self._spotify_status_ready.emit)
             return
 
-        status = mpris.status(self.current_player)
-        text, length = mpris.now_playing_bundle(self.current_player)
-        self.track_label.setText(text or status or "Nothing playing")
+        self._poll()
+
+    def _apply_snapshot(self, snap):
+        status = snap["status"]
+        self.track_label.setText(snap["text"] or status or "Nothing playing")
 
         self.play_btn.setProperty("playing", status == "Playing")
         self._update_play_icon()
 
-        pos = mpris.get_position_seconds(self.current_player)
-        self.position_label.setText(f"{mpris.format_seconds(pos)} / {mpris.format_seconds(length)}")
+        self.position_label.setText(
+            f"{mpris.format_seconds(snap['position'])} / {mpris.format_seconds(snap['length'])}")
 
-        vol = mpris.get_volume(self.current_player)
+        vol = snap["volume"]
         if vol is not None and not self.volume_slider.isSliderDown():
             self.volume_slider.blockSignals(True)
             self.volume_slider.setValue(int(vol * 100))
             self.volume_slider.blockSignals(False)
 
-        shuffle = mpris.get_shuffle(self.current_player)
-        if shuffle in ("On", "Off"):
-            self.shuffle_btn.setChecked(shuffle == "On")
+        if snap["shuffle"] in ("On", "Off"):
+            self.shuffle_btn.setChecked(snap["shuffle"] == "On")
 
-        loop = mpris.get_loop_status(self.current_player)
-        if loop in ("None", "Track", "Playlist"):
-            self.loop_btn.setChecked(loop != "None")
+        if snap["loop"] in ("None", "Track", "Playlist"):
+            self.loop_btn.setChecked(snap["loop"] != "None")
 
     def _on_spotify_status(self, status, error):
         if not self._is_spotify():

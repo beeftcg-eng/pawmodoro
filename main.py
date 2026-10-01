@@ -29,6 +29,7 @@ from spotify_client import SpotifyClient
 from toast import CelebrationToast
 from sync_settings_dialog import SyncSettingsDialog
 import notifier
+import paths
 import shared_activity
 import theme
 import update_checker
@@ -179,6 +180,9 @@ class MainWindow(QMainWindow):
         self.sync_status_timer.start(2000)
         self._refresh_sync_status()
 
+        # Off the UI thread and a little after startup: it can be a big tree.
+        QTimer.singleShot(UPDATE_CLEANUP_MS, lambda: threading.Thread(target=paths.remove_legacy_dirs, daemon=True).start())
+
         self._available_update = None
         self._update_check_running = False
         self.update_checked.connect(self._on_update_checked)
@@ -193,6 +197,8 @@ class MainWindow(QMainWindow):
         # changes) each time you switch to it, rather than only on load.
         if self.tabs.widget(index) is self.progress_tab:
             self.progress_tab.refresh(new_quote=True)
+        elif self.tabs.widget(index) is self.pomodoro_tab:
+            self.pomodoro_tab.refresh_focus_tasks()
 
     def _on_remote_pulled(self, remote, household, rev):
         """Runs on the main thread, and is the only place a cloud pull is
@@ -212,6 +218,7 @@ class MainWindow(QMainWindow):
         self._refresh_level_indicator()
         self.widget_window.refresh_tasks()
         self.shared_tab.refresh()
+        self.pomodoro_tab.refresh_focus_tasks()
         notes_tab.maybe_reload_from_remote()
 
     def _notify_shared_activity(self, before_id, before_tasks, household):
@@ -322,11 +329,27 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def _check_reminders(self):
-        for task in self.storage.check_due_reminders():
-            notifier.send("Task reminder", task["text"])
+        due = self.storage.check_due_reminders()
+        for task in due:
+            self.checklist_tab.show_reminder(task["id"])
+            notifier.send("Task reminder", f"{task['text']}\n(click to open it: done or snooze)",
+                          on_click=lambda task_id=task["id"]: self._open_task(task_id))
+        if due:
+            self.checklist_tab.refresh()  # a snooze that just ended drops its 💤
         for task in self.storage.check_due_shared_reminders():
-            notifier.send("Shared list reminder", task["text"])
+            notifier.send("Shared list reminder", task["text"], on_click=self._open_shared_tab)
         self.shared_tab.refresh()  # cheap; picks up "overdue" markers as time passes
+
+    def _open_task(self, task_id):
+        """A reminder notification was clicked: show that task, with the
+        reminder banner's Done/Snooze buttons above the list."""
+        self.restore_from_widget()
+        self.tabs.setCurrentWidget(self.notes_checklist_tab)
+        self.checklist_tab.select_task(task_id)
+
+    def _open_shared_tab(self):
+        self.restore_from_widget()
+        self.tabs.setCurrentWidget(self.shared_tab)
 
     # ---------- Menu ----------
     def _build_menu(self):
@@ -394,6 +417,7 @@ class MainWindow(QMainWindow):
     # ---------- Gamification ----------
     def _on_celebrate(self, title, detail):
         self.toast.show_toast(title, detail)
+        self.checklist_tab.refresh()  # e.g. a focused task's 🍅 count
         self._refresh_level_indicator()
         self.progress_tab.refresh()
         self.widget_window.refresh_tasks()
@@ -494,10 +518,7 @@ class MainWindow(QMainWindow):
         # Closing the main window just tucks it into the tray, it doesn't quit.
         event.ignore()
         self.hide()
-        self.tray.showMessage(
-            "Pawmodoro", "Still running in the tray. Right-click the tray icon to quit.",
-            QSystemTrayIcon.MessageIcon.Information, 3000
-        )
+        notifier.send("Pawmodoro", "Still running in the tray. Right-click the tray icon to quit.")
 
 
 def main():

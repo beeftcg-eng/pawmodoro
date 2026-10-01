@@ -32,3 +32,4 @@ class NotesChecklistTab(QWidget):
 
     def refresh_theme(self):
         self.notes_tab.refresh_theme()
+        self.checklist_tab.refresh_theme()

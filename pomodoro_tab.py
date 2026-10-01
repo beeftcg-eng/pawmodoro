@@ -8,7 +8,7 @@ import time
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QSpinBox,
     QFormLayout, QGroupBox, QSlider, QCheckBox, QFileDialog, QInputDialog,
-    QScrollArea
+    QScrollArea, QComboBox
 )
 from PyQt6.QtCore import QTimer, Qt, QEvent, pyqtSignal
 
@@ -141,6 +141,20 @@ class PomodoroTab(QWidget):
 
         btn_row.addStretch()
         layout.addLayout(btn_row)
+
+        # Optionally attach work sessions to a checklist task: each finished
+        # one adds to that task's 🍅 count (shown in the checklist).
+        focus_row = QHBoxLayout()
+        focus_row.addStretch()
+        focus_row.addWidget(QLabel("Working on:"))
+        self.focus_combo = QComboBox()
+        self.focus_combo.setMinimumWidth(220)
+        self.focus_combo.setToolTip("Finished work sessions are counted on this task (🍅 in the checklist)")
+        self.focus_combo.currentIndexChanged.connect(self._on_focus_task_changed)
+        focus_row.addWidget(self.focus_combo)
+        focus_row.addStretch()
+        layout.addLayout(focus_row)
+        self.refresh_focus_tasks()
 
         # Settings group
         settings_box = QGroupBox("Timer settings (minutes)")
@@ -414,10 +428,14 @@ class PomodoroTab(QWidget):
             long_break = completed and self.sessions_completed % settings["sessions_before_long_break"] == 0
             self.phase = "long_break" if long_break else "short_break"
             if completed:
-                notify("Pomodoro", "Work session done — time for a long break." if long_break
-                       else "Work session done — take a short break.")
+                focus = self.storage.get_focus_task()
+                done_on = f" on “{focus['text']}”" if focus else ""
+                notify("Pomodoro", f"Work session done{done_on} — time for a long break." if long_break
+                       else f"Work session done{done_on} — take a short break.")
                 self._play_chime()
-                result = self.storage.record_pomodoro_completed(settings["work_min"])
+                result = self.storage.record_pomodoro_completed(
+                    settings["work_min"], task_id=focus["id"] if focus else None)
+                self.refresh_focus_tasks()
                 congrats = quotes.random_pomodoro_congrats()
                 self._announce_gamification(result, f"\U0001F43E {congrats}")
         else:
@@ -434,6 +452,30 @@ class PomodoroTab(QWidget):
             self._start()
         else:
             self._sync_ambient_to_phase()
+
+    def refresh_focus_tasks(self):
+        """Fills the "Working on" list with today's pending tasks (plus the
+        chosen one, even once it's ticked off)."""
+        focus = self.storage.get_focus_task()
+        tasks = [t for t in self.storage.get_checklist()
+                 if t.get("source", "checklist") == "checklist"
+                 and (not t.get("completed_today") or (focus and t["id"] == focus["id"]))]
+        self.focus_combo.blockSignals(True)
+        self.focus_combo.clear()
+        self.focus_combo.addItem("Nothing in particular", None)
+        for task in tasks:
+            label = task["text"] if len(task["text"]) <= 40 else task["text"][:39] + "…"
+            if task.get("completed_today"):
+                label = "✓ " + label
+            if task.get("focus_pomodoros"):
+                label += f"  \U0001F345 {task['focus_pomodoros']}"
+            self.focus_combo.addItem(label, task["id"])
+        index = self.focus_combo.findData(focus["id"]) if focus else 0
+        self.focus_combo.setCurrentIndex(max(0, index))
+        self.focus_combo.blockSignals(False)
+
+    def _on_focus_task_changed(self, index):
+        self.storage.set_focus_task(self.focus_combo.itemData(index))
 
     def _play_chime(self):
         if self.storage.get_pomodoro_settings().get("chime", True):

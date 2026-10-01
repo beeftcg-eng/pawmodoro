@@ -32,11 +32,15 @@ BACKUP_REFRESH_SECONDS = 3600
 HISTORY_KEEP_DAYS = 120
 
 DEFAULT_DATA = {
-    "notes": "",
+    "notes": "",  # the main notes page (the one that syncs)
+    "notes_pages": [],  # extra notes pages, desktop-only: list of {id, title, html}
+    "notes_current_page": "main",  # "main" or a notes_pages id
     "checklist": [],  # list of {id, text, recurrence, last_completed, completed_today,
                        #          reminder_time ("HH:MM" or None), last_reminded (date or None),
                        #          awarded_on (date or None), weekday, source,
-                       #          reminder_every_h (int or None), last_reminded_at (datetime or None)}
+                       #          reminder_every_h (int or None), last_reminded_at (datetime or None),
+                       #          snoozed_until (datetime or None), focus_pomodoros, focus_min}
+                       # (the last five are local-only: the cloud never sees them)
     "pomodoro": {
         "work_min": 25,
         "short_break_min": 5,
@@ -46,6 +50,7 @@ DEFAULT_DATA = {
         "auto_start_next": True,   # roll straight into the next phase
         "ambient_auto": False,     # play the ambient mix only during work phases
     },
+    "focus_task": None,  # checklist task id the pomodoro timer is "working on", or None
     "window": {
         "widget_mode": False,
         "widget_x": 100,
@@ -93,6 +98,13 @@ DEFAULT_DATA = {
         "notified_version": None,  # the newest version we've already sent a notification about
     },
     "shared_notify": True,  # notify when another household member adds or completes a shared item (see shared_activity.py)
+    "reminders": {
+        # Repeating ("every N hours") reminders hold off between these times
+        # and catch up once, when the quiet window ends.
+        "quiet_enabled": False,
+        "quiet_start": "22:00",
+        "quiet_end": "08:00",
+    },
     "shared_reminded": {},  # shared task id -> occurrence date its reminder already fired for (local-only)
 }
 
@@ -275,6 +287,80 @@ class Storage:
     def get_notes(self):
         return self.data.get("notes", "")
 
+    # Notes pages: "main" is data["notes"] (synced, what the phone edits);
+    # any others live only in this file.
+    MAIN_NOTES_PAGE = "main"
+
+    def get_note_pages(self):
+        """[{"id", "title"}], the main page first."""
+        return [{"id": self.MAIN_NOTES_PAGE, "title": "Notes"}] + [
+            {"id": p["id"], "title": p["title"]} for p in self.data.get("notes_pages", [])]
+
+    def _find_note_page(self, page_id):
+        return next((p for p in self.data.get("notes_pages", []) if p["id"] == page_id), None)
+
+    def get_page_html(self, page_id):
+        if page_id == self.MAIN_NOTES_PAGE:
+            return self.get_notes()
+        page = self._find_note_page(page_id)
+        return page["html"] if page else ""
+
+    def set_page_html(self, page_id, html):
+        if page_id == self.MAIN_NOTES_PAGE:
+            self.set_notes(html)
+            return
+        page = self._find_note_page(page_id)
+        if page is not None and page["html"] != html:
+            page["html"] = html
+            self.save()
+
+    def add_note_page(self, title):
+        page = {"id": uuid.uuid4().hex[:8], "title": title, "html": ""}
+        self.data.setdefault("notes_pages", []).append(page)
+        self.save()
+        return page["id"]
+
+    def rename_note_page(self, page_id, title):
+        page = self._find_note_page(page_id)
+        if page is not None:
+            page["title"] = title
+            self.save()
+
+    def remove_note_page(self, page_id):
+        """Returns (page, index) for an undo, or None (the main page can't go)."""
+        pages = self.data.get("notes_pages", [])
+        for index, page in enumerate(pages):
+            if page["id"] == page_id:
+                del pages[index]
+                if self.data.get("notes_current_page") == page_id:
+                    self.data["notes_current_page"] = self.MAIN_NOTES_PAGE
+                self.save()
+                return page, index
+        return None
+
+    def restore_note_page(self, page, index):
+        pages = self.data.setdefault("notes_pages", [])
+        pages.insert(min(index, len(pages)), page)
+        self.save()
+
+    def move_note_page(self, page_id, new_index):
+        """new_index counts only the extra pages (the main page stays first)."""
+        pages = self.data.get("notes_pages", [])
+        page = self._find_note_page(page_id)
+        if page is None:
+            return
+        pages.remove(page)
+        pages.insert(max(0, min(new_index, len(pages))), page)
+        self.save()
+
+    def get_current_note_page(self):
+        page_id = self.data.get("notes_current_page", self.MAIN_NOTES_PAGE)
+        return page_id if page_id == self.MAIN_NOTES_PAGE or self._find_note_page(page_id) else self.MAIN_NOTES_PAGE
+
+    def set_current_note_page(self, page_id):
+        self.data["notes_current_page"] = page_id
+        self.save()
+
     def set_notes(self, text):
         self.data["notes"] = text
         self._enqueue("set_notes", {"text": text}, key="notes")
@@ -335,6 +421,7 @@ class Storage:
             "last_reminded": None,  # date isoformat, so a reminder fires at most once/day (local-only)
             "reminder_every_h": None,  # hours between repeating reminders, or None (local-only, doesn't sync)
             "last_reminded_at": None,  # datetime isoformat the repeating reminder last fired/was set (local-only)
+            "snoozed_until": None,  # datetime isoformat a snoozed reminder comes back (local-only)
             "awarded_on": None,  # last date this task paid out XP, see gamification.task_already_awarded
             "source": source,  # "checklist" (default) or "wishlist" (pushed from Deckbuilder)
         }
@@ -381,6 +468,33 @@ class Storage:
             self._enqueue("set_task_reminder", {"id": task_id, "reminder_time": reminder_time})
         self.save()
 
+    def get_reminder_settings(self):
+        return dict(self.data.get("reminders", {}))
+
+    def set_reminder_settings(self, **changes):
+        self.data.setdefault("reminders", {}).update(changes)
+        self.save()
+
+    def _in_quiet_hours(self, now):
+        r = self.data.get("reminders", {})
+        if not r.get("quiet_enabled"):
+            return False
+        start, end, hm = r.get("quiet_start", "22:00"), r.get("quiet_end", "08:00"), now.strftime("%H:%M")
+        if start == end:
+            return False
+        if start < end:
+            return start <= hm < end
+        return hm >= start or hm < end  # spans midnight
+
+    def snooze_task_reminder(self, task_id, minutes):
+        """Brings this task's reminder back in `minutes` (once), on top of
+        whatever regular reminder it has."""
+        task = self._find_task(task_id)
+        if task is None:
+            return
+        task["snoozed_until"] = (datetime.now() + timedelta(minutes=minutes)).isoformat(timespec="seconds")
+        self.save()
+
     def check_due_reminders(self):
         """Returns the tasks whose reminder time has arrived (or passed, e.g.
         the computer was asleep at that minute) and haven't been reminded
@@ -390,10 +504,23 @@ class Storage:
         today = now.date().isoformat()
         current_hm = now.strftime("%H:%M")
         due = []
+        changed = False
+        quiet = self._in_quiet_hours(now)
         for task in self.data.get("checklist", []):
+            snoozed = task.get("snoozed_until")
+            if snoozed:
+                if task.get("completed_today"):
+                    task["snoozed_until"] = None  # done: nothing left to come back for
+                    changed = True
+                elif now.isoformat(timespec="seconds") >= snoozed:
+                    task["snoozed_until"] = None
+                    due.append(task)
+                    continue
+                else:
+                    continue  # its regular reminder waits until the snooze is over
             every_h = task.get("reminder_every_h")
             if every_h:
-                if task.get("completed_today"):
+                if task.get("completed_today") or quiet:
                     continue
                 if task.get("recurrence") == "weekday" and task.get("weekday") not in (None, now.weekday()):
                     continue
@@ -416,7 +543,7 @@ class Storage:
             if current_hm >= reminder_time:
                 task["last_reminded"] = today
                 due.append(task)
-        if due:
+        if due or changed:
             self.save()
         return due
 
@@ -486,6 +613,15 @@ class Storage:
 
     def set_pomodoro_settings(self, settings):
         self.data["pomodoro"] = dict(settings)
+        self.save()
+
+    def get_focus_task(self):
+        """The task chosen on the Pomodoro tab, if it still exists."""
+        task_id = self.data.get("focus_task")
+        return self._find_task(task_id) if task_id else None
+
+    def set_focus_task(self, task_id):
+        self.data["focus_task"] = task_id
         self.save()
 
     # ---------- Window state ----------
@@ -603,6 +739,9 @@ class Storage:
                 # was set again elsewhere, e.g. on the phone, and wins).
                 "reminder_every_h": None if t.get("reminder_time") else (local_tasks.get(t["id"]) or {}).get("reminder_every_h"),
                 "last_reminded_at": (local_tasks.get(t["id"]) or {}).get("last_reminded_at"),
+                "snoozed_until": (local_tasks.get(t["id"]) or {}).get("snoozed_until"),
+                "focus_pomodoros": (local_tasks.get(t["id"]) or {}).get("focus_pomodoros", 0),
+                "focus_min": (local_tasks.get(t["id"]) or {}).get("focus_min", 0),
                 "awarded_on": t.get("awarded_on"),
                 "source": t.get("source", "checklist"),
             }
@@ -921,12 +1060,18 @@ class Storage:
         )
         return completed
 
-    def record_pomodoro_completed(self, minutes=None):
+    def record_pomodoro_completed(self, minutes=None, task_id=None):
         """Call once per completed work session (not for a skipped one).
         `minutes` is the session length, for the focus-time history.
+        `task_id`: the checklist task the session was spent on, if any; its
+        local-only focus_pomodoros/focus_min totals go up.
         Returns a dict describing what was earned, for the UI to celebrate."""
         if minutes is None:
             minutes = self.get_pomodoro_settings().get("work_min", 25)
+        task = self._find_task(task_id) if task_id else None
+        if task is not None:
+            task["focus_pomodoros"] = task.get("focus_pomodoros", 0) + 1
+            task["focus_min"] = task.get("focus_min", 0) + minutes
         self._ensure_daily_quests()
         self._ensure_weekly_quests()
         self._bump_streak()

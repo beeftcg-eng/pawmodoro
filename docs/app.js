@@ -301,7 +301,10 @@ function startPolling() {
   stopPolling();
   // pick up changes made on the desktop app; skipped while the page is hidden
   // (screen off / another app in front), which saves battery and data
-  pollIntervalId = setInterval(() => { if (!document.hidden) pullAndRender(); }, 5000);
+  pollIntervalId = setInterval(() => {
+    if (!document.hidden) pullAndRender();
+    checkTaskReminders();
+  }, 5000);
 }
 
 function stopPolling() {
@@ -531,10 +534,14 @@ function scheduleNotesSave(editor) {
 // Shared row renderer for both the regular checklist and the wishlist
 // section below it — identical markup/behavior except the regular list
 // also shows each task's recurrence tag.
-function renderTaskList(container, tasks, { showRecurrence = false } = {}) {
+// The regular list also gets a daily reminder time (the same one the
+// desktop's "daily at" reminder uses). The desktop's "every N hours"
+// reminders are desktop-only, so they never show up here.
+function renderTaskList(container, tasks, { showRecurrence = false, reminders = false } = {}) {
   tasks.forEach((task, index) => {
     const li = document.createElement("li");
     li.className = "task-item" + (task.completed_today ? " done" : "");
+    const bell = reminders && task.reminder_time ? ` <em>\u{1F514} ${escapeHtml(task.reminder_time)}</em>` : "";
     li.innerHTML = `
       <div class="reorder-col">
         <button class="reorder-btn" data-dir="up" title="Move up" ${index === 0 ? "disabled" : ""}>▲</button>
@@ -542,14 +549,31 @@ function renderTaskList(container, tasks, { showRecurrence = false } = {}) {
       </div>
       <label>
         <input type="checkbox" ${task.completed_today ? "checked" : ""}>
-        <span>${escapeHtml(task.text)}${showRecurrence ? ` <em>[${task.recurrence}]</em>` : ""}</span>
+        <span>${escapeHtml(task.text)}${showRecurrence ? ` <em>[${task.recurrence}]</em>` : ""}${bell}</span>
       </label>
+      ${reminders ? `<button class="rename-btn reminder-btn" title="Daily reminder">\u{1F514}</button>` : ""}
       <button class="rename-btn" title="Rename">✎</button>
-      <button class="remove-btn" title="Remove">✕</button>`;
+      <button class="remove-btn" title="Remove">✕</button>
+      ${reminders ? `
+        <div class="reminder-edit" hidden>
+          <span class="hint">Remind me daily at</span>
+          <input type="time" value="${escapeHtml(task.reminder_time ?? "")}">
+          <button class="reminder-save">Set</button>
+          <button class="reminder-clear">Clear</button>
+        </div>` : ""}`;
     li.querySelector("input").addEventListener("change", async e => {
       await toggleTask(task.id, e.target.checked);
     });
-    li.querySelector(".rename-btn").addEventListener("click", async () => {
+    if (reminders) {
+      const editor = li.querySelector(".reminder-edit");
+      li.querySelector(".reminder-btn").addEventListener("click", () => { editor.hidden = !editor.hidden; });
+      li.querySelector(".reminder-save").addEventListener("click", () => {
+        const time = editor.querySelector("input").value;
+        if (time) setTaskReminder(task.id, time);
+      });
+      li.querySelector(".reminder-clear").addEventListener("click", () => setTaskReminder(task.id, null));
+    }
+    li.querySelector('.rename-btn[title="Rename"]').addEventListener("click", async () => {
       const text = (prompt("Rename task", task.text) ?? "").trim();
       if (!text || text === task.text) return;
       const { error } = await supabaseClient.rpc("rename_task", { p_task_id: task.id, p_text: text });
@@ -599,7 +623,7 @@ function renderChecklist() {
       ` : ""}
     </div>`;
 
-  renderTaskList(document.getElementById("task-list"), tasks, { showRecurrence: true });
+  renderTaskList(document.getElementById("task-list"), tasks, { showRecurrence: true, reminders: true });
   const wishlistList = document.getElementById("wishlist-task-list");
   if (wishlistList) renderTaskList(wishlistList, wishlistTasks);
 
@@ -612,6 +636,38 @@ function renderChecklist() {
     await pullAndRender();
   });
   restoreDraft();
+}
+
+async function setTaskReminder(taskId, time) {
+  const { error } = await supabaseClient.rpc("set_task_reminder", { p_task_id: taskId, p_reminder_time: time });
+  if (error) toast("⚠️ Couldn't save the reminder", error.message || "Check your connection and try again.");
+  else if (time && window.Notification && Notification.permission === "default") Notification.requestPermission();
+  await pullAndRender();
+}
+
+// Fires the daily reminders while this page is open (a closed web app can't
+// wake itself up -- the desktop app is what reminds you otherwise). Each
+// one fires at most once a day per device.
+const REMINDED_KEY = "pawmodoro_reminded";  // { taskId: "YYYY-MM-DD" }
+
+function checkTaskReminders() {
+  if (!state?.checklist) return;
+  const now = new Date();
+  const today = localISODate(now);
+  const hm = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+  let reminded;
+  try { reminded = JSON.parse(localStorage.getItem(REMINDED_KEY) || "{}"); } catch { reminded = {}; }
+  let changed = false;
+  for (const task of state.checklist) {
+    if (!task.reminder_time || task.completed_today || task.source === "wishlist") continue;
+    if (reminded[task.id] === today || hm < task.reminder_time) continue;
+    reminded[task.id] = today;
+    changed = true;
+    notify("\u{1F514} Task reminder", task.text);
+  }
+  if (changed) {
+    try { localStorage.setItem(REMINDED_KEY, JSON.stringify(reminded)); } catch { /* private mode */ }
+  }
 }
 
 async function moveTask(tasks, index, delta) {

@@ -195,6 +195,17 @@ def now_playing_bundle(player):
     return text, length
 
 
+def snapshot(player):
+    """Same shape as mpris.snapshot(), built from the calls below (SMTC is
+    in-process, so there's no per-call subprocess cost to save here)."""
+    text, length = now_playing_bundle(player)
+    return {
+        "status": status(player), "text": text, "length": length,
+        "position": get_position_seconds(player), "volume": get_volume(player),
+        "shuffle": get_shuffle(player), "loop": get_loop_status(player),
+    }
+
+
 def command(player, action):
     session = _find_session(player)
     if not session:

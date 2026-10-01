@@ -4,10 +4,10 @@ progress_tab.py - Level, XP, streak, and today's/this week's quests: the
 together into one sense of daily and weekly progress.
 """
 import html
-from datetime import date
+from datetime import date, timedelta
 
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QGroupBox, QProgressBar, QScrollArea
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QGroupBox, QProgressBar, QScrollArea, QToolTip
 )
 from PyQt6.QtCore import Qt, QRectF
 from PyQt6.QtGui import QPainter, QColor, QPen, QFont
@@ -85,6 +85,111 @@ class HistoryChart(QWidget):
                              Qt.AlignmentFlag.AlignCenter, "MTWTFSS"[d["day"].weekday()])
 
 
+HEATMAP_WEEKS = 17  # ~the 120 days of history storage keeps
+
+
+class HistoryHeatmap(QWidget):
+    """A calendar grid of focus minutes per day, one column per week
+    (Monday at the top), shaded by how much you focused that day. Hover a
+    day for its numbers. Custom-painted: needs set_colors() on a theme
+    switch, like HistoryChart."""
+
+    CELL, GAP, LEFT, TOP = 13, 3, 22, 16
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMouseTracking(True)
+        self._days = {}
+        self._first = date.today()
+        self._accent = QColor("#96433a")
+        self._edge = QColor("#c9b896")
+        self._ink = QColor("#6b5c46")
+        step = self.CELL + self.GAP
+        self.setFixedHeight(self.TOP + 7 * step)
+        self.setMinimumWidth(self.LEFT + HEATMAP_WEEKS * step)
+
+    def set_days(self, days):
+        """days: get_history() rows covering the grid, oldest first."""
+        self._days = {d["day"]: d for d in days}
+        today = date.today()
+        self._first = today - timedelta(days=today.weekday()) - timedelta(weeks=HEATMAP_WEEKS - 1)
+        self.update()
+
+    @staticmethod
+    def days_needed():
+        today = date.today()
+        return today.weekday() + 1 + 7 * (HEATMAP_WEEKS - 1)
+
+    def set_colors(self, accent, edge, ink_soft):
+        self._accent, self._edge, self._ink = QColor(accent), QColor(edge), QColor(ink_soft)
+        self.update()
+
+    def _shade(self, minutes, peak):
+        if minutes <= 0:
+            return None
+        level = min(4, 1 + int(3 * minutes / peak)) if peak else 1  # 1..4
+        color = QColor(self._accent)
+        color.setAlphaF(0.25 + 0.75 * (level - 1) / 3)
+        return color
+
+    def _cell_rect(self, week, weekday):
+        step = self.CELL + self.GAP
+        return QRectF(self.LEFT + week * step, self.TOP + weekday * step, self.CELL, self.CELL)
+
+    def _day_at(self, pos):
+        step = self.CELL + self.GAP
+        week = int((pos.x() - self.LEFT) // step)
+        weekday = int((pos.y() - self.TOP) // step)
+        if not (0 <= week < HEATMAP_WEEKS and 0 <= weekday < 7):
+            return None
+        day = self._first + timedelta(weeks=week, days=weekday)
+        return day if day <= date.today() and self._cell_rect(week, weekday).contains(pos) else None
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        font = QFont(self.font())
+        font.setPointSize(8)
+        painter.setFont(font)
+        today = date.today()
+        peak = max([d["focus_min"] for d in self._days.values()] + [1])
+        painter.setPen(self._ink)
+        for weekday, name in ((0, "M"), (2, "W"), (4, "F")):
+            rect = self._cell_rect(0, weekday)
+            painter.drawText(QRectF(0, rect.top(), self.LEFT - 4, self.CELL),
+                             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, name)
+        last_month = None
+        for week in range(HEATMAP_WEEKS):
+            monday = self._first + timedelta(weeks=week)
+            if monday.month != last_month:
+                last_month = monday.month
+                painter.setPen(self._ink)
+                painter.drawText(QRectF(self._cell_rect(week, 0).left(), 0, 40, self.TOP - 2),
+                                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom, monday.strftime("%b"))
+            for weekday in range(7):
+                day = monday + timedelta(days=weekday)
+                if day > today:
+                    continue
+                rect = self._cell_rect(week, weekday)
+                fill = self._shade(self._days.get(day, {}).get("focus_min", 0), peak)
+                painter.setPen(QPen(self._accent, 1.5) if day == today else QPen(self._edge, 1))
+                painter.setBrush(fill if fill is not None else Qt.BrushStyle.NoBrush)
+                painter.drawRoundedRect(rect, 3, 3)
+
+    def mouseMoveEvent(self, event):
+        day = self._day_at(event.position())
+        if day is None:
+            QToolTip.hideText()
+            return
+        row = self._days.get(day, {})
+        QToolTip.showText(
+            event.globalPosition().toPoint(),
+            f"{day.strftime('%a %d %b')}: {_format_minutes(row.get('focus_min', 0))} focused, "
+            f"{row.get('pomodoros', 0)} sessions, {row.get('tasks', 0)} tasks",
+            self,
+        )
+
+
 class ProgressTab(QWidget):
     def __init__(self, storage, parent=None):
         super().__init__(parent)
@@ -136,6 +241,14 @@ class ProgressTab(QWidget):
         self.week_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         history_layout.addWidget(self.week_label)
         layout.addWidget(self.history_box)
+
+        self.heatmap_box = QGroupBox(f"Focus over the last {HEATMAP_WEEKS} weeks")
+        heatmap_layout = QHBoxLayout(self.heatmap_box)
+        self.heatmap = HistoryHeatmap()
+        heatmap_layout.addStretch()
+        heatmap_layout.addWidget(self.heatmap)
+        heatmap_layout.addStretch()
+        layout.addWidget(self.heatmap_box)
 
         # --- Household (only shown once you've joined one; see Shared tab) ---
         self.household_box = QGroupBox("\U0001F3E0 Household")
@@ -203,6 +316,7 @@ class ProgressTab(QWidget):
         self.task_stat_label.setText(f"✅ {g.get('total_tasks', 0)} tasks completed")
 
         self.history_chart.set_days(self.storage.get_history(14))
+        self.heatmap.set_days(self.storage.get_history(HistoryHeatmap.days_needed()))
         totals = self.storage.get_week_totals()
         self.week_label.setText(
             f"This week (since Tuesday): {totals['pomodoros']} sessions \u00b7 "
@@ -288,5 +402,6 @@ class ProgressTab(QWidget):
         self.weekly_reset_label.setStyleSheet(f"color: {p['INK_SOFT']}; font-size: 10px;")
         self.week_label.setStyleSheet(f"color: {p['INK_SOFT']}; font-size: 11px;")
         self.history_chart.set_colors(p["ACCENT"], p["PAPER_EDGE"], p["INK_SOFT"])
+        self.heatmap.set_colors(p["ACCENT"], p["PAPER_EDGE"], p["INK_SOFT"])
 
         self.refresh()

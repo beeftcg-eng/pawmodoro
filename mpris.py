@@ -78,6 +78,39 @@ def now_playing_bundle(player):
     return text, length
 
 
+def _float_or_none(value, scale=1.0):
+    try:
+        return float(value) / scale
+    except ValueError:
+        return None
+
+
+def snapshot(player):
+    """Everything the player bar shows, from ONE playerctl call (it used to
+    spawn six per poll: status, metadata, position, volume, shuffle, loop).
+    Returns {status, text, length, position, volume, shuffle, loop}; values
+    the player doesn't report are None/""."""
+    fields = ["status", "position", "volume", "loop", "shuffle", "title", "artist", "mpris:length"]
+    raw = run(["-p", player, "metadata", "--format",
+               _METADATA_SEP.join(f"{{{{ {f} }}}}" for f in fields)])
+    if not raw:
+        # Nothing loaded: `metadata` fails outright, but status still works.
+        return {"status": status(player), "text": "", "length": None, "position": None,
+                "volume": None, "shuffle": None, "loop": None}
+    values = dict(zip(fields, (raw.split(_METADATA_SEP) + [""] * len(fields))[:len(fields)]))
+    title, artist = values["title"], values["artist"]
+    shuffle = {"true": "On", "false": "Off"}.get(values["shuffle"].lower())
+    return {
+        "status": values["status"],
+        "text": (f"{title} \u2014 {artist}" if artist else title) if title else "",
+        "length": _float_or_none(values["mpris:length"], 1_000_000),
+        "position": _float_or_none(values["position"], 1_000_000),
+        "volume": _float_or_none(values["volume"]),
+        "shuffle": shuffle,
+        "loop": values["loop"] or None,
+    }
+
+
 def command(player, action):
     """action: 'previous' | 'play-pause' | 'next'"""
     if player:
