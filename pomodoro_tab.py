@@ -294,8 +294,10 @@ class PomodoroTab(QWidget):
             self.sessions_completed = int(state.get("sessions_completed", 0))
         if state.get("running") and state.get("ends_at"):
             remaining = math.ceil(state["ends_at"] - time.time())
-            if 0 < remaining <= full:
-                self.seconds_left = remaining
+            # (+1: restarting within the same clock tick, float rounding can
+            # make a just-started session look a second longer than a full one)
+            if 0 < remaining <= full + 1:
+                self.seconds_left = min(remaining, full)
                 self._start()
                 return
             # It ran out while the app wasn't running: like time spent

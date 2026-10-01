@@ -42,6 +42,19 @@ class MainWindowTests(StorageTestCase):
         self.assertTrue(tab.running)
         self.assertGreater(tab.seconds_left, 24 * 60)
 
+    def test_restart_within_the_same_clock_tick(self):
+        # Windows' clock is coarse: ends_at - now can come out a hair over a
+        # full session, which must still resume rather than count as expired.
+        window = self.make_window()
+        now = time.time()
+        state = {"phase": "work", "sessions_completed": 0, "seconds_left": 1500, "running": True,
+                 "ends_at": now + 1500.001, "day": None}
+        window.storage.set_timer_state(state)
+        with mock.patch("pomodoro_tab.time.time", return_value=now):
+            restarted = self.make_window()
+        self.assertTrue(restarted.pomodoro_tab.running)
+        self.assertEqual(restarted.pomodoro_tab.seconds_left, 1500)
+
     def test_timer_that_ran_out_while_closed_is_not_credited(self):
         window = self.make_window()
         window.pomodoro_tab._start()
