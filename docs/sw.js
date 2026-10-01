@@ -1,8 +1,8 @@
 // sw.js - Minimal service worker. Only caches the static app shell (not
 // Supabase data) so the page installs cleanly as a PWA and reloads a
 // touch faster; it does not provide real offline data access.
-const CACHE = "pawmodoro-shell-v17";
-const SHELL = ["./", "index.html", "style.css?v=17", "app.js?v=17", "manifest.json"];
+const CACHE = "pawmodoro-shell-v18";
+const SHELL = ["./", "index.html", "style.css?v=18", "app.js?v=18", "manifest.json"];
 
 self.addEventListener("install", event => {
   event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL)));
@@ -45,6 +45,13 @@ self.addEventListener("push", event => {
   event.waitUntil(self.registration.showNotification(data.title || "Pawmodoro", {
     body: data.body || "",
     tag: data.tag,
+    // Without this, a reminder replacing an earlier one with the same tag
+    // (yesterday's, still in the shade) arrives without sound or vibration.
+    renotify: Boolean(data.tag),
+    silent: false,
+    // Used where the browser honours it; on Android 8+ the sound and
+    // vibration come from the app's notification settings instead.
+    vibrate: [300, 150, 300, 150, 600],
     icon: "icons/icon_256.png",
     badge: "icons/icon_64.png",
   }));

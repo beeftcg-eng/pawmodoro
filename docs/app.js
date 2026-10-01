@@ -1058,9 +1058,17 @@ async function onPhaseComplete() {
 
 function notify(title, body) {
   toast(title, body);
-  if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
-  if (window.Notification && Notification.permission === "granted") {
-    new Notification(title, { body });
+  if (navigator.vibrate) navigator.vibrate([300, 150, 300, 150, 600]);
+  if (!window.Notification || Notification.permission !== "granted") return;
+  const options = { body, silent: false, vibrate: [300, 150, 300, 150, 600], icon: "icons/icon_256.png", badge: "icons/icon_64.png" };
+  // Chrome on Android refuses `new Notification()` ("Illegal constructor");
+  // there, notifications have to come from the service worker.
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.ready
+      .then(reg => reg.showNotification(title, options))
+      .catch(() => { try { new Notification(title, options); } catch { /* toast already shown */ } });
+  } else {
+    try { new Notification(title, options); } catch { /* toast already shown */ }
   }
 }
 
