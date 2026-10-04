@@ -12,6 +12,7 @@ in the background. The UI never waits on the network, and edits made while
 offline are kept and uploaded later. See sync_engine.py.
 """
 import json
+import random
 import os
 import shutil
 import threading
@@ -59,6 +60,7 @@ DEFAULT_DATA = {
     },
     "timer_state": None,  # the pomodoro timer across restarts, see PomodoroTab._save_timer_state
     "focus_task": None,  # checklist task id the pomodoro timer is "working on", or None
+    "focus_auto_pick": True,  # pick a random one-time task for the timer when it has none (local-only)
     "window": {
         "widget_mode": False,
         "widget_x": 100,
@@ -878,6 +880,32 @@ class Storage:
 
     def set_focus_task(self, task_id):
         self.data["focus_task"] = task_id
+        self.save()
+
+    def pending_once_tasks(self):
+        """One-time checklist tasks not done yet: what the timer's 🎲 picks from."""
+        return [t for t in self.get_checklist()
+                if t.get("source", "checklist") == "checklist" and t["recurrence"] == "once"
+                and not t.get("completed_today")]
+
+    def pick_random_focus_task(self, rng=random):
+        """Makes a random pending one-time task the timer's focus and returns
+        it (None when there are none). Avoids the current one while there's
+        anything else, so picking again always changes it."""
+        tasks = self.pending_once_tasks()
+        current = self.data.get("focus_task")
+        others = [t for t in tasks if t["id"] != current]
+        if not tasks:
+            return None
+        task = rng.choice(others or tasks)
+        self.set_focus_task(task["id"])
+        return task
+
+    def get_focus_auto_pick(self):
+        return bool(self.data.get("focus_auto_pick", True))
+
+    def set_focus_auto_pick(self, enabled):
+        self.data["focus_auto_pick"] = bool(enabled)
         self.save()
 
     # ---------- Window state ----------

@@ -65,6 +65,31 @@ class FocusTests(StorageTestCase):
         self.assertEqual((task["focus_pomodoros"], task["focus_min"]), (2, 55))
         self.assertEqual(self.storage.get_focus_task()["id"], task["id"])
 
+    def test_random_pick_only_takes_unfinished_one_time_tasks(self):
+        st = self.storage
+        self.assertIsNone(st.pick_random_focus_task())
+        st.add_task("Walk", "daily")
+        done = st.add_task("Old", "once")
+        st.set_task_done(done["id"], True)
+        st.add_task("Wish", "once", source="wishlist")
+        a = st.add_task("Taxes", "once")
+        b = st.add_task("Email", "once")
+        self.assertEqual({t["id"] for t in st.pending_once_tasks()}, {a["id"], b["id"]})
+        for _ in range(10):
+            before = st.data["focus_task"]
+            picked = st.pick_random_focus_task()
+            self.assertIn(picked["id"], (a["id"], b["id"]))
+            self.assertNotEqual(picked["id"], before)  # always a different one while there's a choice
+            self.assertEqual(st.get_focus_task()["id"], picked["id"])
+        st.set_task_done(a["id"], True)
+        st.set_focus_task(b["id"])
+        self.assertEqual(st.pick_random_focus_task()["id"], b["id"])  # the only one left
+
+    def test_focus_auto_pick_setting(self):
+        self.assertTrue(self.storage.get_focus_auto_pick())
+        self.storage.set_focus_auto_pick(False)
+        self.assertFalse(self.new_storage().get_focus_auto_pick())
+
     def test_focus_cleared_when_the_task_is_removed(self):
         task = self.storage.add_task("Report", "once")
         self.storage.set_focus_task(task["id"])

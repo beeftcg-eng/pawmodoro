@@ -148,11 +148,64 @@ class MainWindowTests(StorageTestCase):
         st.add_subtask(late["id"], "Find receipts")
         st.set_task_note(late["id"], "ask about the deadline")
         tab.refresh()
-        labels = [tab.list_widget.item(row).text() for row in range(tab.list_widget.count())]
         self.assertEqual(st.get_checklist()[0]["month_day"], 3)
-        self.assertIn("[monthly, 3rd]", labels[0])
-        self.assertTrue(labels[1].startswith("⚠ ") and "overdue" in labels[1] and "☑ 0/1" in labels[1])
-        self.assertIn("Find receipts", tab.list_widget.item(1).toolTip())
+        self.assertIn("[monthly, 3rd]", tab.recurring_list.item(0).text())
+        label = tab.once_list.item(0).text()
+        self.assertTrue(label.startswith("⚠ ") and "overdue" in label and "☑ 0/1" in label)
+        self.assertIn("Find receipts", tab.once_list.item(0).toolTip())
+
+    def test_one_time_tasks_have_their_own_tab(self):
+        window = self.make_window()
+        tab = window.checklist_tab
+        tab.text_input.setText("Walk")
+        tab.add_task()
+        self.assertIs(tab.list_widget, tab.recurring_list)
+        tab.list_tabs.setCurrentWidget(tab.once_list)
+        self.assertEqual(tab.recurrence_box.currentData(), "once")  # adding here makes a one-time task
+        tab.text_input.setText("Taxes")
+        tab.add_task()
+        tab.list_tabs.setCurrentWidget(tab.recurring_list)
+        self.assertEqual(tab.recurrence_box.currentData(), "daily")
+        tab.recurrence_box.setCurrentIndex(tab.recurrence_box.findData("once"))
+        tab.text_input.setText("Email")
+        tab.add_task()
+        self.assertIs(tab.list_widget, tab.once_list)  # jumps to where it landed
+        self.assertEqual([tab.once_list.item(r).text().split("  ")[0] for r in range(tab.once_list.count())],
+                         ["Taxes", "Email"])
+        self.assertEqual(tab.recurring_list.count(), 1)
+        self.assertIn("(2)", tab.list_tabs.tabText(1))
+
+    def test_timer_picks_a_one_time_task(self):
+        window = self.make_window()
+        st = window.storage
+        pomodoro = window.pomodoro_tab
+        st.add_task("Walk", "daily")
+        pomodoro.refresh_focus_tasks()
+        self.assertIsNone(st.get_focus_task())
+        self.assertFalse(pomodoro.pick_btn.isEnabled())
+        taxes = st.add_task("Taxes", "once")
+        email = st.add_task("Email", "once")
+        pomodoro.refresh_focus_tasks()  # auto-pick fills an empty timer
+        first = st.get_focus_task()["id"]
+        self.assertIn(first, (taxes["id"], email["id"]))
+        self.assertEqual(pomodoro.focus_combo.currentData(), first)
+        pomodoro.pick_random_task()  # 🎲 always changes it
+        self.assertNotEqual(st.get_focus_task()["id"], first)
+        # Choosing "Nothing in particular" yourself sticks, even on Start.
+        pomodoro.focus_combo.setCurrentIndex(0)
+        pomodoro._start()
+        pomodoro._pause()
+        self.assertIsNone(st.get_focus_task())
+        # Finishing the task moves on to the other one.
+        pomodoro.pick_random_task()
+        current = st.get_focus_task()["id"]
+        st.set_task_done(current, True)
+        pomodoro.refresh_focus_tasks()
+        self.assertNotEqual(st.get_focus_task()["id"], current)
+        pomodoro.auto_pick_check.setChecked(False)
+        st.set_focus_task(None)
+        pomodoro.refresh_focus_tasks()
+        self.assertIsNone(st.get_focus_task())
 
     def test_task_details_dialog(self):
         from task_details_dialog import TaskDetailsDialog

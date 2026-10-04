@@ -6,7 +6,9 @@ un-check themselves at the start of a new day; a "specific day" task
 next time that weekday comes around; a monthly one when its day of the
 month comes round. A one-off task can have a due date (shown in red once
 it's overdue). Any task can have a note and subtasks (Details…). Tasks can
-be dragged to reorder.
+be dragged to reorder. Repeating tasks and one-time ones sit on two
+separate tabs ("Recurring" / "One-time"); the Pomodoro tab's 🎲 picks from
+the one-time ones.
 
 Also renders a separate, independently-reorderable "Card Wishlist"
 section (hidden when empty) for tasks pushed here from the Deckbuilder
@@ -20,7 +22,7 @@ from datetime import date
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem,
     QPushButton, QLineEdit, QComboBox, QLabel, QTimeEdit, QSpinBox, QAbstractItemView,
-    QInputDialog, QCheckBox, QFrame, QDateEdit
+    QInputDialog, QCheckBox, QFrame, QDateEdit, QTabWidget
 )
 from PyQt6.QtCore import Qt, QDate, QTime, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QFont
@@ -43,7 +45,7 @@ class ChecklistTab(QWidget):
         self.storage = storage
 
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("Recurring checklist"))
+        layout.addWidget(QLabel("Checklist"))
 
         # Shown when a reminder fires, so it can be dealt with right here:
         # the desktop notification itself can't carry buttons on every
@@ -69,11 +71,16 @@ class ChecklistTab(QWidget):
         self.reminder_banner.setVisible(False)
         layout.addWidget(self.reminder_banner)
 
-        self.list_widget = QListWidget()
-        self.list_widget.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
-        self.list_widget.setDefaultDropAction(Qt.DropAction.MoveAction)
-        self.list_widget.setToolTip("Double-click a task for its details: steps, a note, a due date")
-        layout.addWidget(self.list_widget)
+        # Repeating tasks (daily / weekly / monthly / a specific weekday) and
+        # one-time ones on separate tabs. `list_widget` is whichever is shown,
+        # so the buttons below act on the visible tab's selection.
+        self.list_tabs = QTabWidget()
+        self.recurring_list = self._make_task_list()
+        self.once_list = self._make_task_list()
+        self.list_tabs.addTab(self.recurring_list, "")
+        self.list_tabs.addTab(self.once_list, "")
+        self.list_tabs.currentChanged.connect(self._on_list_tab_changed)
+        layout.addWidget(self.list_tabs)
 
         reminder_row = QHBoxLayout()
         reminder_row.addWidget(QLabel("\U0001F514 Reminder for selected:"))
@@ -221,14 +228,37 @@ class ChecklistTab(QWidget):
         self.wishlist_remove_btn = wishlist_remove_btn
 
         self._last_signature = None
-        self.list_widget.itemChanged.connect(self._on_item_changed)
-        self.list_widget.itemDoubleClicked.connect(lambda item: self.open_details())
         self._details_dialog = None
-        self.list_widget.model().rowsMoved.connect(self._on_rows_moved)
+        for widget in (self.recurring_list, self.once_list):
+            widget.itemChanged.connect(self._on_item_changed)
+            widget.itemDoubleClicked.connect(lambda item: self.open_details())
+            widget.model().rowsMoved.connect(lambda *_, w=widget: self._on_rows_moved(w))
         self.wishlist_list_widget.itemChanged.connect(self._on_item_changed)
         self.wishlist_list_widget.model().rowsMoved.connect(self._on_wishlist_rows_moved)
         self.refresh()
         self.refresh_theme()
+
+    @staticmethod
+    def _make_task_list():
+        widget = QListWidget()
+        widget.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        widget.setDefaultDropAction(Qt.DropAction.MoveAction)
+        widget.setToolTip("Double-click a task for its details: steps, a note, a due date")
+        return widget
+
+    @property
+    def list_widget(self):
+        """The task list on the tab that's showing."""
+        return self.list_tabs.currentWidget()
+
+    def _list_for(self, task):
+        return self.once_list if task["recurrence"] == "once" else self.recurring_list
+
+    def _on_list_tab_changed(self, index):
+        # Adding from the One-time tab makes a one-time task, and vice versa.
+        once = self.list_tabs.widget(index) is self.once_list
+        if once != (self.recurrence_box.currentData() == "once"):
+            self.recurrence_box.setCurrentIndex(self.recurrence_box.findData("once" if once else "daily"))
 
     def _on_reminder_mode_changed(self, index=None):
         interval = self.reminder_mode_box.currentData() == "interval"
@@ -262,15 +292,18 @@ class ChecklistTab(QWidget):
         if self._due_reminders:
             QTimer.singleShot(0, self._refresh_banner)
         self._last_signature = signature
+        task_lists = (self.recurring_list, self.once_list)
         selected = {
             widget: (widget.currentItem().data(Qt.ItemDataRole.UserRole) if widget.currentItem() else None)
-            for widget in (self.list_widget, self.wishlist_list_widget)
+            for widget in task_lists + (self.wishlist_list_widget,)
         }
         scroll = {widget: widget.verticalScrollBar().value() for widget in selected}
         wishlist_tasks = [t for t in tasks if t.get("source") == "wishlist"]
 
-        self.list_widget.blockSignals(True)
-        self.list_widget.clear()
+        for widget in task_lists:
+            widget.blockSignals(True)
+            widget.clear()
+        pending = {widget: 0 for widget in task_lists}
         for task in tasks:
             if task.get("source") == "wishlist":
                 continue
@@ -310,8 +343,15 @@ class ChecklistTab(QWidget):
             tooltip = self._task_tooltip(task)
             if tooltip:
                 item.setToolTip(tooltip)
-            self.list_widget.addItem(item)
-        self.list_widget.blockSignals(False)
+            widget = self._list_for(task)
+            widget.addItem(item)
+            if not task.get("completed_today"):
+                pending[widget] += 1
+        for widget in task_lists:
+            widget.blockSignals(False)
+        for widget, title in ((self.recurring_list, "\U0001F501 Recurring"), (self.once_list, "\U0001F4CC One-time")):
+            self.list_tabs.setTabText(self.list_tabs.indexOf(widget),
+                                      f"{title} ({pending[widget]})" if pending[widget] else title)
 
         self.wishlist_list_widget.blockSignals(True)
         self.wishlist_list_widget.clear()
@@ -346,10 +386,11 @@ class ChecklistTab(QWidget):
             lines.append("<i>" + html.escape(note).replace("\n", "<br>") + "</i>")
         return "<br>".join(lines)
 
-    def _on_rows_moved(self):
+    def _on_rows_moved(self, widget):
+        # Only this tab's tasks: reorder_tasks keeps the rest in their order.
         ordered_ids = [
-            self.list_widget.item(i).data(Qt.ItemDataRole.UserRole)
-            for i in range(self.list_widget.count())
+            widget.item(i).data(Qt.ItemDataRole.UserRole)
+            for i in range(widget.count())
         ]
         self.storage.reorder_tasks(ordered_ids)
 
@@ -386,10 +427,11 @@ class ChecklistTab(QWidget):
         month_day = self.month_day_spin.value() if recurrence == "monthly" else None
         due_date = (self.due_date_edit.date().toString("yyyy-MM-dd")
                     if recurrence == "once" and self.due_check.isChecked() else None)
-        self.storage.add_task(text, recurrence, weekday=weekday, month_day=month_day, due_date=due_date)
+        task = self.storage.add_task(text, recurrence, weekday=weekday, month_day=month_day, due_date=due_date)
         self.text_input.clear()
         self.due_check.setChecked(False)
         self.refresh()
+        self.select_task(task["id"])  # shows the tab it landed on
 
     def _remove_selected(self, list_widget):
         item = list_widget.currentItem()
@@ -484,11 +526,20 @@ class ChecklistTab(QWidget):
         )
 
     def select_task(self, task_id):
-        for row in range(self.list_widget.count()):
-            if self.list_widget.item(row).data(Qt.ItemDataRole.UserRole) == task_id:
-                self.list_widget.setCurrentRow(row)
-                self.list_widget.scrollToItem(self.list_widget.item(row))
-                return
+        """Selects a task, switching to the tab it's on."""
+        item = self._find_item(task_id)
+        if item is not None:
+            widget = item.listWidget()
+            self.list_tabs.setCurrentWidget(widget)
+            widget.setCurrentItem(item)
+            widget.scrollToItem(item)
+
+    def _find_item(self, task_id):
+        for widget in (self.recurring_list, self.once_list):
+            for row in range(widget.count()):
+                if widget.item(row).data(Qt.ItemDataRole.UserRole) == task_id:
+                    return widget.item(row)
+        return None
 
     # ---------- Reminder banner ----------
     def show_reminder(self, task_id):
@@ -523,11 +574,9 @@ class ChecklistTab(QWidget):
         if task is not None:
             self._due_reminders.pop()
             # Same path as ticking the box (XP, quests, celebration).
-            for row in range(self.list_widget.count()):
-                item = self.list_widget.item(row)
-                if item.data(Qt.ItemDataRole.UserRole) == task["id"]:
-                    item.setCheckState(Qt.CheckState.Checked)
-                    break
+            item = self._find_item(task["id"])
+            if item is not None:
+                item.setCheckState(Qt.CheckState.Checked)
         self._refresh_banner()
 
     def _banner_snooze(self, minutes):

@@ -55,6 +55,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $dir 'pawmodoro\i
 
 ## What changed from the first version
 
+**v2.19.0 — one-time tasks get their own tab, and the timer can pick what to work on.** No schema change.
+- **Recurring and one-time tabs**: the checklist is split into **🔁 Recurring** (daily, weekly, monthly and specific-day tasks) and **📌 One-time** (tasks set to "once"). Each tab shows how many of its tasks are still open. Adding from the One-time tab makes a one-time task, and a new task always shows up on the tab it belongs to.
+- **🎲 Pick for me**: next to "Working on" on the Pomodoro tab, this picks one of your unfinished one-time tasks at random (a different one each press). With **Pick a one-time task for me automatically** on (the default), the timer does it by itself whenever it isn't working on anything or its task is done: when you open the tab, press Start, or finish a session. Choosing "Nothing in particular" yourself is respected. The setting stays on this computer.
+- **Honest testing note**: covered by new storage and headless window tests (102 Python tests), and the layout was checked in offscreen screenshots. Not yet clicked through by hand in the running app.
+
 **v2.18.0 — monthly tasks, due dates, steps and notes on tasks, and a timer that notices you've walked away.** **Schema change: re-run `supabase/schema.sql`** (see MOBILE_SYNC.md).
 - **Monthly tasks**: pick **monthly** and a day ("on the 1st") when adding a task. It un-ticks itself when that day comes round each month (the 31st means the last day in a shorter month), reminds you on that day, and pays 20 XP once a month.
 - **Due dates**: a **once** task can have a due date (tick **due** and pick it). It shows as "due Fri 03 Oct", turns bold on the day and red with ⚠ once it's overdue, and its reminder waits until that day. Change or clear the date in the task's details.

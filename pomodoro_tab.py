@@ -184,8 +184,24 @@ class PomodoroTab(QWidget):
         self.focus_combo.setToolTip("Finished work sessions are counted on this task (🍅 in the checklist)")
         self.focus_combo.currentIndexChanged.connect(self._on_focus_task_changed)
         focus_row.addWidget(self.focus_combo)
+        self.pick_btn = QPushButton("\U0001F3B2 Pick for me")
+        self.pick_btn.setObjectName("secondary_btn")
+        self.pick_btn.clicked.connect(self.pick_random_task)
+        focus_row.addWidget(self.pick_btn)
         focus_row.addStretch()
         layout.addLayout(focus_row)
+
+        # With this on, a random one-time task is put on the timer whenever it
+        # has nothing (or the task it had got ticked off), unless you chose
+        # "Nothing in particular" yourself.
+        self._chose_nothing = False
+        self.auto_pick_check = QCheckBox("Pick a one-time task for me automatically")
+        self.auto_pick_check.setToolTip(
+            "When the timer isn't working on anything (or that task is done), "
+            "it picks one of your unfinished one-time tasks at random")
+        self.auto_pick_check.setChecked(storage.get_focus_auto_pick())
+        self.auto_pick_check.toggled.connect(self._on_auto_pick_toggled)
+        layout.addWidget(self.auto_pick_check, alignment=Qt.AlignmentFlag.AlignHCenter)
         self.refresh_focus_tasks()
 
         # Settings group
@@ -480,6 +496,8 @@ class PomodoroTab(QWidget):
             self._start()
 
     def _start(self):
+        if self.phase == "work":
+            self.maybe_auto_pick()
         self._hide_away()
         self.running = True
         now = time.monotonic()
@@ -598,6 +616,9 @@ class PomodoroTab(QWidget):
     def refresh_focus_tasks(self):
         """Fills the "Working on" list with today's pending tasks (plus the
         chosen one, even once it's ticked off)."""
+        if not self.running:
+            # (mid-session the task stays as it is until the next one starts)
+            self.maybe_auto_pick(refresh=False)
         focus = self.storage.get_focus_task()
         tasks = [t for t in self.storage.get_checklist()
                  if t.get("source", "checklist") == "checklist"
@@ -615,9 +636,42 @@ class PomodoroTab(QWidget):
         index = self.focus_combo.findData(focus["id"]) if focus else 0
         self.focus_combo.setCurrentIndex(max(0, index))
         self.focus_combo.blockSignals(False)
+        choices = len(self.storage.pending_once_tasks())
+        self.pick_btn.setEnabled(choices > 0)
+        self.pick_btn.setToolTip("Pick one of your one-time tasks at random" if choices
+                                 else "No unfinished one-time tasks to pick from")
 
     def _on_focus_task_changed(self, index):
-        self.storage.set_focus_task(self.focus_combo.itemData(index))
+        task_id = self.focus_combo.itemData(index)
+        self._chose_nothing = task_id is None
+        self.storage.set_focus_task(task_id)
+
+    def pick_random_task(self):
+        """The 🎲 button: a random unfinished one-time task (a different one
+        each press, while there's more than one)."""
+        task = self.storage.pick_random_focus_task()
+        if task is not None:
+            self._chose_nothing = False
+        self.refresh_focus_tasks()
+        return task
+
+    def maybe_auto_pick(self, refresh=True):
+        """Puts a random one-time task on the timer if auto-pick is on and it
+        isn't working on anything unfinished -- unless you picked "Nothing in
+        particular" yourself."""
+        if not self.storage.get_focus_auto_pick() or self._chose_nothing:
+            return
+        focus = self.storage.get_focus_task()
+        if focus is not None and not focus.get("completed_today"):
+            return
+        if self.storage.pick_random_focus_task() is not None and refresh:
+            self.refresh_focus_tasks()
+
+    def _on_auto_pick_toggled(self, checked):
+        self.storage.set_focus_auto_pick(checked)
+        if checked:
+            self._chose_nothing = False
+            self.refresh_focus_tasks()
 
     def _play_chime(self):
         if self.storage.get_pomodoro_settings().get("chime", True):
