@@ -509,8 +509,28 @@ function newPageId() {
 
 // Saves a page only if nobody else saved it since this phone last saw it
 // (e.g. the desktop catching up after being offline). If they did, their
-// version is kept as a new page first, then ours is saved -- nothing lost.
-async function saveNotesChecked(pageId, title, html) {
+// version is added to the bottom of the same page, then ours is saved --
+// nothing lost, and no extra pages. Saves run one at a time: typing while a
+// slow save is still on its way would otherwise send the next one with the
+// old revision and look like a clash with this phone's own text.
+let notesSaveChain = Promise.resolve();
+const notesLastSaved = new Map();  // page id -> the html this phone last saved there
+
+function saveNotesChecked(pageId, title, html) {
+  const run = notesSaveChain.then(() => saveNotesCheckedNow(pageId, title, html));
+  notesSaveChain = run.catch(() => {});
+  return run;
+}
+
+// The other device's version, as a block for the bottom of this page.
+// (The desktop's text is a whole HTML document; only its body is wanted.)
+function otherVersionHtml(theirs) {
+  const body = /<body[^>]*>([\s\S]*)<\/body>/i.exec(theirs ?? "");
+  const text = body ? body[1] : (theirs ?? "");
+  return `<hr><p><i>From your other device (${new Date().toTimeString().slice(0, 5)}):</i></p>${text}`;
+}
+
+async function saveNotesCheckedNow(pageId, title, html) {
   const main = pageId === "main";
   const page = main ? null : (state?.notes_pages ?? []).find(p => p.id === pageId);
   let base = main ? (state?.notes_rev ?? null) : (page?.rev ?? null);
@@ -526,13 +546,19 @@ async function saveNotesChecked(pageId, title, html) {
     if (data.ok) {
       if (main && state) state.notes_rev = data.rev;
       else if (page) page.rev = data.rev;
-      return;
+      notesLastSaved.set(pageId, html);
+      return html;
     }
-    const theirs = main ? data.notes : data.html;
-    const copyTitle = `${title} (other device, ${new Date().toTimeString().slice(0, 5)})`;
-    await supabaseClient.rpc("set_note_page_checked", { p_id: newPageId(), p_title: copyTitle, p_html: theirs ?? "", p_base_rev: null });
-    toast("Notes changed in two places", `Both kept: the other version is now the page “${copyTitle}”.`);
     base = data.rev;
+    const theirs = main ? data.notes : data.html;
+    if (theirs === notesLastSaved.get(pageId)) continue;  // our own last save (a pull told us an older revision)
+    // Really changed elsewhere: keep theirs at the bottom of this page.
+    const extra = otherVersionHtml(theirs);
+    html += extra;
+    // and into the open editor, so the next save from typing keeps it too
+    const editor = document.getElementById("notes-editor");
+    if (editor && notesPage === pageId) editor.insertAdjacentHTML("beforeend", extra);
+    toast("Notes changed in two places", "Both kept: the other version is at the bottom of the page.");
   }
 }
 
@@ -652,13 +678,13 @@ function scheduleNotesSave(editor) {
     notesSaveNow = null;
     const html = editor.innerHTML;
     if (pageId === "main") {
-      await saveNotesChecked("main", "Notes", html);
-      if (state) state.notes = html;
+      const saved = await saveNotesChecked("main", "Notes", html);
+      if (state) state.notes = saved ?? html;
     } else {
       const page = (state?.notes_pages ?? []).find(p => p.id === pageId);
       if (!page) return;  // deleted meanwhile
-      await saveNotesChecked(pageId, page.title, html);
-      page.html = html;
+      const saved = await saveNotesChecked(pageId, page.title, html);
+      page.html = saved ?? html;
     }
     const status = document.getElementById("notes-status");
     if (status) status.textContent = "Autosaved";

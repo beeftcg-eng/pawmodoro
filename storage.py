@@ -11,8 +11,10 @@ away, then queues the matching change in an outbox that sync_engine.py sends
 in the background. The UI never waits on the network, and edits made while
 offline are kept and uploaded later. See sync_engine.py.
 """
+import html as html_lib
 import json
 import random
+import re
 import os
 import shutil
 import threading
@@ -435,25 +437,48 @@ class Storage:
             self.save()
 
     def take_notes_conflicts(self):
-        """UI thread: keeps each other-device version as a new page.
-        Returns the titles of the pages made."""
+        """UI thread: adds each other-device version to the bottom of the
+        page it clashed on (a new page only if that one was deleted since).
+        Returns the titles of the pages changed."""
         with self._lock:
             conflicts = self.data.get("notes_conflicts", [])
             self.data["notes_conflicts"] = []
-        made = []
+        changed = []
         for conflict in conflicts:
-            if conflict["page_id"] == self.MAIN_NOTES_PAGE:
-                base = "Notes"
+            page_id = conflict["page_id"]
+            if page_id == self.MAIN_NOTES_PAGE:
+                title = "Notes"
             else:
-                page = self._find_note_page(conflict["page_id"])
-                base = page["title"] if page else (conflict.get("title") or "Page")
-            title = f"{base} (other device, {conflict['at'][11:16]})"
-            page_id = self.add_note_page(title)
-            self.set_page_html(page_id, conflict["html"] or "")
-            made.append(title)
+                page = self._find_note_page(page_id)
+                if page is None:
+                    title = f"{conflict.get('title') or 'Page'} (other device, {conflict['at'][11:16]})"
+                    page_id = self.add_note_page(title)
+                    self.set_page_html(page_id, conflict["html"] or "")
+                    changed.append(title)
+                    continue
+                title = page["title"]
+            self.set_page_html(page_id, self._append_other_version(
+                self.get_page_html(page_id), conflict["html"] or "", conflict["at"][11:16]))
+            changed.append(title)
         if conflicts:
             self.save()
-        return made
+        return changed
+
+    @staticmethod
+    def _append_other_version(ours, theirs, at):
+        """`ours` with another device's version of the same page added at
+        the bottom under a divider. Either may be plain text, a fragment
+        (the phone) or a whole HTML document (Qt's toHtml)."""
+        def as_html(text):
+            if "<" not in text:
+                return html_lib.escape(text).replace("\n", "<br />")
+            body = re.search(r"<body[^>]*>(.*)</body>", text, re.S | re.I)
+            return body.group(1) if body else text
+        extra = f"<hr /><p><i>From your other device ({at}):</i></p>{as_html(theirs)}"
+        if "<" not in ours:
+            return as_html(ours) + extra
+        end = ours.lower().rfind("</body>")
+        return ours[:end] + extra + ours[end:] if end >= 0 else ours + extra
 
     def outbox_note_pages_unsupported(self):
         """Called by the sync thread when the cloud schema has no notes

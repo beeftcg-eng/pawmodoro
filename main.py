@@ -265,15 +265,20 @@ class MainWindow(QMainWindow):
 
     def _keep_conflicting_notes(self):
         """Notes changed here and on another device before they met: the
-        other version is kept as its own page rather than lost."""
-        made = self.storage.take_notes_conflicts()
-        if not made:
+        other version is added to the bottom of the same page rather than
+        lost. Not while you're typing (the editor would save over it); the
+        next status tick tries again."""
+        notes_tab = self.notes_checklist_tab.notes_tab
+        if notes_tab.is_busy():
             return
-        self.notes_checklist_tab.notes_tab.maybe_reload_from_remote()
+        changed = self.storage.take_notes_conflicts()
+        if not changed:
+            return
+        notes_tab.maybe_reload_from_remote()
         notifier.send(
             "Notes changed in two places",
-            f"Both versions are kept. The other device's is now the page “{made[0]}”"
-            + (f" (and {len(made) - 1} more)" if len(made) > 1 else "") + ".",
+            f"Both versions are kept: the other device's is at the bottom of “{changed[0]}”"
+            + (f" (and {len(changed) - 1} more)" if len(changed) > 1 else "") + ".",
             on_click=lambda: (self.restore_from_widget(), self.tabs.setCurrentWidget(self.notes_checklist_tab)))
 
     def _open_sync_settings(self):

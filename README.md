@@ -55,6 +55,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $dir 'pawmodoro\i
 
 ## What changed from the first version
 
+**v2.19.1 — writing notes on the phone no longer makes extra pages.** No schema change.
+- **The bug**: while you typed on the phone, a save could still be on its way when the next one started (on mobile data that easily takes longer than the 800 ms between saves), and a background refresh could hand the phone an older revision. Either way the phone mistook its own earlier text for a change from another device and kept it as a new page, "Notes (other device, 14:32)", over and over, and those pages showed up on the desktop. The phone now sends one save at a time and recognises its own last save.
+- **No more extra pages at all**: when notes really were changed on two devices at once, the other device's version is now added to the bottom of the same page under a line ("From your other device (14:32):") instead of becoming a new page, on both the phone and the desktop. (Only if that page was deleted in the meantime does it still get a page of its own.) Pages already made by the old behaviour stay until you delete them.
+- **Honest testing note**: covered by phone tests in the simulated browser (including a slow cloud with overlapping saves and a stale refresh) and storage tests. The desktop window tests didn't run on the dev machine (no PyQt6 there) and are left to CI. Not tried on a real phone against the real cloud.
+
 **v2.19.0 — one-time tasks get their own tab, and the timer can pick what to work on.** No schema change.
 - **Recurring and one-time tabs**: the checklist is split into **🔁 Recurring** (daily, weekly, monthly and specific-day tasks) and **📌 One-time** (tasks set to "once"). Each tab shows how many of its tasks are still open. Adding from the One-time tab makes a one-time task, and a new task always shows up on the tab it belongs to.
 - **🎲 Pick for me**: next to "Working on" on the Pomodoro tab, this picks one of your unfinished one-time tasks at random (a different one each press). With **Pick a one-time task for me automatically** on (the default), the timer does it by itself whenever it isn't working on anything or its task is done: when you open the tab, press Start, or finish a session. Choosing "Nothing in particular" yourself is respected. The setting stays on this computer.

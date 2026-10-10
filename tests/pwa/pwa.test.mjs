@@ -202,22 +202,19 @@ test("notes saved on top of the latest revision go straight through", async () =
   } finally { app.close(); }
 });
 
-test("a notes conflict keeps the other version as a page, then saves ours", async () => {
+test("a notes conflict adds the other version to the same page, then saves", async () => {
   let attempt = 0;
   const app = await bootApp({
     set_notes_checked: () => (++attempt === 1
-      ? { data: { ok: false, rev: 7, notes: "<p>desktop's</p>" }, error: null }
+      ? { data: { ok: false, rev: 7, notes: "<html><body><p>desktop's</p></body></html>" }, error: null }
       : { data: { ok: true, rev: 8 }, error: null }),
-    set_note_page_checked: () => ({ data: { ok: true, rev: 1 }, error: null }),
   });
   try {
     await app.window.eval('saveNotesChecked("main", "Notes", "<p>phone\'s</p>")');
-    const copy = app.calls.find(c => c.name === "set_note_page_checked");
-    assert.equal(copy.params.p_html, "<p>desktop's</p>");
-    assert.match(copy.params.p_title, /^Notes \(other device, \d\d:\d\d\)$/);
+    assert.ok(!app.calls.some(c => c.name === "set_note_page_checked"), "no extra page");
     const saves = app.calls.filter(c => c.name === "set_notes_checked");
     assert.deepEqual(saves.map(s => s.params.p_base_rev), [3, 7]);
-    assert.equal(saves[1].params.p_notes, "<p>phone's</p>");
+    assert.match(saves[1].params.p_notes, /^<p>phone's<\/p><hr><p><i>From your other device \(\d\d:\d\d\):<\/i><\/p><p>desktop's<\/p>$/);
   } finally { app.close(); }
 });
 
@@ -231,10 +228,34 @@ test("a page conflict works the same way", async () => {
   try {
     await app.window.eval('saveNotesChecked("p1", "Ideas", "<p>mine</p>")');
     const calls = app.calls.filter(c => c.name === "set_note_page_checked");
+    assert.equal(calls.length, 2);
     assert.equal(calls[0].params.p_base_rev, 2);
-    assert.equal(calls[1].params.p_html, "<p>theirs</p>");
-    assert.match(calls[1].params.p_title, /^Ideas \(other device/);
-    assert.equal(calls[2].params.p_base_rev, 5);
+    assert.equal(calls[1].params.p_id, "p1");
+    assert.equal(calls[1].params.p_base_rev, 5);
+    assert.match(calls[1].params.p_html, /^<p>mine<\/p><hr>.*<p>theirs<\/p>$/);
+  } finally { app.close(); }
+});
+
+test("typing during a slow save is never a clash with this phone's own text", async () => {
+  // A cloud that takes a while to answer, as on mobile data.
+  const cloud = { rev: 3, notes: "<p>main</p>" };
+  const app = await bootApp({
+    set_notes_checked: async (p) => {
+      await new Promise(r => setTimeout(r, 30));
+      if (p.p_base_rev !== cloud.rev && p.p_notes !== cloud.notes) return { data: { ok: false, rev: cloud.rev, notes: cloud.notes }, error: null };
+      cloud.rev += 1; cloud.notes = p.p_notes;
+      return { data: { ok: true, rev: cloud.rev }, error: null };
+    },
+  });
+  try {
+    await app.window.eval(`Promise.all([
+      saveNotesChecked("main", "Notes", "<p>a</p>"),
+      saveNotesChecked("main", "Notes", "<p>ab</p>"),
+    ])`);
+    // Then a pull that started before those saves lands with the old revision.
+    app.window.eval("state.notes_rev = 3");
+    await app.window.eval('saveNotesChecked("main", "Notes", "<p>abc</p>")');
+    assert.equal(cloud.notes, "<p>abc</p>", "no other-device copy appended");
   } finally { app.close(); }
 });
 

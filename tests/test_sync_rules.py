@@ -168,17 +168,32 @@ class ConflictTests(StorageTestCase):
         self.assertEqual(self.storage.data["notes_rev"], 6)
         self.assertEqual(self.storage.take_notes_conflicts(), [])
 
-    def test_conflict_keeps_both_versions(self):
+    def test_conflict_keeps_both_versions_on_the_same_page(self):
         cloud = FakeCloud()
         self.storage.data["notes_rev"] = 3  # the phone saved twice since
         self.storage.set_notes("written offline here")
         self.flush(cloud)
         self.assertEqual(cloud.notes["text"], "written offline here")
+        pages_before = len(self.storage.get_note_pages())
+        self.assertEqual(self.storage.take_notes_conflicts(), ["Notes"])
+        self.assertEqual(len(self.storage.get_note_pages()), pages_before, "no extra page")
+        notes = self.storage.get_notes()
+        self.assertTrue(notes.startswith("written offline here"))
+        self.assertIn("the phone&#x27;s notes", notes)
+        self.assertEqual(self.outbox_ops(), ["set_notes"], "the merged text goes up")
+
+    def test_other_version_goes_inside_a_qt_document(self):
+        ours = "<html><head></head><body><p>mine</p></body></html>"
+        merged = self.storage._append_other_version(ours, "<!DOCTYPE x><html><body style=''><p>theirs</p></body></html>", "10:15")
+        self.assertTrue(merged.endswith("</body></html>"))
+        self.assertLess(merged.index("<p>mine</p>"), merged.index("<p>theirs</p>"))
+        self.assertEqual(merged.count("<body"), 1)
+
+    def test_conflict_on_a_page_deleted_since_becomes_a_page(self):
+        self.storage.data["notes_conflicts"] = [
+            {"page_id": "gone", "title": "Ideas", "html": "<p>theirs</p>", "at": "2026-10-10T10:15"}]
         made = self.storage.take_notes_conflicts()
-        self.assertEqual(len(made), 1)
-        page = next(p for p in self.storage.get_note_pages() if p["title"] == made[0])
-        self.assertEqual(self.storage.get_page_html(page["id"]), "the phone's notes")
-        self.assertEqual(self.storage.get_notes(), "written offline here")
+        self.assertEqual(made, ["Ideas (other device, 10:15)"])
 
     def test_a_second_edit_after_our_own_upload_is_not_a_conflict(self):
         cloud = FakeCloud()
