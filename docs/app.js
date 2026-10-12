@@ -53,6 +53,14 @@ function setTheme(name) {
 
 let supabaseClient = null;
 let state = null;         // last sync_pull() result
+// Fingerprints of the state / household last applied (sync_pull_if_changed,
+// household_pull_if_changed): a periodic poll offers them and gets just
+// "unchanged" back when nothing changed. Only polls offer them -- the pull
+// after anything done here is a full one, so a refused action can never
+// leave a stale screen behind.
+let stateFingerprint = null;
+let householdFingerprint = null;
+let fingerprintsSupported = true;
 let pomodoro = {
   phase: "work",          // "work" | "short_break" | "long_break"
   secondsLeft: 25 * 60,
@@ -61,7 +69,13 @@ let pomodoro = {
   intervalId: null,
   deadline: 0,            // Date.now() value the running phase ends at (the timer counts against this, not ticks)
   completing: false,
+  paused: false,          // stopped part-way (so a re-render keeps the time left)
+  // One timer across devices (set_timer_state / sync_pull's "timer"):
+  owner: true,            // this phone started / changed the timer last
+  revSeen: 0,             // the shared timer revision already followed (or written)
+  takeover: null,         // {session, phase, minutes} a followed phase that ended here, waiting for the owner
 };
+const TIMER_TAKEOVER_MS = 90000;
 
 let lastTzSent = null;         // UTC offset (minutes) last reported to the server
 let tzRetryAt = 0;
@@ -110,6 +124,24 @@ function getSettings() {
 
 function saveSettings(s) {
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
+}
+
+// This phone's id for the shared timer (which device changed it last).
+function deviceId() {
+  try {
+    let id = localStorage.getItem("pawmodoro_device");
+    if (!id) {
+      id = "phone-" + Math.random().toString(16).slice(2, 14);
+      localStorage.setItem("pawmodoro_device", id);
+    }
+    return id;
+  } catch {
+    return "phone";
+  }
+}
+
+function timerShared() {
+  return getSettings().shareTimer !== false;
 }
 
 // ---------- Boot ----------
@@ -290,7 +322,10 @@ async function enterApp() {
   // load, it needs real data on this very first render regardless.
   await sendTzOffset();
   const { data, error } = await supabaseClient.rpc("sync_pull");
-  if (!error) state = data;
+  if (!error) {
+    state = data;
+    followRemoteTimer(state?.timer);
+  }
   await refreshHousehold(true);
   renderShell();
   updateLevelBadge();
@@ -306,7 +341,7 @@ function startPolling() {
   // pick up changes made on the desktop app; skipped while the page is hidden
   // (screen off / another app in front), which saves battery and data
   pollIntervalId = setInterval(() => {
-    if (!document.hidden) pullAndRender();
+    if (!document.hidden) pullAndRender({ poll: true });
     checkTaskReminders();
   }, 5000);
 }
@@ -331,14 +366,31 @@ async function refreshHousehold(force) {
   const due = force || activeTab === "shared" || activeTab === "progress" || Date.now() - lastHouseholdFetch > 30000;
   if (!due || !householdSupported) return;
   lastHouseholdFetch = Date.now();
-  const { data, error } = await supabaseClient.rpc("household_pull");
+  const { data, error } = await fetchHousehold(force);
   if (error) {
     // A cloud schema from before households existed: carry on without them.
     if (error.code === "PGRST202" || error.status === 404) householdSupported = false;
     if (householdState === undefined) householdState = null;
     return;
   }
-  householdState = data; // null when this account isn't in a household
+  if (data?.unchanged) return;
+  householdFingerprint = data?.fingerprint ?? null;
+  householdState = data?.household ?? null; // null when this account isn't in a household
+}
+
+// household_pull_if_changed (like fetchState): {household, fingerprint}, or
+// {unchanged} when the fingerprint offered still matches. Shaped the same
+// on an older schema, from a plain household_pull.
+async function fetchHousehold(force) {
+  if (fingerprintsSupported) {
+    const { data, error } = await supabaseClient.rpc("household_pull_if_changed",
+      { p_fingerprint: force ? null : householdFingerprint });
+    if (!error) return { data };
+    if (error.code !== "PGRST202" && error.status !== 404) return { error };
+    fingerprintsSupported = false;
+  }
+  const { data, error } = await supabaseClient.rpc("household_pull");
+  return error ? { error } : { data: { household: data } };
 }
 
 function renderShell() {
@@ -361,6 +413,7 @@ function renderShell() {
     </nav>`;
   document.getElementById("logout-btn").addEventListener("click", async () => {
     stopPolling();
+    stateFingerprint = householdFingerprint = null;
     await supabaseClient.auth.signOut();
     showLoginScreen();
   });
@@ -385,7 +438,18 @@ function switchTab(tab) {
 
 let pullRequestId = 0;
 
-async function pullAndRender() {
+async function fetchState(poll) {
+  if (fingerprintsSupported) {
+    const { data, error } = await supabaseClient.rpc("sync_pull_if_changed", { p_fingerprint: poll ? stateFingerprint : null });
+    if (!error) return { data };
+    // A cloud schema from before v2.20: plain pulls from now on.
+    if (error.code !== "PGRST202" && error.status !== 404) return { error };
+    fingerprintsSupported = false;
+  }
+  return supabaseClient.rpc("sync_pull");
+}
+
+async function pullAndRender({ poll = false } = {}) {
   // Every call actually fires the request — an action like checking off a
   // task needs its own follow-up pull to always go through, never get
   // silently skipped because a periodic poll happened to be in flight.
@@ -395,13 +459,17 @@ async function pullAndRender() {
   // older request can never overwrite state a faster newer one already set.
   const requestId = ++pullRequestId;
   await sendTzOffset();
-  const { data, error } = await supabaseClient.rpc("sync_pull");
+  const { data, error } = await fetchState(poll);
   if (requestId !== pullRequestId) return;
   if (error) {
     console.error("sync_pull failed", error);
     return;
   }
-  state = data;
+  if (!data?.unchanged) {
+    stateFingerprint = data?.fingerprint ?? null;
+    state = data;
+    followRemoteTimer(state?.timer);
+  }
   await refreshHousehold(false);
   if (requestId !== pullRequestId) return;
   updateLevelBadge();
@@ -712,6 +780,22 @@ function taskRemindsToday(task, now) {
   return true;
 }
 
+// Days in a row a daily task has been done (from done_days, which the cloud
+// keeps); today not done yet doesn't break it. The same rule as
+// task_dates.streak.
+function taskStreak(task, now = new Date()) {
+  if (task.recurrence !== "daily" || !Array.isArray(task.done_days)) return 0;
+  const done = new Set(task.done_days);
+  const day = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  if (!done.has(localISODate(day))) day.setDate(day.getDate() - 1);
+  let count = 0;
+  while (done.has(localISODate(day))) {
+    count++;
+    day.setDate(day.getDate() - 1);
+  }
+  return count;
+}
+
 // "overdue", "today" or null.
 function taskDueStatus(task, now = new Date()) {
   if (task.recurrence !== "once" || !task.due_date || task.completed_today) return null;
@@ -833,7 +917,8 @@ function renderTaskList(container, tasks, { showRecurrence = false, reminders = 
     const subtasks = Array.isArray(task.subtasks) ? task.subtasks : [];
     const extras = !showRecurrence ? ""
       : (subtasks.length ? ` <em>☑ ${subtasks.filter(s => s.done).length}/${subtasks.length}</em>` : "")
-        + ((task.note ?? "").trim() ? " <em>\u{1F4DD}</em>" : "");
+        + ((task.note ?? "").trim() ? " <em>\u{1F4DD}</em>" : "")
+        + (taskStreak(task) >= 2 ? ` <em title="days in a row">\u{1F525} ${taskStreak(task)}</em>` : "");
     const bell = !reminders ? ""
       : task.reminder_every_h ? ` <em>\u{1F514} every ${Number(task.reminder_every_h)}h</em>`
       : task.reminder_time ? ` <em>\u{1F514} ${escapeHtml(task.reminder_time)}</em>` : "";
@@ -1152,7 +1237,7 @@ async function toggleTask(taskId, done) {
 
 function renderPomodoro() {
   const s = getSettings();
-  if (!pomodoro.running) pomodoro.secondsLeft = phaseSeconds(pomodoro.phase, s);
+  if (!pomodoro.running && !pomodoro.paused) pomodoro.secondsLeft = phaseSeconds(pomodoro.phase, s);
   const view = document.getElementById("view");
   view.innerHTML = `
     <div class="pane pomodoro-pane">
@@ -1171,6 +1256,8 @@ function renderPomodoro() {
         <label>Short break (min) <input id="set-short" type="number" min="1" value="${s.shortBreakMin}"></label>
         <label>Long break (min) <input id="set-long" type="number" min="1" value="${s.longBreakMin}"></label>
         <label>Sessions before long break <input id="set-count" type="number" min="1" value="${s.sessionsBeforeLong}"></label>
+        <label class="check-label"><input id="set-share" type="checkbox" ${s.shareTimer === false ? "" : "checked"}>
+          One timer on all my devices</label>
         <button id="save-settings">Save settings</button>
       </details>
     </div>`;
@@ -1185,9 +1272,10 @@ function renderPomodoro() {
       shortBreakMin: parseInt(document.getElementById("set-short").value, 10) || 5,
       longBreakMin: parseInt(document.getElementById("set-long").value, 10) || 15,
       sessionsBeforeLong: parseInt(document.getElementById("set-count").value, 10) || 4,
+      shareTimer: document.getElementById("set-share").checked,
     };
     saveSettings(newSettings);
-    if (!pomodoro.running) {
+    if (!pomodoro.running && !pomodoro.paused) {
       pomodoro.secondsLeft = phaseSeconds(pomodoro.phase, newSettings);
       updateTimerDisplay();
     }
@@ -1225,16 +1313,20 @@ function updateTimerDisplay() {
 function togglePomodoro() {
   if (pomodoro.running) pausePomodoro();
   else startPomodoro();
+  publishTimer();
 }
 
-function startPomodoro() {
+// `deadline`: run until then (another device's timer) instead of for
+// secondsLeft from now; that device alerts for it, so no push is booked here.
+function startPomodoro(deadline) {
   pomodoro.running = true;
-  pomodoro.deadline = Date.now() + pomodoro.secondsLeft * 1000;
+  pomodoro.paused = false;
+  pomodoro.deadline = deadline ?? Date.now() + pomodoro.secondsLeft * 1000;
   clearInterval(pomodoro.intervalId);
   pomodoro.intervalId = setInterval(tickPomodoro, 500);
   requestWakeLock();
   updateTimerDisplay();
-  scheduleTimerPush();
+  if (deadline === undefined) scheduleTimerPush();
 }
 
 // With push on, the cloud also sends "session over" at the end time, so it
@@ -1260,6 +1352,7 @@ function pausePomodoro() {
   settlePomodoro();
   cancelTimerPush();
   pomodoro.running = false;
+  pomodoro.paused = true;
   clearInterval(pomodoro.intervalId);
   releaseWakeLock();
   updateTimerDisplay();
@@ -1274,10 +1367,71 @@ function resetPomodoro() {
   cancelTimerPush();
   clearInterval(pomodoro.intervalId);
   pomodoro.running = false;
+  pomodoro.paused = false;
   releaseWakeLock();
   pomodoro.phase = "work";
   pomodoro.secondsLeft = phaseSeconds("work", getSettings());
   updateTimerDisplay();
+  publishTimer();
+}
+
+// ---- One timer across devices ----
+// Tells the other devices what this timer now is; a no-op with sharing off.
+function publishTimer() {
+  pomodoro.owner = true;
+  pomodoro.takeover = null;
+  if (!timerShared() || !supabaseClient) return;
+  const timerState = { phase: pomodoro.phase, running: pomodoro.running, device: deviceId() };
+  if (pomodoro.running) timerState.ends_at = pomodoro.deadline / 1000;
+  else timerState.seconds_left = pomodoro.secondsLeft;
+  supabaseClient.rpc("set_timer_state", { p_state: timerState }).then(({ data, error }) => {
+    if (error) { if (!isMissingFunction(error)) console.warn("set_timer_state", error); return; }
+    pomodoro.revSeen = Math.max(pomodoro.revSeen, Number(data) || 0);
+  });
+}
+
+// Another device started, paused, reset or moved on the timer: do the same.
+function followRemoteTimer(timer) {
+  if (!timerShared() || !timer || !["work", "short_break", "long_break"].includes(timer.phase)) return;
+  const rev = Number(timer.rev) || 0;
+  if (rev <= pomodoro.revSeen) return;
+  pomodoro.revSeen = rev;
+  if (timer.device === deviceId()) return;
+  const endsMs = (Number(timer.ends_at) || 0) * 1000;
+  if (timer.running && endsMs < Date.now() - 60000) return; // left running somewhere long ago
+  pomodoro.owner = false;
+  pomodoro.takeover = null;
+  if (pomodoro.running) cancelTimerPush(); // its device alerts for it now
+  pomodoro.phase = timer.phase;
+  if (timer.running && endsMs) {
+    startPomodoro(endsMs);
+    settlePomodoro();
+  } else {
+    clearInterval(pomodoro.intervalId);
+    pomodoro.running = false;
+    releaseWakeLock();
+    pomodoro.secondsLeft = Number(timer.seconds_left) || phaseSeconds(timer.phase, getSettings());
+    pomodoro.paused = pomodoro.secondsLeft !== phaseSeconds(timer.phase, getSettings());
+  }
+  updateTimerDisplay();
+}
+
+// A finished phase, counted once however many devices report it (the key).
+async function creditPhase(phase, session, minutes) {
+  const name = phase === "work" ? "record_pomodoro_completed" : "record_break_completed";
+  const params = phase === "work" ? { p_minutes: minutes } : {};
+  let { data, error } = await supabaseClient.rpc(name, { ...params, p_session: session });
+  if (error && isMissingFunction(error)) ({ data, error } = await supabaseClient.rpc(name, params)); // older cloud
+  return data;
+}
+
+async function takeOverTimer(pending) {
+  if (!pending || pending !== pomodoro.takeover) return; // the owner reported back meanwhile
+  pomodoro.takeover = null;
+  const data = await creditPhase(pending.phase, pending.session, pending.minutes);
+  if (pending.phase === "work" && data && !data.already_counted) toast("Focus session counted", `+${data.xp_gained} XP`);
+  publishTimer();
+  await pullAndRender();
 }
 
 async function tickPomodoro() {
@@ -1322,10 +1476,19 @@ async function onPhaseComplete() {
   const pushed = pushOn && Date.now() - pomodoro.deadline > 15000;
   if (!pushed) cancelTimerPush();
   const announce = pushed ? toast : notify;
+  const session = `${pomodoro.phase}:${Math.round(pomodoro.deadline / 1000)}`;
+  // Following another device's timer: it counts the session, unless it
+  // hasn't reported back after a while (then this phone does).
+  const countsHere = pomodoro.owner || !timerShared();
+  if (!countsHere) {
+    const pending = { session, phase: pomodoro.phase, minutes: s.workMin };
+    pomodoro.takeover = pending;
+    setTimeout(() => takeOverTimer(pending), TIMER_TAKEOVER_MS);
+  }
   if (pomodoro.phase === "work") {
     pomodoro.sessionCount += 1;
-    const { data } = await supabaseClient.rpc("record_pomodoro_completed", { p_minutes: s.workMin });
-    announce("Focus session complete!", data ? `+${data.xp_gained} XP` : "Nice work!");
+    const data = countsHere ? await creditPhase("work", session, s.workMin) : null;
+    announce("Focus session complete!", data && !data.already_counted ? `+${data.xp_gained} XP` : "Nice work!");
     if (data) {
       for (const q of data.completed_quests ?? []) {
         toast("\u{1F31F} Quest complete!", `${q.desc} — +${q.bonus_xp} XP`);
@@ -1333,12 +1496,14 @@ async function onPhaseComplete() {
     }
     pomodoro.phase = (pomodoro.sessionCount % s.sessionsBeforeLong === 0) ? "long_break" : "short_break";
   } else {
-    await supabaseClient.rpc("record_break_completed");
+    if (countsHere) await creditPhase(pomodoro.phase, session);
     announce("Break's over", "Back to it when you're ready.");
     pomodoro.phase = "work";
   }
+  pomodoro.paused = false;
   pomodoro.secondsLeft = phaseSeconds(pomodoro.phase, s);
   updateTimerDisplay();
+  if (countsHere) publishTimer();
   await pullAndRender();
 }
 
@@ -1368,6 +1533,14 @@ function localISODate(d) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
+// The Tuesday that starts the quest week `now` is in, "YYYY-MM-DD" (the same
+// rule as gamification.week_start_for and week_start_for() in schema.sql).
+function weekStartFor(now) {
+  const start = new Date(now);
+  start.setDate(start.getDate() - ((now.getDay() + 6) % 7 - 1 + 7) % 7);
+  return localISODate(start);
+}
+
 function formatMinutes(min) {
   const h = Math.floor(min / 60), m = min % 60;
   return h ? `${h}h ${String(m).padStart(2, "0")}m` : `${m}m`;
@@ -1385,10 +1558,7 @@ function renderHistory() {
     days.push({ key: localISODate(d), label: "MTWTFSS"[(d.getDay() + 6) % 7], min: rows.get(localISODate(d))?.focus_min ?? 0, today: i === 0 });
   }
   const peak = Math.max(1, ...days.map(d => d.min));
-  const daysSinceReset = ((now.getDay() + 6) % 7 - 1 + 7) % 7;
-  const weekStart = new Date(now);
-  weekStart.setDate(weekStart.getDate() - daysSinceReset);
-  const weekKey = localISODate(weekStart);
+  const weekKey = weekStartFor(now);
   const week = { pomodoros: 0, focus_min: 0, tasks: 0 };
   for (const r of state.history ?? []) {
     if (r.day >= weekKey) { week.pomodoros += r.pomodoros; week.focus_min += r.focus_min; week.tasks += r.tasks; }
@@ -1635,8 +1805,9 @@ function renderShared() {
       </div>
       <label>
         <input type="checkbox" ${task.done ? "checked" : ""}>
-        <span>${escapeHtml(task.text)}${schedule ? ` <em>${escapeHtml(schedule)}${sharedIsOverdue(task) ? " ⚠ overdue" : ""}</em>` : ""}${task.done && task.done_by_name ? ` <em>✓ ${escapeHtml(task.done_by_name)}</em>` : ""}</span>
+        <span>${escapeHtml(task.text)}${schedule ? ` <em>${escapeHtml(schedule)}${sharedIsOverdue(task) ? " ⚠ overdue" : ""}</em>` : ""}${task.assigned_to ? ` <em>→ ${task.assigned_to_me ? "you" : escapeHtml(task.assigned_name ?? "?")}</em>` : ""}${task.done && task.done_by_name ? ` <em>✓ ${escapeHtml(task.done_by_name)}</em>` : ""}</span>
       </label>
+      <button class="rename-btn assign-btn" title="Whose turn (tap to change)">\u{1F464}</button>
       <button class="remove-btn" title="Remove">✕</button>`;
     li.querySelector("input").addEventListener("change", async e => {
       await sharedCall("shared_set_done", { p_id: task.id, p_done: e.target.checked });
@@ -1644,6 +1815,15 @@ function renderShared() {
     });
     li.querySelector(".remove-btn").addEventListener("click", async () => {
       await sharedCall("shared_remove_task", { p_id: task.id });
+      await reloadShared();
+    });
+    // Anyone → each member in turn → anyone again. Only the assignee gets its reminders.
+    li.querySelector(".assign-btn").addEventListener("click", async () => {
+      const members = (h.members ?? []).filter(m => m.user_id);
+      const at = members.findIndex(m => m.user_id === task.assigned_to);
+      const next = at + 1 < members.length ? members[at + 1] : null;
+      const { ok } = await sharedCall("shared_assign", { p_id: task.id, p_user: next ? next.user_id : null });
+      if (ok) toast(next ? `\u{1F464} ${next.is_me ? "Your" : `${next.name ?? "Their"}'s`} turn` : "\u{1F464} Anyone", task.text);
       await reloadShared();
     });
     li.querySelectorAll(".reorder-btn").forEach(btn => {

@@ -178,3 +178,40 @@ class DetailSyncTests(StorageTestCase):
         st.adopt_remote_state(remote_state([{"id": task["id"], "text": "Taxes", "recurrence": "once"}]))
         task = st.get_checklist()[0]
         self.assertEqual((task["due_date"], task["note"], len(task["subtasks"])), ("2026-10-03", "note", 1))
+
+
+class StreakTests(StorageTestCase):
+    def test_ticking_records_the_day_and_unticking_takes_it_back(self):
+        st = self.storage
+        task = st.add_task("Walk", "daily")
+        st.set_task_done(task["id"], True)
+        self.assertEqual(st._find_task(task["id"])["done_days"], [date.today().isoformat()])
+        st.set_task_done(task["id"], False)
+        self.assertEqual(st._find_task(task["id"])["done_days"], [])
+
+    def test_daily_streak_survives_until_today_is_over(self):
+        today = date(2026, 10, 12)
+        days = [(today - timedelta(days=n)).isoformat() for n in (1, 2, 3, 5)]
+        task = {"recurrence": "daily", "done_days": days}
+        self.assertEqual(task_dates.streak(task, today), 3, "not done yet today")
+        task["done_days"] = days + [today.isoformat()]
+        self.assertEqual(task_dates.streak(task, today), 4)
+        self.assertEqual(task_dates.streak(task, today + timedelta(days=2)), 0, "a missed day ends it")
+
+    def test_specific_day_tasks_count_weeks(self):
+        today = date(2026, 10, 12)  # a Monday
+        task = {"recurrence": "weekday", "weekday": 3,  # Thursday
+                "done_days": ["2026-10-08", "2026-10-01", "2026-09-17"]}
+        self.assertEqual(task_dates.streak(task, today), 2)
+        self.assertEqual(task_dates.streak({"recurrence": "once", "done_days": ["2026-10-12"]}, today), 0)
+
+    def test_done_days_come_from_the_cloud_unless_it_is_older(self):
+        st = self.storage
+        task = st.add_task("Walk", "daily")
+        st.set_task_done(task["id"], True)
+        st.data["sync_outbox"] = []
+        remote = {"id": task["id"], "text": "Walk", "recurrence": "daily", "subtasks": []}
+        st.adopt_remote_state(remote_state([dict(remote, done_days=["2026-10-01", "2026-10-02"])]))
+        self.assertEqual(st.get_checklist()[0]["done_days"], ["2026-10-01", "2026-10-02"])
+        st.adopt_remote_state(remote_state([remote]))  # a v2.18 cloud: no done_days key
+        self.assertEqual(st.get_checklist()[0]["done_days"], ["2026-10-01", "2026-10-02"])

@@ -1,21 +1,32 @@
-name: Deploy push function
+name: Deploy cloud
 
-# Keeps the deployed send-reminders Edge Function (phone push
-# notifications) in step with supabase/functions/: deploys whenever it
-# changes on main, on every release tag, or by hand from the Actions tab.
-# Needs the repo secret SUPABASE_ACCESS_TOKEN (a Supabase personal access
-# token, supabase.com/dashboard/account/tokens); without it the job only
-# warns. The project is the one in cloud_defaults.py.
+# Keeps the shared Supabase project in step with supabase/: whenever it
+# changes on main, on every release tag, or by hand from the Actions tab, in
+# the order a schema change needs (CLAUDE.md): the send-reminders Edge
+# Function (phone push notifications) first, then schema.sql, then
+# push_reminders.sql. schema.sql only goes out after its tests pass.
+#
+# Repo secrets (each step only warns and skips when its secret is missing):
+#   SUPABASE_ACCESS_TOKEN  a Supabase personal access token
+#                          (supabase.com/dashboard/account/tokens), for the function
+#   SUPABASE_DB_URL        the database's connection string (Project Settings →
+#                          Database → Connection string → Session pooler, with
+#                          the database password filled in), for the SQL
+# The project is the one in cloud_defaults.py.
 
 on:
   push:
     branches: [main]
-    paths: ["supabase/functions/**"]
+    paths: ["supabase/**"]
     tags: ["v*"]
   workflow_dispatch: {}
 
+concurrency:
+  group: deploy-cloud
+  cancel-in-progress: false
+
 jobs:
-  deploy:
+  function:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -34,3 +45,36 @@ jobs:
           fi
           ref=$(python3 -c "import cloud_defaults, re; print(re.match(r'https://([a-z0-9]+)\.supabase\.co', cloud_defaults.DEFAULT_URL).group(1))")
           supabase functions deploy send-reminders --project-ref "$ref" --use-api
+
+  schema:
+    needs: function
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test the schema first
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
+        run: tests/sql/run.sh
+
+      - name: Apply schema.sql, then push_reminders.sql
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          if [ -z "$SUPABASE_DB_URL" ]; then
+            echo "::warning::SUPABASE_DB_URL isn't set, so schema.sql wasn't applied: re-run it in the Supabase SQL Editor"
+            exit 0
+          fi
+          # one transaction: a failure part-way leaves the cloud as it was
+          psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -q --single-transaction -f supabase/schema.sql
+          psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -q -f supabase/push_reminders.sql
+          echo "cloud schema is now version $(psql "$SUPABASE_DB_URL" -At -c 'select public.schema_version()')"

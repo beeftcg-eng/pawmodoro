@@ -7,3 +7,8 @@ Icon=__ICON_PATH__
 Terminal=false
 Categories=Utility;Office;
 StartupWMClass=Pawmodoro
+Actions=quick-add;
+
+[Desktop Action quick-add]
+Name=Add a task
+Exec=__INSTALL_DIR__/run.sh --quick-add

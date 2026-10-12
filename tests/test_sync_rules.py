@@ -308,3 +308,180 @@ class PullTests(StorageTestCase):
         remote = [{"id": task["id"], "text": "Meds", "recurrence": "daily", "reminder_time": "09:00"}]
         self.storage._apply_remote_state(remote_state(remote))
         self.assertIsNone(self.storage._find_task(task["id"])["reminder_every_h"])
+
+
+class PollingCloud:
+    """A cloud for SyncEngine._pull: sync_pull_if_changed answers
+    "unchanged" when given the current fingerprint."""
+    refresh_token = "t"
+
+    def __init__(self, state, household=None, outdated_schema=False):
+        self.state, self.household, self.outdated_schema = state, household, outdated_schema
+        self.calls = []
+
+    def _fp(self, value):
+        return str(hash(repr(value)))
+
+    def sync_pull(self):
+        self.calls.append(("sync_pull", None))
+        return dict(self.state)
+
+    def sync_pull_if_changed(self, fingerprint):
+        self.calls.append(("sync_pull_if_changed", fingerprint))
+        if self.outdated_schema:
+            raise outdated()
+        fp = self._fp(self.state)
+        return {"unchanged": True, "fingerprint": fp} if fingerprint == fp else dict(self.state, fingerprint=fp)
+
+    def household_pull(self):
+        return self.household
+
+    def household_pull_if_changed(self, fingerprint):
+        fp = self._fp(self.household)
+        if fingerprint == fp:
+            return {"unchanged": True, "fingerprint": fp}
+        return {"household": dict(self.household) if self.household else None, "fingerprint": fp}
+
+
+class PollingTests(StorageTestCase):
+    """A poll only fetches everything when something changed."""
+
+    def setUp(self):
+        super().setUp()
+        self.enable_sync()
+        self.handed_over = []
+        engine = self.storage.sync
+        engine.on_pulled = lambda remote, household, rev: self.handed_over.append((remote, household, rev))
+
+    def poll(self, cloud, apply=True):
+        self.handed_over.clear()
+        self.storage.sync.client = cloud
+        self.storage.sync._pull()
+        for remote, household, rev in self.handed_over:
+            if apply:
+                self.storage.adopt_remote_state(remote, household, rev)
+        return self.handed_over
+
+    def test_unchanged_state_is_not_handed_over_again(self):
+        cloud = PollingCloud(remote_state([{"id": "r1", "text": "Walk", "recurrence": "daily"}]))
+        self.assertEqual(len(self.poll(cloud)), 1)
+        self.assertEqual([t["text"] for t in self.storage.get_checklist()], ["Walk"])
+        self.assertEqual(self.poll(cloud), [], "nothing changed")
+        self.assertIsNotNone(cloud.calls[-1][1], "the second poll offered a fingerprint")
+        cloud.state = remote_state([{"id": "r1", "text": "Walk the dogs", "recurrence": "daily"}])
+        self.poll(cloud)
+        self.assertEqual([t["text"] for t in self.storage.get_checklist()], ["Walk the dogs"])
+
+    def test_a_local_edit_means_a_full_pull(self):
+        cloud = PollingCloud(remote_state([]))
+        self.poll(cloud)
+        self.storage.add_task("Local", "daily")
+        self.storage.data["sync_outbox"] = []  # as if the upload was refused and dropped
+        self.storage._bump_rev()
+        self.assertEqual(len(self.poll(cloud)), 1)
+        self.assertIsNone(cloud.calls[-1][1], "no fingerprint after a local change")
+        self.assertEqual(self.storage.get_checklist(), [], "the cloud's state was applied again")
+
+    def test_a_refused_pull_is_not_remembered(self):
+        cloud = PollingCloud(remote_state([]))
+        self.poll(cloud, apply=False)
+        self.poll(cloud)
+        self.assertIsNone(cloud.calls[-1][1])
+
+    def test_the_household_is_fingerprinted_too(self):
+        household = {"id": "h1", "name": "Home", "members": [], "tasks": []}
+        cloud = PollingCloud(remote_state([]), household=household)
+        self.storage.data["household"] = {"id": "h1", "tasks": []}
+        self.poll(cloud)
+        self.assertEqual(self.storage.get_household()["name"], "Home")
+        self.assertNotIn("fingerprint", self.storage.get_household())
+        self.assertEqual(self.poll(cloud), [])
+        cloud.household = dict(household, name="New name")
+        handed = self.poll(cloud)
+        self.assertIsNone(handed[0][0], "the state itself didn't change")
+        self.assertEqual(self.storage.get_household()["name"], "New name")
+
+    def test_older_cloud_schema_falls_back_to_full_pulls(self):
+        cloud = PollingCloud(remote_state([]), outdated_schema=True)
+        self.poll(cloud)
+        self.poll(cloud)
+        self.assertEqual([c[0] for c in cloud.calls], ["sync_pull_if_changed", "sync_pull", "sync_pull"])
+
+
+class SchemaVersionTests(StorageTestCase):
+    def check(self, answer):
+        from supabase_sync import SyncError
+        engine = self.storage.sync
+
+        class Cloud:
+            def schema_version(self):
+                if isinstance(answer, SyncError):
+                    raise answer
+                return answer
+        engine.client = Cloud()
+        engine.schema_behind = False
+        engine._check_schema_version()
+        engine.status = "online"
+        return engine
+
+    def test_current_schema_is_fine(self):
+        from supabase_sync import SCHEMA_VERSION
+        engine = self.check(SCHEMA_VERSION)
+        self.assertFalse(engine.needs_attention())
+        self.assertEqual(engine.status_text(), "Synced")
+
+    def test_older_or_missing_version_asks_for_an_update(self):
+        for answer in (210, outdated()):
+            engine = self.check(answer)
+            self.assertTrue(engine.needs_attention())
+            self.assertIn("schema.sql", engine.status_text())
+
+    def test_a_network_blip_changes_nothing(self):
+        from supabase_sync import SyncError
+        self.assertFalse(self.check(SyncError("offline")).needs_attention())
+
+    def test_app_and_schema_agree_on_the_version(self):
+        import re
+        from supabase_sync import SCHEMA_VERSION
+        import support
+        with open(f"{support.ROOT}/supabase/schema.sql", encoding="utf-8") as f:
+            found = re.search(r"function schema_version\(\).*?select (\d+);", f.read(), re.S)
+        self.assertEqual(int(found.group(1)), SCHEMA_VERSION)
+
+
+class TimerSyncTests(StorageTestCase):
+    def test_session_key_falls_back_on_an_older_cloud(self):
+        calls = []
+
+        class OldCloud:
+            refresh_token = "t"
+
+            def record_pomodoro_completed(self, minutes, session=None):
+                calls.append(("pomodoro", minutes, session))
+                if session:
+                    raise outdated()
+
+            def record_break_completed(self, session=None):
+                calls.append(("break", session))
+                if session:
+                    raise outdated()
+
+            def set_timer_state(self, state):
+                calls.append(("timer", state["phase"]))
+                raise outdated()
+
+        self.enable_sync()
+        self.storage.record_pomodoro_completed(25, session="work:100")
+        self.storage.record_break_completed(session="short_break:400")
+        self.storage.publish_timer("work", False, seconds_left=60)
+        self.storage.sync.client = OldCloud()
+        self.assertTrue(self.storage.sync._flush())
+        self.assertEqual(calls, [("pomodoro", 25, "work:100"), ("pomodoro", 25, None),
+                                 ("break", "short_break:400"), ("break", None), ("timer", "work")])
+        self.assertEqual(self.storage.outbox_len(), 0, "nothing left stuck in the queue")
+
+    def test_sharing_can_be_turned_off(self):
+        self.enable_sync()
+        self.storage.data["pomodoro"]["share_timer"] = False
+        self.storage.publish_timer("work", True, ends_at=123.0)
+        self.assertEqual(self.outbox_ops(), [])

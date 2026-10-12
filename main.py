@@ -13,7 +13,7 @@ import time
 from datetime import date
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QSystemTrayIcon, QMenu, QMessageBox,
-    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFileDialog
+    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFileDialog, QDialog
 )
 from PyQt6.QtGui import QIcon, QAction, QActionGroup, QKeySequence
 from PyQt6.QtCore import QTimer, QEvent, QProcess, pyqtSignal
@@ -39,6 +39,8 @@ import theme
 import update_checker
 from update_dialog import UpdateDialog
 from mobile_app_dialog import MobileAppDialog
+from quick_add_dialog import QuickAddDialog
+import calendar_export
 import gamification
 from version import VERSION
 
@@ -176,6 +178,8 @@ class MainWindow(QMainWindow):
         # changes made elsewhere (e.g. the phone). This just receives its
         # results on the UI thread and shows its status.
         self._last_sync_status = None
+        self._quick_add_dialog = None
+        self._quick_add_choice = 0  # the list picked last time
         self.remote_pulled.connect(self._on_remote_pulled)
         self.storage.sync.on_pulled = self.remote_pulled.emit
         self.storage.sync.start()
@@ -223,6 +227,7 @@ class MainWindow(QMainWindow):
         self.widget_window.refresh_tasks()
         self.shared_tab.refresh()
         self.pomodoro_tab.refresh_focus_tasks()
+        self.pomodoro_tab.follow_remote_timer(self.storage.take_remote_timer())
         notes_tab.maybe_reload_from_remote()
 
     def _notify_shared_activity(self, before_id, before_tasks, household):
@@ -251,7 +256,7 @@ class MainWindow(QMainWindow):
             self.sync_btn.setText("☁️ Sync")
         elif engine.status == "online" and not engine.pending_count():
             self.sync_btn.setText("☁️ Sync ✓")
-        elif engine.status in ("auth", "schema"):
+        elif engine.needs_attention():
             self.sync_btn.setText("☁️ Sync ⚠")
         elif engine.pending_count():
             self.sync_btn.setText(f"☁️ Sync ↑{engine.pending_count()}")
@@ -259,9 +264,10 @@ class MainWindow(QMainWindow):
             self.sync_btn.setText("☁️ Sync …")
         self.sync_btn.setToolTip(engine.status_text())
         # Say so once when sync needs attention, since it fails quietly otherwise.
-        if engine.status != self._last_sync_status and engine.status in ("auth", "schema"):
+        attention = (engine.status, engine.schema_behind) if engine.needs_attention() else None
+        if attention and attention != self._last_sync_status:
             notifier.send("Pawmodoro cloud sync", engine.status_text())
-        self._last_sync_status = engine.status
+        self._last_sync_status = attention
 
     def _keep_conflicting_notes(self):
         """Notes changed here and on another device before they met: the
@@ -361,6 +367,31 @@ class MainWindow(QMainWindow):
             self, "Export",
             f"Saved {pages} notes page{'s' if pages != 1 else ''}, your checklist and all your data to\n{path}")
 
+    def _export_calendar(self):
+        text, count = calendar_export.build_ics(self.storage.get_checklist(), self.storage.get_household())
+        if not count:
+            QMessageBox.information(
+                self, "Export to calendar",
+                "Nothing to put in a calendar yet: give tasks a due date, a monthly day, a specific day or a "
+                "reminder time (or schedule shared items), then try again.")
+            return
+        default = os.path.join(os.path.expanduser("~"), "Pawmodoro.ics")
+        path, _ = QFileDialog.getSaveFileName(self, "Export to calendar", default, "Calendar files (*.ics)")
+        if not path:
+            return
+        if not path.lower().endswith(".ics"):
+            path += ".ics"
+        try:
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write(text)
+        except OSError as e:
+            QMessageBox.warning(self, "Export to calendar", f"Couldn't write the file: {e}")
+            return
+        QMessageBox.information(
+            self, "Export to calendar",
+            f"Saved {count} event{'s' if count != 1 else ''} to\n{path}\n\nImport it into your calendar app. "
+            "It's a snapshot: export again after changes (importing again updates the same events).")
+
     def _open_backup_dialog(self):
         dialog = BackupDialog(self.storage, self)
         dialog.restored.connect(self._restart_app)
@@ -426,6 +457,9 @@ class MainWindow(QMainWindow):
         export_action = QAction("Export everything…", self)
         export_action.triggered.connect(self._export_everything)
         menu.addAction(export_action)
+        calendar_action = QAction("Export to calendar (.ics)…", self)
+        calendar_action.triggered.connect(self._export_calendar)
+        menu.addAction(calendar_action)
         restore_action = QAction("Restore from a backup…", self)
         restore_action.triggered.connect(self._open_backup_dialog)
         menu.addAction(restore_action)
@@ -463,6 +497,7 @@ class MainWindow(QMainWindow):
             ("Start / pause the timer", "Ctrl+P", self.pomodoro_tab.toggle_running),
             ("Skip to the next phase", "Ctrl+Shift+P", lambda: self.pomodoro_tab.advance_phase(completed=False)),
             ("New checklist task", "Ctrl+T", self._focus_new_task),
+            ("Quick add (any list)…", "Ctrl+Shift+T", self.quick_add),
             ("New notes page", "Ctrl+N", self._new_notes_page),
             ("Pin as desktop widget", "Ctrl+Shift+W", self._enter_widget_mode),
         ]
@@ -471,6 +506,38 @@ class MainWindow(QMainWindow):
             action.setShortcut(QKeySequence(keys))
             action.triggered.connect(lambda checked=False, h=handler: h())
             go.addAction(action)
+
+    def quick_add(self):
+        """A task straight into the checklist or the shared list, without
+        bringing up the main window (tray menu, `--quick-add`)."""
+        if self._quick_add_dialog is not None:
+            self._quick_add_dialog.raise_()
+            self._quick_add_dialog.activateWindow()
+            return
+        dialog = QuickAddDialog(self.storage.get_household() is not None, self._quick_add_choice)
+        self._quick_add_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        dialog.finished.connect(lambda result: self._finish_quick_add(dialog, result))
+
+    def _finish_quick_add(self, dialog, result):
+        self._quick_add_dialog = None
+        dialog.deleteLater()
+        if result != QDialog.DialogCode.Accepted:
+            return
+        self._quick_add_choice = dialog.destination_box.currentIndex()
+        text = dialog.text().strip()
+        target, recurrence = dialog.destination()
+        if target == "shared":
+            self.storage.shared_add_task(text)
+            self.shared_tab.refresh()
+        else:
+            self.storage.add_task(text, recurrence)
+            self.checklist_tab.refresh()
+            self.widget_window.refresh_tasks()
+            self.pomodoro_tab.refresh_focus_tasks()
+        notifier.send("Added", text)
 
     def _focus_new_task(self):
         self.tabs.setCurrentWidget(self.notes_checklist_tab)
@@ -541,6 +608,9 @@ class MainWindow(QMainWindow):
         show_action = QAction("Show main window", self)
         show_action.triggered.connect(self.restore_from_widget)
         tray_menu.addAction(show_action)
+        add_action = QAction("➕ Add a task…", self)
+        add_action.triggered.connect(self.quick_add)
+        tray_menu.addAction(add_action)
 
         # The timer, without opening the window.
         tray_menu.addSeparator()
@@ -696,10 +766,11 @@ def main():
             probe.abort()
             time.sleep(0.3)
         probe.abort()
+    quick_add = "--quick-add" in sys.argv[1:]
     probe.connectToServer(SINGLE_INSTANCE_KEY)
     if probe.waitForConnected(200):
         print("Pawmodoro is already running — bringing its window to the front instead.")
-        probe.write(b"show")
+        probe.write(b"quick-add" if quick_add else b"show")
         probe.waitForBytesWritten(200)
         probe.disconnectFromServer()
         return
@@ -723,8 +794,10 @@ def main():
             return
 
         def _handle_ping():
-            conn.readAll()
-            window.bring_to_front()
+            if b"quick-add" in bytes(conn.readAll()):
+                window.quick_add()
+            else:
+                window.bring_to_front()
 
         conn.readyRead.connect(_handle_ping)
         conn.disconnected.connect(conn.deleteLater)
@@ -733,6 +806,8 @@ def main():
     window._ipc_server = ipc_server  # keep it alive for the app's lifetime
 
     window.show()
+    if quick_add:
+        window.quick_add()
 
     sys.exit(app.exec())
 

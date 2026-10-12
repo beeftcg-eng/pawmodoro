@@ -40,6 +40,10 @@ STALL_GAP_SECONDS = 3
 TICK_MS = 250
 # How often a running work session asks whether you're still at the computer.
 IDLE_CHECK_MS = 10000
+# One timer across devices: when a phase ends on a device that's only
+# following the timer, it waits this long for the device running it to
+# report the next phase before counting the session itself.
+TAKEOVER_MS = 90_000
 
 PHASE_NAMES = {
     "work": "\U0001F43E Work session",
@@ -103,6 +107,11 @@ class PomodoroTab(QWidget):
         self.running = False
         self._deadline = 0.0
         self._last_tick = 0.0
+        # One timer across devices (Storage.publish_timer / follow_remote_timer):
+        self._ends_at = None  # wall-clock end of the running phase, as shared
+        self._owner = True  # this device started / changed the timer last
+        self._following = False  # True while applying another device's change
+        self._pending_takeover = None  # (session, phase) waiting for the owner to report it
         self._ambient_auto_changing = False  # True while auto-mode flips the checkboxes itself
 
         outer = QVBoxLayout(self)
@@ -249,6 +258,13 @@ class PomodoroTab(QWidget):
         )
         self.ambient_auto_check.setChecked(settings.get("ambient_auto", False))
         form.addRow(self.ambient_auto_check)
+
+        self.share_timer_check = QCheckBox("One timer on all my devices (with Cloud Sync)")
+        self.share_timer_check.setToolTip(
+            "Start, pause or skip here and your phone and other computers follow (and the other way "
+            "round). A finished session counts once, wherever it ran.")
+        self.share_timer_check.setChecked(settings.get("share_timer", True))
+        form.addRow(self.share_timer_check)
 
         self.idle_spin = QSpinBox()
         self.idle_spin.setRange(0, 60)
@@ -494,11 +510,18 @@ class PomodoroTab(QWidget):
             self._pause()
         else:
             self._start()
+        self._publish()
 
-    def _start(self):
+    def _start(self, ends_at=None):
+        """Runs the current phase: for seconds_left from now, or until the
+        wall-clock `ends_at` (another device's timer, or the next phase
+        chained onto the end of the last one)."""
         if self.phase == "work":
             self.maybe_auto_pick()
         self._hide_away()
+        if ends_at is not None:
+            self.seconds_left = max(0, math.ceil(ends_at - time.time() - 1e-6))
+        self._ends_at = ends_at if ends_at is not None else time.time() + self.seconds_left
         self.running = True
         now = time.monotonic()
         self._deadline = now + self.seconds_left
@@ -523,7 +546,9 @@ class PomodoroTab(QWidget):
         mouse for the set time, pause it and take that time back off (you
         weren't focusing). The banner offers to count it after all."""
         minutes = self.storage.get_pomodoro_settings().get("idle_pause_min", 5)
-        if not (self.running and self.phase == "work" and minutes):
+        # (only where the session is being run: following the phone's timer,
+        # an idle computer says nothing about whether you're working)
+        if not (self.running and self.phase == "work" and minutes and self._owner):
             return
         away = idle.idle_seconds()
         if away is None or away < minutes * 60:
@@ -534,6 +559,7 @@ class PomodoroTab(QWidget):
         self._away = (counted_left, int(away))
         self._refresh_labels()
         self._save_timer_state()
+        self._publish()
         away_min = max(1, round(away / 60))
         self.away_label.setText(
             f"⏸ Paused: no keyboard or mouse for {away_min} min, so that time wasn't counted. Still there?")
@@ -544,6 +570,7 @@ class PomodoroTab(QWidget):
         if self._away is not None:
             self.seconds_left = self._away[0]
         self._start()
+        self._publish()
 
     def _hide_away(self):
         self._away = None
@@ -554,7 +581,13 @@ class PomodoroTab(QWidget):
         gap = now - self._last_tick
         self._last_tick = now
         if gap > STALL_GAP_SECONDS:
-            self._deadline += gap - TICK_MS / 1000  # forgive time spent asleep / frozen
+            forgiven = gap - TICK_MS / 1000
+            self._deadline += forgiven  # forgive time spent asleep / frozen
+            if self._ends_at is not None and self._owner:
+                # the shared end moves too, and the other devices follow it
+                # (one that's following keeps the owner's, which it's keyed by)
+                self._ends_at += forgiven
+                QTimer.singleShot(0, self._publish)
         # (-1e-6: on a coarse clock, deadline - now can come out a hair over a
         # whole second, which would round up to a phantom extra second)
         self.seconds_left = max(0, math.ceil(self._deadline - now - 1e-6))
@@ -568,6 +601,7 @@ class PomodoroTab(QWidget):
         self.seconds_left = self._phase_minutes(self.phase) * 60
         self._refresh_labels()
         self._save_timer_state()
+        self._publish()
 
     def advance_phase(self, completed=False):
         """Moves on to the next phase. `completed` is True when the timer
@@ -581,6 +615,14 @@ class PomodoroTab(QWidget):
         self.start_btn.setText("▶  Start")
 
         settings = self.storage.get_pomodoro_settings()
+        ended_at = self._ends_at
+        session = f"{self.phase}:{round(ended_at)}" if completed and ended_at else None
+        # Following another device's timer: that device counts the session;
+        # this one takes over only if it doesn't report back (see TAKEOVER_MS).
+        counts_here = not completed or self._owner or not self.storage.shared_timer_enabled()
+        if completed and not counts_here:
+            self._pending_takeover = (session, self.phase, settings["work_min"])
+            QTimer.singleShot(TAKEOVER_MS, lambda pending=self._pending_takeover: self._take_over(pending))
         if self.phase == "work":
             if completed:
                 self.sessions_completed += 1
@@ -592,26 +634,99 @@ class PomodoroTab(QWidget):
                 notify("Pomodoro", f"Work session done{done_on} — time for a long break." if long_break
                        else f"Work session done{done_on} — take a short break.")
                 self._play_chime()
-                result = self.storage.record_pomodoro_completed(
-                    settings["work_min"], task_id=focus["id"] if focus else None)
-                self.refresh_focus_tasks()
-                congrats = quotes.random_pomodoro_congrats()
-                self._announce_gamification(result, f"\U0001F43E {congrats}")
+                if counts_here:
+                    self._credit_work(settings["work_min"], session)
         else:
             self.phase = "work"
             if completed:
                 notify("Pomodoro", "Break's over — back to work.")
                 self._play_chime()
-                break_result = self.storage.record_break_completed()
-                self._announce_quests(break_result.get("completed_quests", []))
+                if counts_here:
+                    self._credit_break(session)
 
         self.seconds_left = self._phase_minutes(self.phase) * 60
         self._refresh_labels()
         if completed and settings.get("auto_start_next", True):
-            self._start()
+            # Chained onto the end of the last phase, so every device that
+            # follows this timer works out the same end time.
+            chained = ended_at + self.seconds_left if ended_at else None
+            self._start(ends_at=chained if chained and chained > time.time() + 1 else None)
         else:
             self._sync_ambient_to_phase()
             self._save_timer_state()
+        if counts_here:
+            self._publish()
+
+    def _credit_work(self, minutes, session):
+        focus = self.storage.get_focus_task()
+        result = self.storage.record_pomodoro_completed(
+            minutes, task_id=focus["id"] if focus else None, session=session)
+        self.refresh_focus_tasks()
+        congrats = quotes.random_pomodoro_congrats()
+        self._announce_gamification(result, f"\U0001F43E {congrats}")
+
+    def _credit_break(self, session):
+        break_result = self.storage.record_break_completed(session=session)
+        self._announce_quests(break_result.get("completed_quests", []))
+
+    # ---------- One timer across devices ----------
+    def _publish(self):
+        """Tells the other devices what this timer now is (a no-op without
+        Cloud Sync or with sharing off). Never while following them."""
+        if self._following:
+            return
+        self._owner = True
+        self._pending_takeover = None
+        if self.running:
+            self.storage.publish_timer(self.phase, True, ends_at=self._ends_at)
+        else:
+            self.storage.publish_timer(self.phase, False, seconds_left=self.seconds_left)
+
+    def _take_over(self, pending):
+        """A phase ended here while following another device, and that device
+        never reported back: count it here (the cloud ignores it if the other
+        device did after all) and run the timer from here on."""
+        if pending is None or pending is not self._pending_takeover:
+            return  # the other device reported in meanwhile
+        self._pending_takeover = None
+        session, phase, minutes = pending
+        if phase == "work":
+            self._credit_work(minutes, session)
+        else:
+            self._credit_break(session)
+        self._publish()
+
+    def follow_remote_timer(self, timer):
+        """Another device started, paused, reset or moved on the shared
+        timer (Storage.take_remote_timer): do the same here."""
+        if not timer or timer.get("phase") not in PHASE_NAMES:
+            return
+        ends_at = timer.get("ends_at")
+        if timer.get("running") and ends_at and ends_at < time.time() - 60:
+            return  # left running somewhere long ago: nothing to follow
+        self._following = True
+        try:
+            self._pending_takeover = None
+            self._owner = False
+            self._hide_away()
+            self.timer.stop()
+            self.idle_timer.stop()
+            if self.phase != timer["phase"]:
+                self.phase = timer["phase"]
+                self.refresh_focus_tasks()
+            if timer.get("running") and ends_at:
+                self._start(ends_at=ends_at)
+            else:
+                self.running = False
+                self._ends_at = None
+                self.start_btn.setText("▶  Start")
+                full = self._phase_minutes(self.phase) * 60
+                self.seconds_left = int(timer.get("seconds_left") or full)
+                self._sync_ambient_to_phase()
+                self._save_timer_state()
+            self._refresh_labels()
+        finally:
+            self._following = False
 
     def refresh_focus_tasks(self):
         """Fills the "Working on" list with today's pending tasks (plus the
@@ -705,7 +820,7 @@ class PomodoroTab(QWidget):
     def _refresh_labels(self):
         phase_text = PHASE_NAMES[self.phase]
         total = self._phase_minutes(self.phase) * 60
-        fraction = 1 - (self.seconds_left / total) if total else 0.0
+        fraction = max(0.0, min(1.0, 1 - (self.seconds_left / total))) if total else 0.0
 
         self.circular_timer.set_colors(
             self._phase_ring_color(), *self._track_and_ink_colors()
@@ -825,6 +940,7 @@ class PomodoroTab(QWidget):
             "auto_start_next": self.auto_next_check.isChecked(),
             "ambient_auto": self.ambient_auto_check.isChecked(),
             "idle_pause_min": self.idle_spin.value(),
+            "share_timer": self.share_timer_check.isChecked(),
         }
         self.storage.set_pomodoro_settings(settings)
         if not self.running:

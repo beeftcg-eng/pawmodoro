@@ -71,7 +71,7 @@ class NotesTab(QWidget):
         find_layout = QHBoxLayout(self.find_bar)
         find_layout.setContentsMargins(0, 0, 0, 0)
         self.find_input = QLineEdit()
-        self.find_input.setPlaceholderText("Find in notes…")
+        self.find_input.setPlaceholderText("Find in all pages…")
         self.find_input.returnPressed.connect(self.find_next)
         find_layout.addWidget(self.find_input)
         prev_btn = QPushButton("↑")
@@ -279,13 +279,41 @@ class NotesTab(QWidget):
         if not text:
             return
         flags = QTextDocument.FindFlag.FindBackward if backward else QTextDocument.FindFlag(0)
+        if self.editor.find(text, flags):
+            return
+        # Nothing more on this page: carry on in the next page that has it
+        # (the previous one when going backwards), else wrap round this one.
+        title = self._next_page_with(text, backward)
+        if title is not None:
+            self.status_label.setText(f"Found on “{title}”")
+        cursor = self.editor.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End if backward else QTextCursor.MoveOperation.Start)
+        self.editor.setTextCursor(cursor)
         if not self.editor.find(text, flags):
-            # wrap around to the other end and try once more
-            cursor = self.editor.textCursor()
-            cursor.movePosition(QTextCursor.MoveOperation.End if backward else QTextCursor.MoveOperation.Start)
-            self.editor.setTextCursor(cursor)
-            if not self.editor.find(text, flags):
-                self.status_label.setText(f"“{text}” not found")
+            self.status_label.setText(f"“{text}” not found")
+
+    def _next_page_with(self, text, backward):
+        """Switches to the nearest other page containing `text` (any case,
+        like the editor's own find) and returns its title, or None."""
+        pages = self.storage.get_note_pages()
+        ids = [p["id"] for p in pages]
+        if self.current_page not in ids:
+            return None
+        here, needle = ids.index(self.current_page), text.casefold()
+        for step in range(1, len(ids)):
+            index = (here - step if backward else here + step) % len(ids)
+            if needle in self._page_plain_text(ids[index]).casefold():
+                self.page_bar.setCurrentIndex(index)  # switches the editor (_on_page_changed)
+                return pages[index]["title"]
+        return None
+
+    def _page_plain_text(self, page_id):
+        stored = self.storage.get_page_html(page_id)
+        if "<" not in stored:
+            return stored
+        doc = QTextDocument()
+        doc.setHtml(stored)
+        return doc.toPlainText()
 
     def find_next(self):
         self._find(backward=False)

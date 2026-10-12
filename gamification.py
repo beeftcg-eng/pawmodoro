@@ -3,7 +3,7 @@ gamification.py - Pure logic for Pawmodoro's leveling, XP, and daily/weekly
 quest system. No Qt or storage dependencies here, so the math and quest
 picking are easy to reason about (and change) on their own.
 """
-import random
+import hashlib
 from datetime import timedelta
 
 import task_dates
@@ -84,12 +84,19 @@ def level_from_xp(total_xp):
     return level, remaining, needed
 
 
+def pick_quests(pool, period_iso, count):
+    """The `count` quests of `pool` with the lowest md5("<id>:<period>"),
+    so the pick is stable for the whole day/week (a restart doesn't
+    reshuffle quests in progress) and the cloud picks the very same ones:
+    mirrored by ensure_daily_quests() / ensure_weekly_quests() in
+    supabase/schema.sql, which order by the same md5."""
+    ranked = sorted(pool, key=lambda t: (hashlib.md5(f"{t['id']}:{period_iso}".encode()).hexdigest(), t["id"]))
+    return ranked[:count]
+
+
 def generate_daily_quests(day_iso, count=QUESTS_PER_DAY):
-    """Deterministic per-day selection (seeded by the date string) so
-    restarting the app on the same day doesn't reshuffle quests already
-    in progress."""
-    rng = random.Random(day_iso)
-    chosen = rng.sample(QUEST_POOL, k=min(count, len(QUEST_POOL)))
+    """Today's quests (see pick_quests)."""
+    chosen = pick_quests(QUEST_POOL, day_iso, count)
     return [
         {
             "id": template["id"],
@@ -117,11 +124,9 @@ def days_until_weekly_reset(d):
 
 
 def generate_weekly_quests(week_start_iso, count=QUESTS_PER_WEEK):
-    """Deterministic per-week selection (seeded by the Tuesday that starts
-    the week) so restarting the app mid-week doesn't reshuffle quests
-    already in progress."""
-    rng = random.Random(week_start_iso)
-    chosen = rng.sample(WEEKLY_QUEST_POOL, k=min(count, len(WEEKLY_QUEST_POOL)))
+    """This week's quests, keyed by the Tuesday that starts the week (see
+    pick_quests)."""
+    chosen = pick_quests(WEEKLY_QUEST_POOL, week_start_iso, count)
     return [
         {
             "id": template["id"],
@@ -153,10 +158,3 @@ def task_already_awarded(recurrence, awarded_on, today, month_day=None):
         return awarded_on >= task_dates.month_occurrence(month_day or 1, today).isoformat()
     return awarded_on == today.isoformat()
 
-
-def weekly_task_needs_reset(last_completed, today):
-    """A "weekly" task un-checks itself when the quest week rolls over
-    (Tuesday), same reset as the weekly quests. `last_completed` is an ISO
-    date string or None. Mirrored by roll_recurring_tasks() in
-    supabase/schema.sql."""
-    return not last_completed or last_completed < week_start_for(today).isoformat()

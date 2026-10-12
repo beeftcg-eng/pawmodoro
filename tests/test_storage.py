@@ -28,6 +28,15 @@ class PersistenceTests(StorageTestCase):
             f.write("{ not json")
         self.assertEqual(self.new_storage().get_notes(), "precious")
 
+    def test_json_that_isnt_an_object_restored_from_backup(self):
+        self.storage.set_notes("precious")
+        os.makedirs(storage.BACKUP_DIR, exist_ok=True)
+        self.storage._backup_daily()
+        for text in ("[]", "null"):
+            with open(storage.DATA_FILE, "w", encoding="utf-8") as f:
+                f.write(text)
+            self.assertEqual(self.new_storage().get_notes(), "precious")
+
 
 class NotesPagesTests(StorageTestCase):
     def test_main_page_is_the_synced_notes(self):

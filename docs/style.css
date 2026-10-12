@@ -286,7 +286,9 @@ html, body {
 
 .settings-details { text-align: left; margin-top: 12px; }
 .settings-details label { display: flex; justify-content: space-between; margin: 8px 0; font-size: 14px; }
+.settings-details label.check-label { justify-content: flex-start; gap: 8px; align-items: center; }
 .settings-details input { width: 70px; padding: 4px; }
+.settings-details input[type="checkbox"] { width: auto; }
 .settings-details button {
   margin-top: 8px;
   padding: 8px 16px;

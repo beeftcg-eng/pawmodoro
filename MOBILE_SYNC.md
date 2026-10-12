@@ -97,6 +97,22 @@ sync as before; adding a monthly task or a dated one waits in the upload
 queue (the ☁️ Sync button says the schema needs updating), and notes and
 steps stay on the computer they were made on.
 
+**v2.20.0** adds one timer across your devices, streaks on daily tasks,
+"whose turn" on shared items, and lighter polling. Re-run `schema.sql` only
+(`push_reminders.sql` and the push function are unchanged). Until you do,
+everything syncs as before: polling simply stays the old, heavier way, the
+timers stay separate, and a shared item's assignment stays on the computer
+it was set on. The ☁️ Sync button shows ⚠ with "the cloud database is older
+than this app" until then.
+
+**From v2.20.0 the schema can update itself**: the **Deploy cloud** GitHub
+workflow (`.github/workflows/deploy-functions.yml`) tests `schema.sql` and
+then runs it, and `push_reminders.sql`, against your project whenever they
+change on `main`. It needs a repo secret `SUPABASE_DB_URL`: in Supabase,
+**Project Settings → Database → Connection string → Session pooler**, with
+your database password filled in. Without the secret it just warns, and you
+re-run the SQL by hand as before.
+
 ## Phone reminders with the app closed (v2.16.0, optional)
 
 The phone app can receive your checklist's daily 🔔 reminders as real
@@ -244,14 +260,15 @@ own devices — not between different people's separate accounts.
 | | Synced? |
 |---|---|
 | Notes | ✅ including extra pages (v2.16.0+). Bold/underline/lists are editable on the phone; other desktop formatting (highlights, colors) isn't, but isn't lost either |
-| Checklist | ✅ (tasks, order, renames, daily reminder times; the desktop-only "specific day" tasks, "every N hours" reminders, snoozes and 🍅 counts stay on the desktop) |
-| Shared household list | ✅ — shared with the people in your household |
+| Checklist | ✅ (tasks, order, renames, reminders, snoozes, steps and notes, and since v2.20.0 the days each task was done, for 🔥 streaks; the desktop-only "specific day" tasks and 🍅 counts stay on the desktop) |
+| Shared household list | ✅ — shared with the people in your household, including whose turn an item is (v2.20.0) |
+| The pomodoro timer | ✅ since v2.20.0: start, pause, reset or skip on one device and the others follow; a finished session counts once. Turn it off per device under Timer settings ("One timer on all my devices") |
 | Focus-minutes history | ✅ |
 | XP, level, streak | ✅ |
 | Daily & weekly quests | ✅ — completing a pomodoro/task/break on *either* device advances the same quests |
 | Ambient sounds | ❌ desktop-only |
 | Music tab (YouTube Music / Spotify) | ❌ phone-only makes no sense here — use the phone's own music apps |
-| Theme, pomodoro timer durations, chime / auto-start settings | Independent per device (not synced, so each device can have its own) |
+| Theme, pomodoro timer durations, chime / auto-start settings | Independent per device (not synced, so each device can have its own; a shared timer runs to the end time of the device that started it) |
 
 ## A real limitation worth knowing
 

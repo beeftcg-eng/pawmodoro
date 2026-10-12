@@ -46,6 +46,70 @@ begin
   assert jsonb_array_length(sync_pull()->'notes_pages') = 1, 'page removed';
 end $$;
 
+-- ============ Polling: only send what changed ============
+do $$
+declare r jsonb; fp text;
+begin
+  r := sync_pull_if_changed(null);
+  fp := r->>'fingerprint';
+  assert fp is not null and r ? 'checklist' and not r ? 'unchanged', 'first poll gets everything: ' || r;
+  r := sync_pull_if_changed(fp);
+  assert (r->>'unchanged')::boolean and not r ? 'checklist' and r->>'fingerprint' = fp, 'nothing changed: ' || r;
+  r := sync_pull_if_changed('stale');
+  assert r ? 'checklist' and r->>'fingerprint' = fp, 'an unknown fingerprint gets everything';
+  perform set_note_page('p3', 'New', '');
+  r := sync_pull_if_changed(fp);
+  assert r ? 'notes_pages' and r->>'fingerprint' <> fp, 'a change gets everything again';
+  perform remove_note_page('p3');
+end $$;
+
+-- ============ One timer across devices ============
+do $$
+declare r jsonb; xp0 int; rev1 bigint;
+begin
+  assert sync_pull()->'timer' = 'null'::jsonb, 'no timer yet';
+  rev1 := set_timer_state('{"phase": "work", "running": true, "ends_at": 1790000000.5, "device": "desk", "junk": 1}');
+  r := sync_pull()->'timer';
+  assert r->>'phase' = 'work' and (r->>'running')::boolean and (r->>'ends_at')::float = 1790000000.5
+         and r->>'device' = 'desk' and not r ? 'junk' and (r->>'rev')::bigint = rev1, 'timer state: ' || r;
+  assert set_timer_state('{"phase": "short_break", "running": false, "seconds_left": 300, "device": "phone"}') = rev1 + 1,
+    'every change bumps rev';
+  begin
+    perform set_timer_state('{"phase": "nap"}');
+    assert false, 'bad phase accepted';
+  exception when raise_exception then null;
+  end;
+
+  xp0 := (sync_pull()->>'xp')::int;
+  r := record_pomodoro_completed(25, 'work:1790000000');
+  assert (r->>'xp_gained')::int = 20, 'first report pays: ' || r;
+  r := record_pomodoro_completed(25, 'work:1790000000');
+  assert (r->>'xp_gained')::int = 0 and (r->>'already_counted')::boolean, 'second report of the same session: ' || r;
+  assert (sync_pull()->>'xp')::int = xp0 + 20, 'paid once';
+  r := record_pomodoro_completed(25);
+  assert (r->>'xp_gained')::int = 20, 'an older client (no key) still pays';
+  assert not (record_break_completed('short_break:1790000300') ? 'already_counted'), 'first break';
+  assert (record_break_completed('short_break:1790000300')->>'already_counted')::boolean, 'same break again';
+  assert record_break_completed() is not null, 'older client break';
+end $$;
+
+-- ============ Done days (per-task streaks) ============
+select 1 from (select add_task('streak task', 'daily', null, 'checklist', 'sd1')) x;
+do $$
+declare days date[];
+begin
+  update checklist_tasks set done_days = array[user_today() - 2, user_today() - 1] where id = 'sd1';
+  perform complete_task('sd1', true);
+  select done_days into days from checklist_tasks where id = 'sd1';
+  assert days = array[user_today() - 2, user_today() - 1, user_today()], 'a tick adds today: ' || days::text;
+  perform complete_task('sd1', false);
+  select done_days into days from checklist_tasks where id = 'sd1';
+  assert days = array[user_today() - 2, user_today() - 1], 'an un-tick takes today off: ' || days::text;
+  assert (select jsonb_typeof(c->'done_days') from jsonb_array_elements(sync_pull()->'checklist') c
+          where c->>'id' = 'sd1') = 'array', 'sync_pull sends done_days';
+  perform remove_task('sd1');
+end $$;
+
 -- ============ Reminder modes, snooze, quiet hours ============
 select 1 from (select add_task('daily one', 'daily', null, 'checklist', 't1')) x;
 do $$
@@ -110,6 +174,9 @@ insert into shared_tasks (id, household_id, text, recurrence, due_date, due_time
   ('sh4', '44444444-4444-4444-4444-444444444444', 'one-off today', 'once', (now() at time zone 'utc')::date, '00:00'),
   ('sh5', '44444444-4444-4444-4444-444444444444', 'one-off last week', 'once', (now() at time zone 'utc')::date - 7, '00:00');
 update shared_tasks set done = true, done_at = now(), done_by = :'C' where id = 'sh3';
+-- C's turn: its reminder goes only to C (who has no phone), so never to B.
+insert into shared_tasks (id, household_id, text, recurrence, due_time, assigned_to) values
+  ('sh6', '44444444-4444-4444-4444-444444444444', 'cals turn', 'daily', '00:00', :'C');
 
 set role service_role;
 create temp table round1 as select * from due_push_reminders();
@@ -361,6 +428,58 @@ do $$
 begin
   assert check_cron_secret((select value from server_settings where name = 'cron_secret')), 'the right secret passes';
   assert not check_cron_secret('wrong'), 'a wrong secret fails';
+end $$;
+reset role;
+
+-- household_pull_if_changed: B is in a household, A isn't.
+set role authenticated;
+select set_config('request.jwt.claim.sub', :'B', false);
+do $$
+declare r jsonb; fp text;
+begin
+  r := household_pull_if_changed(null);
+  fp := r->>'fingerprint';
+  assert jsonb_typeof(r->'household') = 'object' and fp is not null, 'household with fingerprint: ' || r;
+  r := household_pull_if_changed(fp);
+  assert (r->>'unchanged')::boolean and not r ? 'household', 'unchanged household: ' || r;
+  perform shared_add_task('new item');
+  r := household_pull_if_changed(fp);
+  assert r ? 'household' and r->>'fingerprint' <> fp, 'changed household comes back';
+end $$;
+select set_config('request.jwt.claim.sub', :'A', false);
+do $$
+declare r jsonb;
+begin
+  r := household_pull_if_changed(null);
+  assert r ? 'household' and jsonb_typeof(r->'household') = 'null', 'no household is a null household: ' || r;
+  assert (household_pull_if_changed(r->>'fingerprint')->>'unchanged')::boolean, 'still none';
+end $$;
+reset role;
+
+-- Assigning shared items.
+set role authenticated;
+select set_config('request.jwt.claim.sub', :'B', false);
+do $$
+declare item jsonb;
+begin
+  perform shared_assign('sh2', '33333333-3333-3333-3333-333333333333');
+  select t into item from jsonb_array_elements(household_pull()->'tasks') t where t->>'id' = 'sh2';
+  assert item->>'assigned_name' = 'Cal' and not (item->>'assigned_to_me')::boolean, 'assigned to Cal: ' || item;
+  begin
+    perform shared_assign('sh2', '11111111-1111-1111-1111-111111111111');
+    assert false, 'assigned to someone outside the household';
+  exception when raise_exception then null;
+  end;
+  perform shared_assign('sh2', null);
+  select t into item from jsonb_array_elements(household_pull()->'tasks') t where t->>'id' = 'sh2';
+  assert item->'assigned_to' = 'null'::jsonb, 'back to anyone';
+end $$;
+select set_config('request.jwt.claim.sub', :'C', false);
+do $$
+begin
+  perform household_leave();
+  assert not exists (select 1 from shared_tasks where assigned_to = '33333333-3333-3333-3333-333333333333'),
+    'leaving hands your items back to anyone';
 end $$;
 reset role;
 \echo 'all schema assertions passed'

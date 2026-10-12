@@ -12,11 +12,12 @@ Mirrored in supabase/schema.sql (personal_month_occurrence,
 roll_recurring_tasks, complete_task, checklist_done_on, due_push_reminders)
 -- change both, or desktop-offline and cloud diverge.
 """
-from datetime import date
+from datetime import date, timedelta
 
 import shared_schedule
 
 MONTH_DAYS = range(1, 32)
+DONE_DAYS_KEEP = 120  # how many days back a task's done_days go (streaks)
 
 
 def normalize(recurrence, month_day=None, due_date=None):
@@ -46,6 +47,63 @@ def month_occurrence(month_day, today):
 def monthly_needs_reset(last_completed, month_day, today):
     """A monthly task un-ticks itself once its day comes round again."""
     return not last_completed or last_completed < month_occurrence(month_day or 1, today).isoformat()
+
+
+def needs_reset(task, today):
+    """Whether a ticked personal task un-ticks itself on `today`: daily ones
+    each new day, a specific-day one when its weekday comes round, weekly
+    ones when the quest week rolls over (Tuesday), monthly ones when their
+    day comes round; "once" never. Mirrored by roll_recurring_tasks() and
+    checklist_done_on() in supabase/schema.sql (which don't know "weekday")."""
+    recurrence = task.get("recurrence")
+    last = task.get("last_completed")
+    if recurrence == "daily":
+        return last != today.isoformat()
+    if recurrence == "weekday":
+        return task.get("weekday") is not None and today.weekday() == task["weekday"] and last != today.isoformat()
+    if recurrence == "weekly":
+        # the quest week starts on Tuesday (gamification.week_start_for,
+        # which can't be imported here: gamification imports this module)
+        week_start = shared_schedule.last_occurrence({"recurrence": "weekly", "weekday": 1}, today)
+        return not last or last < week_start.isoformat()
+    if recurrence == "monthly":
+        return monthly_needs_reset(last, task.get("month_day"), today)
+    return False
+
+
+def record_done_day(done_days, today, done):
+    """A task's done_days after ticking (`done`) or un-ticking it on
+    `today`: sorted ISO dates of the last DONE_DAYS_KEEP days. Mirrored by
+    task_done_days() in supabase/schema.sql."""
+    cutoff = (today - timedelta(days=DONE_DAYS_KEEP)).isoformat()
+    days = {d for d in done_days or [] if isinstance(d, str) and d > cutoff}
+    if done:
+        days.add(today.isoformat())
+    else:
+        days.discard(today.isoformat())
+    return sorted(days)
+
+
+def streak(task, today):
+    """How many periods in a row a repeating task has been done: days for a
+    daily task, weeks for a specific-day one. A period not done *yet* (today,
+    or this week's day still to come) doesn't break it. Other kinds have no
+    streak (0). Mirrored by taskStreak() in docs/app.js."""
+    recurrence = task.get("recurrence")
+    if recurrence == "daily":
+        step, day = 1, today
+    elif recurrence == "weekday" and task.get("weekday") is not None:
+        step, day = 7, today - timedelta(days=(today.weekday() - task["weekday"]) % 7)
+    else:
+        return 0
+    done = set(task.get("done_days") or [])
+    if day.isoformat() not in done:
+        day -= timedelta(days=step)
+    count = 0
+    while day.isoformat() in done:
+        count += 1
+        day -= timedelta(days=step)
+    return count
 
 
 def reminds_today(task, today):

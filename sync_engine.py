@@ -25,7 +25,7 @@ import time
 import traceback
 from datetime import datetime
 
-from supabase_sync import SupabaseSync, SyncError
+from supabase_sync import SCHEMA_VERSION, SupabaseSync, SyncError
 
 POLL_SECONDS = 5           # how often to pull while things are healthy
 BACKGROUND_POLL_SECONDS = 60  # ...and while no Pawmodoro window is on screen (sitting in the tray)
@@ -40,6 +40,8 @@ STATUS_TEXT = {
     "auth": "Signed out of the cloud — open Cloud Sync and log in again (nothing is lost)",
     "schema": "The cloud database needs updating — re-run supabase/schema.sql in the Supabase SQL Editor (see MOBILE_SYNC.md)",
 }
+SCHEMA_BEHIND_TEXT = ("Synced, but the cloud database is older than this app, so some features fall back — "
+                      "re-run supabase/schema.sql in the Supabase SQL Editor (see MOBILE_SYNC.md)")
 
 
 def local_utc_offset_minutes():
@@ -67,6 +69,15 @@ class SyncEngine:
         self._tz_retry_at = 0.0
         self._household_supported = True
         self._next_household_probe = 0.0
+        # Polling only sends what changed (sync_pull_if_changed). Storage
+        # sets `applied` = (state fingerprint, household fingerprint, rev)
+        # when it applies a pull; the fingerprints are only offered while
+        # storage.rev still equals that rev, so after any local edit or
+        # upload the next pull is a full one.
+        self.applied = (None, None, None)
+        self._fingerprints_supported = True
+        # True when the cloud's schema_version() is older than this app's.
+        self.schema_behind = False
         # Set from the UI thread: True while no window is showing. Pulls then
         # slow right down; local edits still upload immediately (wake()).
         self.background = False
@@ -104,6 +115,8 @@ class SyncEngine:
         with self._io_lock:
             self.client = None
             self._tz_sent = None
+            self.applied = (None, None, None)
+            self._fingerprints_supported = True
             self._household_supported = True
             self._next_household_probe = 0.0
             self._last_pull = 0.0
@@ -113,8 +126,14 @@ class SyncEngine:
     def pending_count(self):
         return self.storage.outbox_len()
 
+    def needs_attention(self):
+        """Something only the user can fix (log in again, update the cloud)."""
+        return self.status in ("auth", "schema") or (self.status == "online" and self.schema_behind)
+
     def status_text(self):
         text = STATUS_TEXT.get(self.status, self.status)
+        if self.status == "online" and self.schema_behind:
+            text = SCHEMA_BEHIND_TEXT
         pending = self.pending_count()
         if pending and self.status != "off":
             text += f" ({pending} change{'s' if pending != 1 else ''} waiting to upload)"
@@ -186,8 +205,17 @@ class SyncEngine:
         # Supabase rotates the refresh token on every use; the one we just
         # spent is dead, so persist the new one immediately.
         self._persist_token()
+        self._check_schema_version()
         self.status = "online"
         return True
+
+    def _check_schema_version(self):
+        try:
+            version = self.client.schema_version()
+        except SyncError as e:
+            version = 0 if e.schema_outdated else None  # missing = from before v2.20
+        if version is not None:
+            self.schema_behind = int(version or 0) < SCHEMA_VERSION
 
     def _persist_token(self):
         if self.client is not None:
@@ -282,9 +310,12 @@ class SyncEngine:
         elif name == "complete_task":
             c.complete_task(a["id"], a["done"])
         elif name == "pomodoro":
-            c.record_pomodoro_completed(a.get("minutes", 25))
+            self._with_session_fallback(lambda session: c.record_pomodoro_completed(a.get("minutes", 25), session),
+                                        a.get("session"))
         elif name == "break":
-            c.record_break_completed()
+            self._with_session_fallback(c.record_break_completed, a.get("session"))
+        elif name == "timer_state":
+            self._new_in_schema(lambda: c.set_timer_state(a))
         elif name == "shared_add":
             c.shared_add_task(a["text"], a["id"], a.get("schedule"))
         elif name == "shared_schedule":
@@ -295,6 +326,8 @@ class SyncEngine:
             c.shared_set_done(a["id"], a["done"])
         elif name == "shared_remove":
             c.shared_remove_task(a["id"])
+        elif name == "shared_assign":
+            self._new_in_schema(lambda: c.shared_assign(a["id"], a["user_id"]))
         elif name == "shared_clear_done":
             c.shared_clear_done()
         elif name == "note_page_set":
@@ -305,6 +338,16 @@ class SyncEngine:
             c.reorder_note_pages(a["ids"])
         else:
             print(f"[sync] unknown queued operation {name!r}; dropping it")
+
+    def _with_session_fallback(self, call, session):
+        """A finished timer phase, with its session key; a cloud older than
+        v2.20 doesn't take the key, so it's sent without one there."""
+        try:
+            call(session)
+        except SyncError as e:
+            if not (session and e.schema_outdated):
+                raise
+            call(None)
 
     def _new_in_schema(self, call):
         """Something an older cloud schema simply doesn't have (it stays on
@@ -343,22 +386,45 @@ class SyncEngine:
                 page_id, result.get("title", title), result.get("notes" if main else "html", ""), result.get("rev"))
         raise SyncError("notes kept changing while saving", status=None)
 
+    def _known_fingerprints(self, rev):
+        state_fp, household_fp, applied_rev = self.applied
+        return (state_fp, household_fp) if applied_rev == rev else (None, None)
+
     def _pull(self):
         rev = self.storage.rev
+        state_fp, household_fp = self._known_fingerprints(rev)
         try:
             with self._io_lock:
-                remote = self.client.sync_pull()
+                remote = self._pull_state(state_fp)
         except SyncError as e:
             self._note_failure(e)
             return
-        household = self._pull_household()
+        household = self._pull_household(household_fp)
         self._last_pull = time.monotonic()
         self._persist_token()
         self.status = "online"
+        # Nothing new since what's already applied: nothing to hand over.
+        if remote is None and household is False:
+            return
         if self.on_pulled is not None:
             self.on_pulled(remote, household, rev)
 
-    def _pull_household(self):
+    def _pull_state(self, fingerprint):
+        """The server's state, or None when it still matches `fingerprint`."""
+        if self._fingerprints_supported:
+            try:
+                remote = self.client.sync_pull_if_changed(fingerprint)
+                return None if remote.get("unchanged") else remote
+            except SyncError as e:
+                if not e.schema_outdated:
+                    raise
+                self._fingerprints_supported = False  # older cloud schema
+        return self.client.sync_pull()
+
+    def _pull_household(self, fingerprint=None):
+        """False when not checked (or unchanged since `fingerprint`), None
+        when the account isn't in a household, else the household dict
+        (with its "fingerprint" when the schema sends one)."""
         if not self._household_supported:
             return False
         in_household = self.storage.get_household() is not None
@@ -368,7 +434,16 @@ class SyncEngine:
         self._next_household_probe = now + HOUSEHOLD_PROBE_SECONDS
         try:
             with self._io_lock:
-                return self.client.household_pull()
+                if not self._fingerprints_supported:
+                    return self.client.household_pull()
+                pulled = self.client.household_pull_if_changed(fingerprint if in_household else None)
+                if pulled.get("unchanged"):
+                    return False
+                household = pulled.get("household")
+                if household is not None:
+                    # taken back out by Storage.adopt_remote_state
+                    household["fingerprint"] = pulled.get("fingerprint")
+                return household
         except SyncError as e:
             if e.schema_outdated:
                 # Older cloud schema without the household feature: the rest

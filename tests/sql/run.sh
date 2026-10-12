@@ -16,4 +16,6 @@ psql_q -d "$db" -f "$root/supabase/schema.sql" > /dev/null
 psql_q -d "$db" -f "$root/supabase/schema.sql" > /dev/null
 # Query results go nowhere; a failed assertion is an error on stderr.
 psql_q -d "$db" -o /dev/null -f "$here/schema_tests.sql"
+# The rules the schema shares with the desktop, against tests/parity/cases.json.
+psql_q -d "$db" -o /dev/null -v casefile="$root/tests/parity/cases.json" -f "$here/parity_tests.sql"
 echo "schema tests passed"

@@ -135,6 +135,7 @@ class ScheduleDialog(QDialog):
         self.setWindowTitle("Schedule")
         layout = QVBoxLayout(self)
         heading = QLabel(f"When is \u201c{task['text']}\u201d for?")
+        heading.setTextFormat(Qt.TextFormat.PlainText)  # the text may come from the other member
         heading.setWordWrap(True)
         layout.addWidget(heading)
         self.editor = ScheduleEditor()
@@ -232,6 +233,10 @@ class SharedTab(QWidget):
         schedule_btn.setToolTip("Set a date/time, or make the selected item repeat daily, weekly or monthly")
         schedule_btn.clicked.connect(self.edit_schedule)
         action_row.addWidget(schedule_btn)
+        assign_btn = QPushButton("Assign selected…")
+        assign_btn.setToolTip("Make it someone's turn: only they get its reminders")
+        assign_btn.clicked.connect(self.assign_selected)
+        action_row.addWidget(assign_btn)
         clear_btn = QPushButton("Clear completed")
         clear_btn.setToolTip("Removes ticked one-off items. Repeating items stay and un-tick themselves when due again.")
         clear_btn.clicked.connect(self.clear_completed)
@@ -299,7 +304,7 @@ class SharedTab(QWidget):
                       f"<b>{html.escape(household.get('invite_code', ''))}</b>")
         else:
             header = (f"\U0001F3E0 {' & '.join(names)} — invite code "
-                      f"<b>{household.get('invite_code', '')}</b>")
+                      f"<b>{html.escape(household.get('invite_code', ''))}</b>")
         self.header_label.setText(header)
         self.header_label.setTextFormat(Qt.TextFormat.RichText)
 
@@ -327,6 +332,8 @@ class SharedTab(QWidget):
             label += f"   \u2014  {described}"
             if not task["done"] and shared_schedule.is_overdue(shared_schedule.normalize(schedule), datetime.now()):
                 label += "  \u26A0 overdue"
+        if task.get("assigned_to"):
+            label += "   \u2192 you" if task.get("assigned_to_me") else f"   \u2192 {task.get('assigned_name') or '?'}"
         if task["done"] and task.get("done_by_name"):
             label += f"   \u2014 \u2713 {task['done_by_name']}"
         return label
@@ -373,6 +380,25 @@ class SharedTab(QWidget):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.storage.shared_set_schedule(task["id"], dialog.schedule())
             self.refresh(force=True)
+
+    def assign_selected(self):
+        item = self.list_widget.currentItem()
+        household = self.storage.get_household()
+        if not item or not household:
+            return
+        task = next((t for t in household.get("tasks", []) if t["id"] == item.data(Qt.ItemDataRole.UserRole)), None)
+        if task is None:
+            return
+        members = [m for m in household.get("members", []) if m.get("user_id")]
+        choices = ["Anyone"] + [(m.get("name") or "?") + (" (you)" if m.get("is_me") else "") for m in members]
+        current = next((i + 1 for i, m in enumerate(members) if m["user_id"] == task.get("assigned_to")), 0)
+        # (the item's text stays out of the label: it may be rich text from the other member)
+        choice, ok = QInputDialog.getItem(self, "Assign", "Whose turn is the selected item?", choices, current, False)
+        if not ok:
+            return
+        index = choices.index(choice)
+        self.storage.shared_assign(task["id"], members[index - 1]["user_id"] if index else None)
+        self.refresh(force=True)
 
     def remove_selected(self):
         item = self.list_widget.currentItem()

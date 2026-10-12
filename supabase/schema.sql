@@ -19,7 +19,7 @@ create extension if not exists pgcrypto;
 -- ============================================================
 
 -- Reference data: the pool of possible daily/weekly quests. Read-only at
--- runtime; ensure_daily_quests()/ensure_weekly_quests() pick 3 at random
+-- runtime; ensure_daily_quests()/ensure_weekly_quests() pick 3 (by md5, see them)
 -- from here, same as gamification.QUEST_POOL / WEEKLY_QUEST_POOL.
 create table if not exists quest_templates (
   id text primary key,
@@ -144,6 +144,8 @@ alter table checklist_tasks add column if not exists month_day int;
 alter table checklist_tasks add column if not exists due_date date;
 alter table checklist_tasks add column if not exists note text not null default '';
 alter table checklist_tasks add column if not exists subtasks jsonb not null default '[]'::jsonb;
+-- v2.20: the days a task was ticked (see task_done_days), for per-task streaks.
+alter table checklist_tasks add column if not exists done_days date[] not null default '{}';
 alter table checklist_tasks drop constraint if exists checklist_tasks_recurrence_check;
 alter table checklist_tasks add constraint checklist_tasks_recurrence_check
   check (recurrence in ('daily', 'weekly', 'once', 'monthly'));
@@ -224,6 +226,10 @@ create table if not exists shared_tasks (
   created_by uuid references auth.users(id) on delete set null,
   created_at timestamptz not null default now()
 );
+
+-- v2.20: a shared item can be given to one member ("whose turn"); its
+-- reminders then go only to them. Null = anyone.
+alter table shared_tasks add column if not exists assigned_to uuid references auth.users(id) on delete set null;
 
 -- v2.11 migrations (no-ops when already applied): scheduled shared items.
 --  * recurrence: 'once' (optionally with an exact date + time), 'daily',
@@ -364,6 +370,20 @@ begin
 end;
 $$;
 
+-- The 3 quests of a list for a day (daily) or the Tuesday starting a week
+-- (weekly): the lowest md5("<id>:<period>"), the same pick as
+-- gamification.pick_quests, so the desktop's offline pick and the cloud's
+-- agree (checked by tests/parity).
+create or replace function pick_quests(p_list_type text, p_period date) returns jsonb
+language sql stable security invoker set search_path = public, extensions as $$
+  select coalesce(jsonb_agg(jsonb_build_object(
+      'id', id, 'kind', kind, 'target', target, 'desc', description,
+      'progress', 0, 'completed', false) order by n), '[]'::jsonb)
+    from (select t.*, row_number() over (order by md5(t.id || ':' || to_char(p_period, 'YYYY-MM-DD')), t.id) as n
+            from quest_templates t where t.list_type = p_list_type) ranked
+   where n <= 3;
+$$;
+
 create or replace function ensure_daily_quests() returns void
 language plpgsql security invoker set search_path = public, extensions as $$
 declare
@@ -373,11 +393,7 @@ declare
 begin
   s := ensure_app_state();
   if s.quests_date is distinct from today then
-    select coalesce(jsonb_agg(jsonb_build_object(
-        'id', id, 'kind', kind, 'target', target, 'desc', description,
-        'progress', 0, 'completed', false)), '[]'::jsonb)
-      into picked
-      from (select * from quest_templates where list_type = 'daily' order by random() limit 3) t;
+    picked := pick_quests('daily', today);
     update app_state set quests_date = today, quests = picked, updated_at = now()
       where user_id = auth.uid();
   end if;
@@ -393,11 +409,7 @@ declare
 begin
   s := ensure_app_state();
   if s.weekly_quests_start is distinct from wk then
-    select coalesce(jsonb_agg(jsonb_build_object(
-        'id', id, 'kind', kind, 'target', target, 'desc', description,
-        'progress', 0, 'completed', false)), '[]'::jsonb)
-      into picked
-      from (select * from quest_templates where list_type = 'weekly' order by random() limit 3) t;
+    picked := pick_quests('weekly', wk);
     update app_state set weekly_quests_start = wk, weekly_quests = picked, updated_at = now()
       where user_id = auth.uid();
   end if;
@@ -518,11 +530,43 @@ language sql security invoker set search_path = public, extensions as $$
     tasks = greatest(0, daily_stats.tasks + excluded.tasks);
 $$;
 
--- p_minutes is the length of the work session, for the focus-time history.
--- The old zero-argument version is dropped so the two can't both exist and
--- make a no-argument call ambiguous.
+-- v2.20: one pomodoro timer across your devices. Each finished phase has a
+-- key ("<phase>:<end time>"); every device following the timer may report
+-- it, and a key already counted is ignored, so it pays out once. Kept for a
+-- few days (keys only need to outlive a device catching up).
+create table if not exists timer_sessions (
+  user_id uuid not null references auth.users(id) on delete cascade,
+  session_key text not null,
+  created_at timestamptz not null default now(),
+  primary key (user_id, session_key)
+);
+alter table timer_sessions enable row level security;
+drop policy if exists "own timer sessions" on timer_sessions;
+create policy "own timer sessions" on timer_sessions for all
+  using (auth.uid() = user_id) with check (auth.uid() = user_id);
+
+-- True the first time a session key is reported (or when there's no key:
+-- an older client), false when another device already counted it.
+create or replace function claim_timer_session(p_session text) returns boolean
+language plpgsql security invoker set search_path = public, extensions as $$
+begin
+  if p_session is null then
+    return true;
+  end if;
+  delete from timer_sessions where user_id = auth.uid() and created_at < now() - interval '3 days';
+  insert into timer_sessions (user_id, session_key) values (auth.uid(), left(p_session, 80))
+    on conflict do nothing;
+  return found;
+end;
+$$;
+
+-- p_minutes is the length of the work session, for the focus-time history;
+-- p_session its key (see timer_sessions). The older signatures are dropped
+-- so they can't both exist and make a call ambiguous.
 drop function if exists record_pomodoro_completed();
-create or replace function record_pomodoro_completed(p_minutes int default 25) returns jsonb
+drop function if exists record_pomodoro_completed(int);
+create or replace function record_pomodoro_completed(p_minutes int default 25, p_session text default null)
+returns jsonb
 language plpgsql security invoker set search_path = public, extensions as $$
 declare
   s app_state;
@@ -530,6 +574,12 @@ declare
   new_lvl record;
   completed jsonb;
 begin
+  if not claim_timer_session(p_session) then
+    select * into s from app_state where user_id = auth.uid();
+    select * into old_lvl from level_from_xp(coalesce(s.xp, 0));
+    return jsonb_build_object('xp_gained', 0, 'already_counted', true, 'old_level', old_lvl.level,
+                              'new_level', old_lvl.level, 'completed_quests', '[]'::jsonb);
+  end if;
   perform ensure_daily_quests();
   perform ensure_weekly_quests();
   perform bump_streak();
@@ -556,16 +606,68 @@ begin
 end;
 $$;
 
-create or replace function record_break_completed() returns jsonb
+drop function if exists record_break_completed();
+create or replace function record_break_completed(p_session text default null) returns jsonb
 language plpgsql security invoker set search_path = public, extensions as $$
 declare
   completed jsonb;
 begin
+  if not claim_timer_session(p_session) then
+    return jsonb_build_object('completed_quests', '[]'::jsonb, 'already_counted', true);
+  end if;
   perform ensure_daily_quests();
   perform ensure_weekly_quests();
   completed := advance_quests('breaks', 1);
   return jsonb_build_object('completed_quests', completed);
 end;
+$$;
+
+-- The shared timer itself: what the last device to touch it did. `state` is
+-- {phase, running, ends_at (epoch seconds, while running), seconds_left
+-- (while paused), device (a random id per app install)}; `rev` goes up
+-- with every change, and sync_pull's "timer" carries both.
+create table if not exists timer_state (
+  user_id uuid primary key references auth.users(id) on delete cascade,
+  state jsonb not null,
+  rev bigint not null default 1,
+  updated_at timestamptz not null default now()
+);
+alter table timer_state enable row level security;
+drop policy if exists "own timer" on timer_state;
+create policy "own timer" on timer_state for all
+  using (auth.uid() = user_id) with check (auth.uid() = user_id);
+
+create or replace function set_timer_state(p_state jsonb) returns bigint
+language plpgsql security invoker set search_path = public, extensions as $$
+declare
+  clean jsonb;
+  new_rev bigint;
+begin
+  if p_state->>'phase' not in ('work', 'short_break', 'long_break') then
+    raise exception 'bad timer phase';
+  end if;
+  clean := jsonb_build_object(
+    'phase', p_state->>'phase',
+    'running', coalesce((p_state->>'running')::boolean, false),
+    'ends_at', (p_state->>'ends_at')::double precision,
+    'seconds_left', greatest(0, least(coalesce((p_state->>'seconds_left')::int, 0), 24 * 3600)),
+    'device', left(coalesce(p_state->>'device', ''), 40));
+  insert into timer_state (user_id, state) values (auth.uid(), clean)
+  on conflict (user_id) do update set state = excluded.state, rev = timer_state.rev + 1, updated_at = now()
+  returning rev into new_rev;
+  return new_rev;
+end;
+$$;
+
+-- The days (the last 120) a task was ticked, for per-task streaks: today
+-- added on a tick, taken off again on an un-tick of the same day; a reset at
+-- midnight leaves them alone. Mirrors task_dates.record_done_day (checked by
+-- tests/parity).
+create or replace function task_done_days(p_days date[], p_today date, p_done boolean) returns date[]
+language sql immutable set search_path = public, extensions as $$
+  select coalesce(array_agg(d order by d), '{}')
+    from (select distinct d from unnest(coalesce(p_days, '{}') || case when p_done then array[p_today] else '{}'::date[] end) d
+          where d > p_today - 120 and (p_done or d <> p_today)) x;
 $$;
 
 -- Flips just the checklist row (no XP/quest side effects). Split out from
@@ -580,7 +682,8 @@ declare
 begin
   update checklist_tasks set
     completed_today = p_done,
-    last_completed = case when p_done then user_today() else last_completed end
+    last_completed = case when p_done then user_today() else last_completed end,
+    done_days = task_done_days(done_days, user_today(), p_done)
   where id = p_task_id and user_id = auth.uid()
   returning * into t;
   if not found then
@@ -670,7 +773,7 @@ begin
   already := case t.recurrence
     when 'once' then t.awarded_on is not null
     when 'weekly' then t.awarded_on is not null and t.awarded_on >= week_start_for(today)
-    when 'monthly' then t.awarded_on is not null and t.awarded_on >= month_occurrence(t.month_day, today)
+    when 'monthly' then t.awarded_on is not null and t.awarded_on >= month_occurrence(coalesce(t.month_day, 1), today)
     else t.awarded_on is not null and t.awarded_on = today
   end;
   if already then
@@ -682,10 +785,24 @@ begin
 end;
 $$;
 
--- Daily tasks un-check at the start of each (local) day; weekly tasks
--- un-check when the quest week rolls over (Tuesday), the same reset as the
--- weekly quests; monthly ones when their day of the month comes round. A
--- task that resets un-ticks its subtasks too. Mirrors
+-- Whether a ticked personal task un-ticks itself on local day d: daily ones
+-- each new day, weekly ones when the quest week rolls over (Tuesday, the
+-- same reset as the weekly quests), monthly ones when their day of the month
+-- comes round; one-offs never. Mirrors task_dates.needs_reset (checked by
+-- tests/parity), and is the one place roll_recurring_tasks() and
+-- checklist_done_on() take it from.
+create or replace function checklist_needs_reset(p_recurrence text, p_last date, p_month_day int, d date)
+returns boolean language sql immutable set search_path = public, extensions as $$
+  select case p_recurrence
+    when 'daily' then p_last is distinct from d
+    when 'weekly' then p_last is null or p_last < week_start_for(d)
+    when 'monthly' then p_last is null or p_last < month_occurrence(coalesce(p_month_day, 1), d)
+    else false
+  end;
+$$;
+
+-- Un-ticks every task whose period rolled over (see checklist_needs_reset).
+-- A task that resets un-ticks its subtasks too. Mirrors
 -- Storage._roll_recurring_tasks.
 create or replace function roll_recurring_tasks() returns void
 language sql security invoker set search_path = public, extensions as $$
@@ -695,11 +812,7 @@ language sql security invoker set search_path = public, extensions as $$
                          from jsonb_array_elements(subtasks) with ordinality as x(s, i)), '[]'::jsonb)
   where user_id = auth.uid()
     and completed_today = true
-    and (
-      (recurrence = 'daily' and last_completed is distinct from user_today())
-      or (recurrence = 'weekly' and (last_completed is null or last_completed < week_start_for(user_today())))
-      or (recurrence = 'monthly' and (last_completed is null or last_completed < month_occurrence(month_day, user_today())))
-    );
+    and checklist_needs_reset(recurrence, last_completed, month_day, user_today());
 $$;
 
 create or replace function set_notes(p_notes text) returns void
@@ -944,6 +1057,15 @@ $$;
 
 -- One call to fetch everything the web app / desktop app needs, after
 -- rolling over daily tasks and making sure quest lists are fresh.
+-- Which schema this is: 220 = the one from v2.20. Bump it with any change an
+-- app relies on (and supabase_sync.SCHEMA_VERSION to match), so the desktop
+-- can say "re-run schema.sql" up front instead of features quietly falling
+-- back.
+create or replace function schema_version() returns int
+language sql immutable set search_path = public, extensions as $$
+  select 220;
+$$;
+
 create or replace function sync_pull() returns jsonb
 language plpgsql security invoker set search_path = public, extensions as $$
 declare
@@ -979,8 +1101,27 @@ begin
     'weekly_quests', s.weekly_quests,
     'checklist', tasks,
     'history', hist,
-    'notes_pages', pages
+    'notes_pages', pages,
+    'timer', (select t.state || jsonb_build_object('rev', t.rev) from timer_state t where t.user_id = auth.uid())
   );
+end;
+$$;
+
+-- What the apps poll every few seconds: sync_pull(), plus a fingerprint of
+-- it. A caller that passes the fingerprint of the state it already has gets
+-- just {unchanged, fingerprint} back when nothing changed, so an idle poll
+-- costs a few bytes instead of every note and task (Supabase's free tier
+-- counts egress). Clients fall back to sync_pull() on an older schema.
+create or replace function sync_pull_if_changed(p_fingerprint text default null) returns jsonb
+language plpgsql security invoker set search_path = public, extensions as $$
+declare
+  r jsonb := sync_pull();
+  fp text := md5(r::text);
+begin
+  if p_fingerprint is not distinct from fp then
+    return jsonb_build_object('unchanged', true, 'fingerprint', fp);
+  end if;
+  return r || jsonb_build_object('fingerprint', fp);
 end;
 $$;
 
@@ -1112,13 +1253,34 @@ begin
           -- OTHER members' changes (shared_activity.py). Older clients ignore the extra keys.
           'created_by_name', (select display_name from household_members where user_id = t.created_by),
           'created_by_me', coalesce(t.created_by = auth.uid(), false),
-          'done_by_me', coalesce(t.done_by = auth.uid(), false)
+          'done_by_me', coalesce(t.done_by = auth.uid(), false),
+          -- v2.20: who it's assigned to (null = anyone)
+          'assigned_to', t.assigned_to,
+          'assigned_name', (select display_name from household_members
+                            where user_id = t.assigned_to and household_id = h.id),
+          'assigned_to_me', coalesce(t.assigned_to = auth.uid(), false)
         ) order by t.sort_order, t.created_at), '[]'::jsonb)
       from shared_tasks t where t.household_id = h.id
     )
   ) into result
   from households h where h.id = hid;
   return result;
+end;
+$$;
+
+-- household_pull() for polling, the same way as sync_pull_if_changed:
+-- {household, fingerprint}, or {unchanged, fingerprint} when the caller's
+-- fingerprint still matches. `household` is null outside a household.
+create or replace function household_pull_if_changed(p_fingerprint text default null) returns jsonb
+language plpgsql security invoker set search_path = public, extensions as $$
+declare
+  h jsonb := household_pull();
+  fp text := md5(coalesce(h::text, 'null'));
+begin
+  if p_fingerprint is not distinct from fp then
+    return jsonb_build_object('unchanged', true, 'fingerprint', fp);
+  end if;
+  return jsonb_build_object('household', h, 'fingerprint', fp);
 end;
 $$;
 
@@ -1182,6 +1344,7 @@ begin
   if hid is null then
     return;
   end if;
+  update shared_tasks set assigned_to = null where household_id = hid and assigned_to = auth.uid();
   delete from household_members where user_id = auth.uid();
   if not exists (select 1 from household_members where household_id = hid) then
     delete from households where id = hid;
@@ -1274,6 +1437,27 @@ begin
     done_by = case when p_done then auth.uid() else null end,
     done_at = case when p_done then now() else null end
   where id = p_id and household_id = my_household_id();
+  if not found then
+    raise exception 'task not found';
+  end if;
+end;
+$$;
+
+-- Gives a shared item to one member of the household (p_user null = anyone).
+-- Security definer to see the other members; checks both sides itself.
+create or replace function shared_assign(p_id text, p_user uuid) returns void
+language plpgsql security definer set search_path = public, extensions as $$
+declare
+  hid uuid := my_household_id();
+begin
+  if auth.uid() is null or hid is null then
+    raise exception 'not in a household';
+  end if;
+  if p_user is not null and not exists (
+      select 1 from household_members where household_id = hid and user_id = p_user) then
+    raise exception 'not a member of this household';
+  end if;
+  update shared_tasks set assigned_to = p_user where id = p_id and household_id = hid;
   if not found then
     raise exception 'task not found';
   end if;
@@ -1425,12 +1609,8 @@ drop function if exists checklist_done_on(boolean, text, date, date);
 create or replace function checklist_done_on(p_completed boolean, p_recurrence text, p_last date, d date,
                                              p_month_day int default null)
 returns boolean language sql immutable set search_path = public, extensions as $$
-  select p_completed and (
-    p_recurrence = 'once'
-    or (p_recurrence = 'daily' and p_last = d)
-    or (p_recurrence = 'weekly' and p_last >= week_start_for(d))
-    or (p_recurrence = 'monthly' and p_last >= month_occurrence(coalesce(p_month_day, 1), d))
-  );
+  select p_completed and p_recurrence in ('once', 'daily', 'weekly', 'monthly')
+    and not checklist_needs_reset(p_recurrence, p_last, p_month_day, d);
 $$;
 
 -- Whether a task's reminders may go out on local day d (mirrors
@@ -1525,6 +1705,7 @@ begin
     join members mb on mb.household_id = t.household_id
     left join app_state a on a.user_id = mb.user_id
     where t.due_time is not null
+      and (t.assigned_to is null or t.assigned_to = mb.user_id)  -- v2.20: only the assignee
   ),
   due as (
     select c.* from candidates c

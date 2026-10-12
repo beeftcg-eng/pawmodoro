@@ -13,7 +13,8 @@
  *
  * All it does: find its own directory, launch
  * <owndir>\venv\Scripts\pythonw.exe main.py with that directory as the
- * working directory, and exit. The actual icon Windows shows comes from
+ * working directory, and exit. Its own arguments are passed on (e.g.
+ * --quick-add, from the "Pawmodoro Quick Add" shortcut). The actual icon Windows shows comes from
  * pawmodoro.rc (compiled in at build time), not the Desktop shortcut's
  * IconLocation - so this fixes the pinned tile's identity even before
  * the app launches, not just the running window's.
@@ -39,9 +40,16 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         return 1;
     }
 
-    /* CreateProcessW requires a mutable command-line buffer. */
-    wchar_t cmdLine[MAX_PATH + 32];
-    wsprintfW(cmdLine, L"\"%s\" main.py", pythonwPath);
+    /* CreateProcessW requires a mutable command-line buffer. Our own
+     * arguments go on the end (a too-long tail is dropped, not truncated). */
+    wchar_t cmdLine[MAX_PATH + 1100];
+    lstrcpyW(cmdLine, L"\"");
+    lstrcatW(cmdLine, pythonwPath);
+    lstrcatW(cmdLine, L"\" main.py");
+    if (pCmdLine && *pCmdLine && lstrlenW(pCmdLine) < 1000) {
+        lstrcatW(cmdLine, L" ");
+        lstrcatW(cmdLine, pCmdLine);
+    }
 
     STARTUPINFOW si;
     ZeroMemory(&si, sizeof(si));

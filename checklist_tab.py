@@ -282,7 +282,7 @@ class ChecklistTab(QWidget):
             (t["id"], t["text"], t["recurrence"], t.get("weekday"), t.get("reminder_time"), t.get("reminder_every_h"),
              t.get("snoozed_until"), t.get("focus_pomodoros", 0),
              bool(t.get("completed_today")), t.get("source"), t.get("month_day"), t.get("due_date"),
-             t.get("note"), str(t.get("subtasks")))
+             t.get("note"), str(t.get("subtasks")), task_dates.streak(t, today))
             for t in tasks
         ] + [today]  # "due today" turns into "overdue" at midnight
         if not force and signature == self._last_signature:
@@ -328,6 +328,12 @@ class ChecklistTab(QWidget):
                 label += f"  \U0001F4A4 {task['snoozed_until'][11:16]}"
             if task.get("focus_pomodoros"):
                 label += f"  \U0001F345 {task['focus_pomodoros']}"
+            streak = task_dates.streak(task, today)
+            if streak >= 2:
+                # "+": the streak may go back further than done_days are kept
+                step_days = 1 if task["recurrence"] == "daily" else 7
+                at_limit = (streak + 1) * step_days >= task_dates.DONE_DAYS_KEEP
+                label += f"  \U0001F525 {streak}{'+' if at_limit else ''}"
             item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, task["id"])
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
@@ -381,6 +387,9 @@ class ChecklistTab(QWidget):
     @staticmethod
     def _task_tooltip(task):
         lines = [("☑ " if s.get("done") else "☐ ") + html.escape(s["text"]) for s in task.get("subtasks") or []]
+        streak = task_dates.streak(task, date.today())
+        if streak >= 2:
+            lines.insert(0, f"\U0001F525 {streak} {'days' if task['recurrence'] == 'daily' else 'weeks'} in a row")
         note = (task.get("note") or "").strip()
         if note:
             lines.append("<i>" + html.escape(note).replace("\n", "<br>") + "</i>")

@@ -21,6 +21,8 @@ if something fails.
 - [ ] Right-click the tray icon: **Start timer** starts the pomodoro; the menu then says **Pause timer (24:59 left)**. Hovering the icon shows the time left.
 - [ ] Give a checklist task a reminder a minute ahead, close the window, wait. A notification appears; clicking it opens Pawmodoro on that task with the Done / Snooze banner.
 - [ ] Clicking a second Pawmodoro shortcut while it's running brings the existing window forward instead of opening another.
+- [ ] Tray icon → **➕ Add a task…** opens a small box on top of other windows; the task lands in the chosen list.
+- [ ] With the window closed to the tray, press **Ctrl+Alt+T** (the **Pawmodoro Quick Add** Start Menu shortcut): the same box appears, and no second Pawmodoro starts. With Pawmodoro not running at all, the same key starts it with the box open.
 
 ## Music controls
 
@@ -36,6 +38,12 @@ if something fails.
 - [ ] Ctrl+1 to Ctrl+5 switch tabs; Ctrl+P starts/pauses the timer; Ctrl+T jumps to a new checklist task; Ctrl+N asks for a new notes page.
 - [ ] View → **Export everything…** saves a zip; it contains `notes/`, `checklist.md` and `pawmodoro-data.json`, and text you made **bold** in your notes shows as `**bold**` in the exported `.md` file.
 - [ ] View → **Restore from a backup…** → pick today's → Pawmodoro restarts by itself (a single window, a single tray icon).
+- [ ] View → **Export to calendar (.ics)…** with a dated one-off task saves a file that Outlook (or the Calendar app) imports as an event on that day.
+
+## One timer across devices (needs Cloud Sync and the v2.20 schema)
+
+- [ ] Start a work session on the desktop; within about 5 s the phone app's Pomodoro tab shows the same countdown. Pause it on the phone; the desktop pauses within about 5 s.
+- [ ] Let a session run out with both open: both chime, and the Progress tab shows +1 session and +20 XP (not +2 / +40).
 
 ## Updating
 

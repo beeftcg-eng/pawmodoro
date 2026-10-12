@@ -66,3 +66,4 @@ Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Fil
 Type: filesandordirs; Name: "{localappdata}\Pawmodoro"
 Type: files; Name: "{userdesktop}\Pawmodoro.lnk"
 Type: files; Name: "{userappdata}\Microsoft\Windows\Start Menu\Programs\Pawmodoro.lnk"
+Type: files; Name: "{userappdata}\Microsoft\Windows\Start Menu\Programs\Pawmodoro Quick Add.lnk"

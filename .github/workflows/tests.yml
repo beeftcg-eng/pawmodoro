@@ -64,7 +64,7 @@ jobs:
       - name: Run phone app tests
         working-directory: tests/pwa
         run: |
-          npm install --no-audit --no-fund
+          npm ci --no-audit --no-fund
           npm test
 
   # The real Windows install (install.ps1, what install.bat and the in-app

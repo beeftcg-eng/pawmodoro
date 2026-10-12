@@ -59,8 +59,12 @@ DEFAULT_DATA = {
         "auto_start_next": True,   # roll straight into the next phase
         "ambient_auto": False,     # play the ambient mix only during work phases
         "idle_pause_min": 5,       # pause a work session after this long with no keyboard/mouse (0 = never)
+        "share_timer": True,       # one timer across your devices (with Cloud Sync)
     },
     "timer_state": None,  # the pomodoro timer across restarts, see PomodoroTab._save_timer_state
+    "device_id": None,  # this install's id for the shared timer (made on first start)
+    "remote_timer": None,  # the shared timer as last pulled: {phase, running, ends_at, seconds_left, device, rev}
+    "timer_rev_seen": 0,  # the shared timer revision this computer has already followed (or written)
     "focus_task": None,  # checklist task id the pomodoro timer is "working on", or None
     "focus_auto_pick": True,  # pick a random one-time task for the timer when it has none (local-only)
     "window": {
@@ -135,6 +139,20 @@ def _deep_merge(defaults, loaded):
     return merged
 
 
+def in_quiet_hours(reminders, hm):
+    """Whether "HH:MM" `hm` falls in the quiet hours of the `reminders`
+    settings (a window spanning midnight when start > end). Mirrored by
+    in_quiet_hours() in supabase/schema.sql."""
+    if not reminders.get("quiet_enabled"):
+        return False
+    start, end = reminders.get("quiet_start", "22:00"), reminders.get("quiet_end", "08:00")
+    if start == end:
+        return False
+    if start < end:
+        return start <= hm < end
+    return hm >= start or hm < end  # spans midnight
+
+
 class Storage:
     """Loads data on start, keeps it in memory, and writes it back on every change."""
 
@@ -153,6 +171,8 @@ class Storage:
         self.data = self._load()
         self._outbox_seq = max((o.get("seq", 0) for o in self.data.get("sync_outbox", [])), default=0)
         self._backup_daily()
+        if not self.data.get("device_id"):
+            self.data["device_id"] = uuid.uuid4().hex[:12]
         self._rolled_date = date.today().isoformat()
         self._roll_recurring_tasks()
         self._roll_shared_tasks()
@@ -166,8 +186,11 @@ class Storage:
         if os.path.exists(DATA_FILE):
             try:
                 with open(DATA_FILE, "r", encoding="utf-8") as f:
-                    return _deep_merge(DEFAULT_DATA, json.load(f))
-            except (json.JSONDecodeError, OSError):
+                    loaded = json.load(f)
+                if not isinstance(loaded, dict):
+                    raise ValueError("data.json doesn't hold an object")
+                return _deep_merge(DEFAULT_DATA, loaded)
+            except (ValueError, OSError):  # JSONDecodeError is a ValueError
                 # Corrupt file: back it up rather than destroying it silently
                 backup = DATA_FILE + ".corrupt"
                 try:
@@ -186,8 +209,10 @@ class Storage:
         for name in sorted(os.listdir(BACKUP_DIR), reverse=True):
             try:
                 with open(os.path.join(BACKUP_DIR, name), "r", encoding="utf-8") as f:
-                    return _deep_merge(DEFAULT_DATA, json.load(f))
-            except (json.JSONDecodeError, OSError):
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    return _deep_merge(DEFAULT_DATA, loaded)
+            except (ValueError, OSError):
                 continue
         return None
 
@@ -226,6 +251,7 @@ class Storage:
             restored["sync"] = self.data.get("sync", DEFAULT_DATA["sync"])
             restored["spotify"] = self.data.get("spotify", DEFAULT_DATA["spotify"])
             restored["sync_outbox"] = []
+            restored["device_id"] = self.data.get("device_id")  # still this computer
             self._outbox_inflight = None
             restored["notes_pages_synced"] = False  # re-upload the restored pages
             self.data = restored
@@ -238,6 +264,7 @@ class Storage:
         data["sync"]["refresh_token"] = None
         data["spotify"].update(access_token=None, refresh_token=None)
         data["sync_outbox"] = []
+        data["device_id"] = None  # an install's own; whoever loads this keeps theirs
         return data
 
     def _backup_daily(self):
@@ -555,19 +582,9 @@ class Storage:
         day of the month comes round. "once" tasks never reset. A task that
         resets un-ticks its subtasks too."""
         today_date = date.today()
-        today = today_date.isoformat()
         changed = False
         for task in self.data.get("checklist", []):
-            recurrence = task.get("recurrence")
-            last = task.get("last_completed")
-            should_reset = (
-                (recurrence == "daily" and last != today)
-                or (recurrence == "weekday" and task.get("weekday") is not None
-                    and today_date.weekday() == task["weekday"] and last != today)
-                or (recurrence == "weekly" and gamification.weekly_task_needs_reset(last, today_date))
-                or (recurrence == "monthly" and task_dates.monthly_needs_reset(last, task.get("month_day"), today_date))
-            )
-            if should_reset and task.get("completed_today"):
+            if task.get("completed_today") and task_dates.needs_reset(task, today_date):
                 task["completed_today"] = False
                 for sub in task.get("subtasks") or []:
                     sub["done"] = False
@@ -615,6 +632,7 @@ class Storage:
             "due_date": due_date,  # "YYYY-MM-DD" for a "once" task, or None
             "note": "",
             "subtasks": [],  # [{id, text, done}]
+            "done_days": [],  # ISO dates it was ticked (task_dates.record_done_day), for streaks
         }
         self.data["checklist"].append(task)
         self._enqueue_task_add(task)
@@ -747,15 +765,7 @@ class Storage:
         self.save()
 
     def _in_quiet_hours(self, now):
-        r = self.data.get("reminders", {})
-        if not r.get("quiet_enabled"):
-            return False
-        start, end, hm = r.get("quiet_start", "22:00"), r.get("quiet_end", "08:00"), now.strftime("%H:%M")
-        if start == end:
-            return False
-        if start < end:
-            return start <= hm < end
-        return hm >= start or hm < end  # spans midnight
+        return in_quiet_hours(self.data.get("reminders", {}), now.strftime("%H:%M"))
 
     def snooze_task_reminder(self, task_id, minutes):
         """Brings this task's reminder back in `minutes` (once), on top of
@@ -867,6 +877,7 @@ class Storage:
             return {"completed_quests": []}
         today = date.today()
         task["completed_today"] = done
+        task["done_days"] = task_dates.record_done_day(task.get("done_days"), today, done)
         if done:
             task["last_completed"] = today.isoformat()
         result = {"completed_quests": []}
@@ -890,6 +901,34 @@ class Storage:
     def set_pomodoro_settings(self, settings):
         self.data["pomodoro"] = dict(settings)
         self.save()
+
+    # ---------- One timer across devices (v2.20) ----------
+    def shared_timer_enabled(self):
+        return self.sync_configured() and self.get_pomodoro_settings().get("share_timer", True)
+
+    def publish_timer(self, phase, running, ends_at=None, seconds_left=None):
+        """Tells your other devices what this timer just did (start, pause,
+        reset, skip, the next phase). Only the newest one is ever sent."""
+        if not self.shared_timer_enabled():
+            return
+        self._enqueue("timer_state", {"phase": phase, "running": running, "ends_at": ends_at,
+                                      "seconds_left": seconds_left, "device": self.data["device_id"]},
+                      key="timer_state")
+        self.save()
+
+    def take_remote_timer(self):
+        """The shared timer as another device last set it, once per change;
+        None when there's nothing new from elsewhere (or sharing is off).
+        Our own changes coming back are just marked as seen."""
+        timer = self.data.get("remote_timer")
+        if not self.shared_timer_enabled() or not isinstance(timer, dict):
+            return None
+        rev = int(timer.get("rev") or 0)
+        if rev <= self.data.get("timer_rev_seen", 0):
+            return None
+        self.data["timer_rev_seen"] = rev
+        self.save()
+        return None if timer.get("device") == self.data["device_id"] else dict(timer)
 
     def get_timer_state(self):
         return self.data.get("timer_state")
@@ -1034,6 +1073,8 @@ class Storage:
             self.data.setdefault("reminders", {}).update(
                 {k: remote["reminders"][k] for k in ("quiet_enabled", "quiet_start", "quiet_end") if k in remote["reminders"]})
         self._apply_remote_pages(remote, keep_notes)
+        if "timer" in remote:  # v2.20; followed by PomodoroTab.follow_remote_timer
+            self.data["remote_timer"] = remote["timer"]
         local_tasks = {t["id"]: t for t in self.data.get("checklist", [])}
         # "weekday" (specific-day) tasks are local-only — the cloud
         # schema's checklist_tasks.recurrence CHECK constraint doesn't
@@ -1091,13 +1132,18 @@ class Storage:
 
     @staticmethod
     def _remote_detail_fields(remote_task, local_task):
-        """Monthly day, due date, note and subtasks from a pull. A cloud older
-        than v2.18 has none of them; then this computer's own are kept."""
+        """Monthly day, due date, note, subtasks and done days from a pull. A
+        cloud older than v2.18 (v2.20 for done days) has none of them; then
+        this computer's own are kept."""
+        # done_days (v2.20) on its own: a v2.18 cloud has subtasks but not it.
+        done_days = remote_task.get("done_days")
+        done_days = [str(d) for d in done_days] if isinstance(done_days, list) else local_task.get("done_days", [])
         if "subtasks" not in remote_task:
-            return {k: local_task.get(k, default) for k, default in
-                    (("month_day", None), ("due_date", None), ("note", ""), ("subtasks", []))}
+            return {"done_days": done_days, **{k: local_task.get(k, default) for k, default in
+                    (("month_day", None), ("due_date", None), ("note", ""), ("subtasks", []))}}
         subtasks = remote_task.get("subtasks")
         return {
+            "done_days": done_days,
             "month_day": remote_task.get("month_day"),
             "due_date": remote_task.get("due_date"),
             "note": remote_task.get("note") or "",
@@ -1147,7 +1193,8 @@ class Storage:
 
     def adopt_remote_state(self, remote, household=False, rev=None, keep_notes=False):
         """Replaces the local cache with the server's state (see
-        sync_engine.py). `household`: False = leave the cached household
+        sync_engine.py); `remote` None = unchanged since the last pull
+        applied. `household`: False = leave the cached household
         alone, None = the account isn't in one, else the household dict.
         `keep_notes`: leave the notes text alone (the editor is being used).
         When `rev` is given (the value when the pull began), nothing is
@@ -1156,10 +1203,18 @@ class Storage:
         overwrite a fresh edit. Returns True when applied."""
         if rev is not None and (rev != self.rev or self.outbox_len()):
             return False
-        self._apply_remote_state(remote, keep_notes=keep_notes)
+        state_fp, household_fp, _ = self.sync.applied
+        if remote is not None:  # None: unchanged since the last one applied
+            state_fp = remote.pop("fingerprint", None)
+            self._apply_remote_state(remote, keep_notes=keep_notes)
         if household is not False:
+            household_fp = household.pop("fingerprint", None) if household else None
             self.data["household"] = household
         self.save()
+        # Lets the next poll ask "anything new since this?" -- unless the
+        # notes were held back for the editor, which then has to see the
+        # next full pull.
+        self.sync.applied = (None if keep_notes else state_fp, household_fp, rev)
         return True
 
     # ---------- History (focus minutes etc. per day) ----------
@@ -1330,6 +1385,20 @@ class Storage:
         self._enqueue("shared_done", {"id": task_id, "done": done})
         self.save()
 
+    def shared_assign(self, task_id, user_id):
+        """Gives a shared item to one household member (None = anyone); its
+        reminders then go only to them."""
+        household = self.get_household()
+        members = {m.get("user_id"): m for m in (household or {}).get("members", [])}
+        for task in (household or {}).get("tasks", []):
+            if task["id"] == task_id:
+                member = members.get(user_id) if user_id else None
+                task["assigned_to"] = user_id if member else None
+                task["assigned_name"] = member.get("name") if member else None
+                task["assigned_to_me"] = bool(member and member.get("is_me"))
+        self._enqueue("shared_assign", {"id": task_id, "user_id": user_id if user_id in members else None})
+        self.save()
+
     def shared_remove_task(self, task_id):
         household = self.get_household()
         if household:
@@ -1384,8 +1453,8 @@ class Storage:
         now = datetime.now()
         due = []
         for task in (household or {}).get("tasks", []):
-            if task.get("done"):
-                continue
+            if task.get("done") or (task.get("assigned_to") and not task.get("assigned_to_me")):
+                continue  # someone else's turn: their reminder, not yours
             occurrence = shared_schedule.reminder_occurrence(self._shared_schedule_of(task), now)
             if occurrence and reminded.get(task["id"]) != occurrence:
                 reminded[task["id"]] = occurrence
@@ -1475,9 +1544,11 @@ class Storage:
         )
         return completed
 
-    def record_pomodoro_completed(self, minutes=None, task_id=None):
+    def record_pomodoro_completed(self, minutes=None, task_id=None, session=None):
         """Call once per completed work session (not for a skipped one).
         `minutes` is the session length, for the focus-time history.
+        `session`: its key ("work:<end time>") so the cloud counts it once
+        however many devices report it (the shared timer).
         `task_id`: the checklist task the session was spent on, if any; its
         local-only focus_pomodoros/focus_min totals go up.
         Returns a dict describing what was earned, for the UI to celebrate."""
@@ -1498,7 +1569,7 @@ class Storage:
         self.add_xp(gamification.XP_PER_WORK_SESSION)
         completed_quests = self._advance_quests("pomodoros", 1)
         new_level, _, _ = gamification.level_from_xp(g["xp"])
-        self._enqueue("pomodoro", {"minutes": minutes})
+        self._enqueue("pomodoro", {"minutes": minutes, "session": session})
         self.save()
         return {
             "xp_gained": gamification.XP_PER_WORK_SESSION,
@@ -1507,13 +1578,14 @@ class Storage:
             "completed_quests": completed_quests,
         }
 
-    def record_break_completed(self):
+    def record_break_completed(self, session=None):
         """Call once per completed break. Breaks don't earn XP on their
-        own, but they can satisfy a "take a break" quest."""
+        own, but they can satisfy a "take a break" quest. `session` as for
+        record_pomodoro_completed."""
         self._ensure_daily_quests()
         self._ensure_weekly_quests()
         completed_quests = self._advance_quests("breaks", 1)
-        self._enqueue("break", {})
+        self._enqueue("break", {"session": session})
         self.save()
         return {"completed_quests": completed_quests}
 

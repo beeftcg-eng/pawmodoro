@@ -44,6 +44,12 @@ class SyncError(Exception):
         return self.status >= 500 or self.status in (401, 408, 429)
 
 
+# The cloud schema this app was written against (schema_version() in
+# supabase/schema.sql, 220 = v2.20). An older one still syncs, with
+# fallbacks, but the app says it should be updated.
+SCHEMA_VERSION = 220
+
+
 class SupabaseSync:
     def __init__(self, url, anon_key, access_token=None, refresh_token=None):
         self.url = (url or "").rstrip("/")
@@ -146,8 +152,16 @@ class SupabaseSync:
                 return self._request(f"/rest/v1/rpc/{name}", params or {})
             raise
 
+    def schema_version(self):
+        return self._rpc("schema_version")
+
     def sync_pull(self):
         return self._rpc("sync_pull")
+
+    def sync_pull_if_changed(self, fingerprint):
+        """sync_pull() plus a "fingerprint", or just {unchanged, fingerprint}
+        when `fingerprint` still matches (schema v2.20+)."""
+        return self._rpc("sync_pull_if_changed", {"p_fingerprint": fingerprint})
 
     def set_notes(self, text):
         return self._rpc("set_notes", {"p_notes": text})
@@ -222,11 +236,20 @@ class SupabaseSync:
     def complete_task(self, task_id, done):
         return self._rpc("complete_task", {"p_task_id": task_id, "p_done": done})
 
-    def record_pomodoro_completed(self, minutes=25):
-        return self._rpc("record_pomodoro_completed", {"p_minutes": minutes})
+    def record_pomodoro_completed(self, minutes=25, session=None):
+        """`session` (schema v2.20+): the session's key, so it counts once
+        across devices. Only sent when given."""
+        params = {"p_minutes": minutes}
+        if session:
+            params["p_session"] = session
+        return self._rpc("record_pomodoro_completed", params)
 
-    def record_break_completed(self):
-        return self._rpc("record_break_completed")
+    def record_break_completed(self, session=None):
+        return self._rpc("record_break_completed", {"p_session": session} if session else {})
+
+    def set_timer_state(self, state):
+        """The shared timer (schema v2.20+); returns its new revision."""
+        return self._rpc("set_timer_state", {"p_state": state})
 
     def import_state(self, notes, xp, total_pomodoros, total_tasks, current_streak, longest_streak, last_active_date):
         return self._rpc("import_state", {
@@ -243,6 +266,10 @@ class SupabaseSync:
 
     def household_pull(self):
         return self._rpc("household_pull")
+
+    def household_pull_if_changed(self, fingerprint):
+        """{household, fingerprint}, or {unchanged, fingerprint} (schema v2.20+)."""
+        return self._rpc("household_pull_if_changed", {"p_fingerprint": fingerprint})
 
     def household_create(self, name):
         return self._rpc("household_create", {"p_name": name})
@@ -280,6 +307,10 @@ class SupabaseSync:
 
     def shared_remove_task(self, task_id):
         return self._rpc("shared_remove_task", {"p_id": task_id})
+
+    def shared_assign(self, task_id, user_id):
+        """Gives a shared item to one member (None = anyone). Schema v2.20+."""
+        return self._rpc("shared_assign", {"p_id": task_id, "p_user": user_id})
 
     def shared_clear_done(self):
         return self._rpc("shared_clear_done")

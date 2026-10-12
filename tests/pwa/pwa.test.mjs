@@ -39,6 +39,12 @@ async function bootApp(handlers = {}) {
     rpc: async (name, params) => {
       calls.push({ name, params });
       if (handlers[name]) return handlers[name](params);
+      // The polling RPCs answer from the plain ones (never "unchanged", unless a test says so).
+      if (name === "sync_pull_if_changed") return { data: state, error: null };
+      if (name === "household_pull_if_changed") {
+        const { data, error } = handlers.household_pull ? await handlers.household_pull() : { data: null, error: null };
+        return error ? { data: null, error } : { data: { household: data, fingerprint: null }, error: null };
+      }
       if (name === "sync_pull") return { data: state, error: null };
       return { data: null, error: null };
     },
@@ -356,4 +362,144 @@ test("tapping the notification itself opens the app", async () => {
   await sw.fire("notificationclick", { action: "", notification: { close() {}, data: {} } });
   assert.deepEqual(sw.opened, ["./"]);
   assert.equal(sw.fetches.length, 0);
+});
+
+// The phone's copies of the desktop's date rules, against what the Python
+// rules answer (tests/parity/cases.json; regenerate with tools/parity_cases.py).
+test("date rules match the desktop's (tests/parity)", async () => {
+  const cases = JSON.parse(readFileSync(fileURLToPath(new URL("../parity/cases.json", import.meta.url)), "utf8"));
+  const app = await bootApp();
+  try {
+    // noon local time on that day
+    const at = day => { const [y, m, d] = day.split("-").map(Number); return new app.window.Date(y, m - 1, d, 12); };
+    const call = (fn, ...args) => app.window[fn](...args);
+    for (const c of cases.week_start) {
+      assert.equal(call("weekStartFor", at(c.day)), c.expect, `weekStartFor(${c.day})`);
+    }
+    for (const c of cases.month_occurrence) {
+      assert.equal(call("monthOccurrence", c.month_day, at(c.day)), c.expect, `monthOccurrence(${c.month_day}, ${c.day})`);
+    }
+    for (const c of cases.streak) {
+      assert.equal(call("taskStreak", c.task, at(c.day)), c.expect, `taskStreak(${JSON.stringify(c.task)}, ${c.day})`);
+    }
+    for (const c of cases.reminds) {
+      assert.equal(call("taskRemindsToday", c.task, at(c.day)), c.expect, `taskRemindsToday(${JSON.stringify(c.task)}, ${c.day})`);
+    }
+  } finally { app.close(); }
+});
+
+test("a poll with nothing new keeps what's shown, and an older cloud gets plain pulls", async () => {
+  let unchanged = false;
+  const app = await bootApp({
+    sync_pull_if_changed: params => unchanged
+      ? { data: { unchanged: true, fingerprint: "fp1" }, error: null }
+      : { data: { ...pullState(), fingerprint: "fp1" }, error: null },
+  });
+  try {
+    await app.window.eval("pullAndRender({ poll: true })");
+    unchanged = true;
+    await app.window.eval("pullAndRender({ poll: true })");
+    const polls = app.calls.filter(c => c.name === "sync_pull_if_changed");
+    assert.equal(polls.at(-1).params.p_fingerprint, "fp1", "a poll offers what it has");
+    assert.equal(app.window.eval("state.checklist.length"), 2, "an unchanged answer keeps the state");
+    await app.window.eval("pullAndRender()");
+    assert.equal(app.calls.filter(c => c.name === "sync_pull_if_changed").at(-1).params.p_fingerprint, null,
+      "the pull after an action is a full one");
+  } finally { app.close(); }
+
+  const old = await bootApp({ sync_pull_if_changed: () => ({ data: null, error: { code: "PGRST202", status: 404 } }) });
+  try {
+    await old.window.eval("pullAndRender({ poll: true })");
+    await old.window.eval("pullAndRender({ poll: true })");
+    assert.equal(old.calls.filter(c => c.name === "sync_pull_if_changed").length, 1, "asked once");
+    assert.ok(old.calls.filter(c => c.name === "sync_pull").length >= 2);
+    assert.equal(old.window.eval("state.checklist.length"), 2);
+  } finally { old.close(); }
+});
+
+test("a shared item's turn goes round the members, and shows who", async () => {
+  const household = {
+    id: "h1", invite_code: "CODE",
+    members: [{ user_id: "u1", name: "Me", is_me: true }, { user_id: "u2", name: "Bea", is_me: false }],
+    tasks: [{ id: "s1", text: "Bins", done: false, recurrence: "once", assigned_to: "u2", assigned_name: "Bea", assigned_to_me: false }],
+  };
+  const app = await bootApp({ household_pull: () => ({ data: household, error: null }) });
+  try {
+    app.window.eval('switchTab("shared")');
+    await until(() => app.window.document.querySelector("#shared-list .assign-btn"));
+    assert.match(app.window.document.getElementById("shared-list").textContent, /→ Bea/);
+    app.window.document.querySelector("#shared-list .assign-btn").click();
+    await settle();
+    assert.deepEqual(plain(app.calls.find(c => c.name === "shared_assign").params), { p_id: "s1", p_user: null },
+      "after the last member comes anyone");
+  } finally { app.close(); }
+});
+
+// ---------- one timer across devices ----------
+
+test("starting and pausing the timer tells the other devices", async () => {
+  const app = await bootApp({ set_timer_state: () => ({ data: 5, error: null }) });
+  try {
+    app.window.eval('switchTab("pomodoro")');
+    app.window.document.getElementById("pomo-start-pause").click();
+    await settle();
+    const started = plain(app.calls.filter(c => c.name === "set_timer_state").at(-1).params.p_state);
+    assert.equal(started.phase, "work");
+    assert.equal(started.running, true);
+    assert.ok(Math.abs(started.ends_at - (Date.now() / 1000 + 25 * 60)) < 3);
+    assert.match(started.device, /^phone-/);
+    app.window.eval("pomodoro.deadline -= 60000"); // a minute in
+    app.window.document.getElementById("pomo-start-pause").click();
+    await settle();
+    const paused = plain(app.calls.filter(c => c.name === "set_timer_state").at(-1).params.p_state);
+    assert.equal(paused.running, false);
+    assert.equal(paused.seconds_left, 24 * 60);
+    app.window.eval('switchTab("checklist"); switchTab("pomodoro")');
+    assert.equal(app.window.document.getElementById("timer-text").textContent, "24:00", "a re-render keeps the paused time");
+  } finally { app.close(); }
+});
+
+test("the phone follows the desktop's timer, and leaves the count to it", async () => {
+  const app = await bootApp();
+  try {
+    app.window.eval('switchTab("pomodoro")');
+    const endsAt = Date.now() / 1000 + 600;
+    app.window.eval(`followRemoteTimer({ phase: "short_break", running: true, ends_at: ${endsAt}, device: "desk", rev: 4 })`);
+    assert.equal(app.window.eval("pomodoro.phase"), "short_break");
+    assert.equal(app.window.eval("pomodoro.running"), true);
+    assert.match(app.window.document.getElementById("timer-text").textContent, /^(10:00|09:59)$/);
+    assert.ok(!app.calls.some(c => c.name === "set_timer_state"), "following isn't sent back");
+    app.window.eval('followRemoteTimer({ phase: "short_break", running: true, ends_at: 1, device: "desk", rev: 4 })');
+    assert.equal(app.window.eval("pomodoro.deadline"), endsAt * 1000, "a revision is followed once");
+
+    // the desktop's session ends: the phone doesn't count it itself...
+    app.window.eval(`followRemoteTimer({ phase: "work", running: true, ends_at: ${Date.now() / 1000 - 1}, device: "desk", rev: 5 })`);
+    await app.window.eval("tickPomodoro()");
+    await settle();
+    assert.ok(!app.calls.some(c => c.name === "record_pomodoro_completed"));
+    assert.equal(app.window.eval("pomodoro.takeover.phase"), "work");
+    // ...unless the desktop never reports back
+    await app.window.eval("takeOverTimer(pomodoro.takeover)");
+    const counted = app.calls.find(c => c.name === "record_pomodoro_completed");
+    assert.match(counted.params.p_session, /^work:\d+$/);
+    assert.equal(app.window.eval("pomodoro.owner"), true);
+  } finally { app.close(); }
+});
+
+test("its own timer counts its sessions with a key, even on an older cloud", async () => {
+  const app = await bootApp({
+    record_pomodoro_completed: params => params.p_session
+      ? { data: null, error: { code: "PGRST202", message: "Could not find the function" } }
+      : { data: { xp_gained: 20, completed_quests: [] }, error: null },
+  });
+  try {
+    app.window.eval('switchTab("pomodoro"); startPomodoro(Date.now() - 1); pomodoro.owner = true');
+    await app.window.eval("tickPomodoro()");
+    await settle();
+    const calls = app.calls.filter(c => c.name === "record_pomodoro_completed").map(c => plain(c.params));
+    assert.equal(calls.length, 2);
+    assert.match(calls[0].p_session, /^work:/);
+    assert.equal(calls[1].p_session, undefined, "retried without the key");
+    assert.equal(app.window.eval("pomodoro.phase"), "short_break");
+  } finally { app.close(); }
 });

@@ -34,6 +34,158 @@ class MainWindowTests(StorageTestCase):
             window.tabs.setCurrentIndex(index)
             self.app.processEvents()
 
+    def test_find_carries_on_into_other_pages(self):
+        st = self.storage
+        st.set_page_html("main", "<p>groceries</p>")
+        ideas = st.add_note_page("Ideas")
+        st.set_page_html(ideas, "<p>a Bakery list</p>")
+        st.add_note_page("Empty")
+        window = self.make_window()
+        notes = window.notes_checklist_tab.notes_tab
+        notes.find_input.setText("bakery")
+        notes.find_next()
+        self.assertEqual(notes.current_page, ideas)
+        self.assertEqual(notes.editor.textCursor().selectedText(), "Bakery")
+        notes.find_input.setText("groceries")
+        notes.find_previous()
+        self.assertEqual(notes.current_page, "main")
+        notes.find_input.setText("nowhere")
+        notes.find_next()
+        self.assertEqual(notes.current_page, "main")
+        self.assertIn("not found", notes.status_label.text())
+
+    def test_quick_add_into_the_checklist_and_shared_list(self):
+        window = self.make_window()
+        window.quick_add()
+        dialog = window._quick_add_dialog
+        self.assertEqual(dialog.destination_box.count(), 3, "no shared list outside a household")
+        dialog.text_input.setText("  Call the vet ")
+        dialog.destination_box.setCurrentIndex(1)
+        dialog.accept()
+        self.assertEqual([(t["text"], t["recurrence"]) for t in window.storage.get_checklist()],
+                         [("Call the vet", "daily")])
+        self.assertIsNone(window._quick_add_dialog)
+
+        window.storage.data["household"] = {"id": "h1", "members": [], "tasks": []}
+        window.quick_add()
+        dialog = window._quick_add_dialog
+        self.assertEqual(dialog.destination_box.currentIndex(), 1, "remembers the last list")
+        dialog.destination_box.setCurrentIndex(3)
+        dialog.text_input.setText("Milk")
+        dialog.accept()
+        self.assertEqual([t["text"] for t in window.storage.get_household()["tasks"]], ["Milk"])
+
+    def test_quick_add_needs_some_text(self):
+        window = self.make_window()
+        window.quick_add()
+        window._quick_add_dialog._accept_if_text()
+        self.assertIsNotNone(window._quick_add_dialog, "still open")
+        window._quick_add_dialog.reject()
+        self.assertEqual(window.storage.get_checklist(), [])
+
+    def make_synced_window(self):
+        """A window whose storage thinks Cloud Sync is on (nothing is sent:
+        the sync thread isn't started)."""
+        import sync_engine
+        self.enable_sync()
+        self.storage.save()
+        with mock.patch.object(sync_engine.SyncEngine, "start"):
+            window = self.make_window()
+        return window, window.pomodoro_tab, window.storage
+
+    def outbox(self, st, op):
+        return [o["args"] for o in st.data["sync_outbox"] if o["op"] == op]
+
+    def test_shared_timer_start_is_published(self):
+        window, tab, st = self.make_synced_window()
+        tab.toggle_running()
+        [state] = self.outbox(st, "timer_state")
+        self.assertEqual((state["phase"], state["running"], state["device"]), ("work", True, st.data["device_id"]))
+        self.assertAlmostEqual(state["ends_at"], time.time() + 25 * 60, delta=2)
+        tab.toggle_running()
+        [state] = self.outbox(st, "timer_state")  # only the newest is kept
+        self.assertEqual((state["running"], state["ends_at"]), (False, None))
+        self.assertGreater(state["seconds_left"], 24 * 60)
+
+    def test_following_another_devices_timer(self):
+        window, tab, st = self.make_synced_window()
+        st.data["remote_timer"] = {"phase": "short_break", "running": True, "ends_at": time.time() + 120,
+                                   "device": "phone", "rev": 3}
+        tab.follow_remote_timer(st.take_remote_timer())
+        self.assertEqual((tab.phase, tab.running), ("short_break", True))
+        self.assertAlmostEqual(tab.seconds_left, 120, delta=2)
+        self.assertEqual(self.outbox(st, "timer_state"), [], "following isn't news to send back")
+        self.assertIsNone(st.take_remote_timer(), "each change is followed once")
+        st.data["remote_timer"] = {"phase": "short_break", "running": False, "seconds_left": 99,
+                                   "device": "phone", "rev": 4}
+        tab.follow_remote_timer(st.take_remote_timer())
+        self.assertEqual((tab.running, tab.seconds_left), (False, 99))
+
+    def test_our_own_change_coming_back_is_not_followed(self):
+        window, tab, st = self.make_synced_window()
+        st.data["remote_timer"] = {"phase": "work", "running": True, "ends_at": time.time() + 60,
+                                   "device": st.data["device_id"], "rev": 7}
+        self.assertIsNone(st.take_remote_timer())
+        self.assertEqual(st.data["timer_rev_seen"], 7)
+
+    def test_a_timer_left_running_long_ago_is_ignored(self):
+        window, tab, st = self.make_synced_window()
+        tab.follow_remote_timer({"phase": "short_break", "running": True, "ends_at": time.time() - 3600,
+                                 "device": "phone", "rev": 1})
+        self.assertEqual((tab.phase, tab.running), ("work", False))
+
+    def test_the_device_running_the_timer_counts_the_session_once(self):
+        window, tab, st = self.make_synced_window()
+        tab.toggle_running()
+        ends_at = tab._ends_at
+        xp = st.data["gamification"]["xp"]
+        tab.advance_phase(completed=True)
+        self.assertEqual(st.data["gamification"]["xp"], xp + 20)
+        [done] = self.outbox(st, "pomodoro")
+        self.assertEqual(done["session"], f"work:{round(ends_at)}")
+        [state] = self.outbox(st, "timer_state")
+        self.assertEqual(state["phase"], "short_break")
+        self.assertAlmostEqual(state["ends_at"], ends_at + 5 * 60, delta=0.01, msg="chained onto the last end")
+
+    def test_a_follower_leaves_the_count_to_the_owner_then_takes_over(self):
+        window, tab, st = self.make_synced_window()
+        xp = st.data["gamification"]["xp"]
+        ends_at = time.time() - 1
+        tab.follow_remote_timer({"phase": "work", "running": True, "ends_at": ends_at, "device": "phone", "rev": 2})
+        tab._on_tick()  # the phase is over
+        self.assertEqual(tab.phase, "short_break")
+        self.assertEqual(st.data["gamification"]["xp"], xp, "the phone counts it")
+        self.assertEqual(self.outbox(st, "pomodoro"), [])
+        tab._take_over(tab._pending_takeover)  # ...but the phone never reported back
+        self.assertEqual(st.data["gamification"]["xp"], xp + 20)
+        self.assertEqual(self.outbox(st, "pomodoro")[0]["session"], f"work:{round(ends_at)}")
+        self.assertTrue(tab._owner)
+
+    def test_owner_reporting_back_cancels_the_takeover(self):
+        window, tab, st = self.make_synced_window()
+        tab.follow_remote_timer({"phase": "work", "running": True, "ends_at": time.time() - 1,
+                                 "device": "phone", "rev": 2})
+        tab._on_tick()
+        pending = tab._pending_takeover
+        tab.follow_remote_timer({"phase": "short_break", "running": True, "ends_at": time.time() + 299,
+                                 "device": "phone", "rev": 3})
+        xp = st.data["gamification"]["xp"]
+        tab._take_over(pending)
+        self.assertEqual(st.data["gamification"]["xp"], xp)
+
+    def test_an_idle_computer_does_not_pause_the_phones_session(self):
+        window, tab, st = self.make_synced_window()
+        tab.follow_remote_timer({"phase": "work", "running": True, "ends_at": time.time() + 600,
+                                 "device": "phone", "rev": 2})
+        with mock.patch("pomodoro_tab.idle.idle_seconds", return_value=3600):
+            tab._check_idle()
+        self.assertTrue(tab.running)
+
+    def test_without_sync_nothing_is_shared(self):
+        window = self.make_window()
+        window.pomodoro_tab.toggle_running()
+        self.assertEqual(window.storage.data["sync_outbox"], [])
+
     def test_running_timer_survives_a_restart(self):
         window = self.make_window()
         window.pomodoro_tab._start()

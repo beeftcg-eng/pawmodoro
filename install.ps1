@@ -177,6 +177,21 @@ if (Test-Path $IconPath) {
 }
 $StartShortcut.Save()
 
+# "Add a task" from anywhere: a Start Menu shortcut whose Ctrl+Alt+T opens
+# Pawmodoro's quick-add box (Windows only honours shortcut keys on Start
+# Menu / Desktop shortcuts). Change or clear the key in the shortcut's
+# Properties.
+$QuickShortcut = $Shell.CreateShortcut((Join-Path $StartMenuDir "Pawmodoro Quick Add.lnk"))
+$QuickShortcut.TargetPath = $AppExe
+$QuickShortcut.Arguments = "--quick-add"
+$QuickShortcut.WorkingDirectory = $InstallDir
+$QuickShortcut.Hotkey = "CTRL+ALT+T"
+$QuickShortcut.Description = "Add a task to Pawmodoro"
+if (Test-Path $IconPath) {
+    $QuickShortcut.IconLocation = $IconPath
+}
+$QuickShortcut.Save()
+
 Write-Host ""
 Write-Host "Done! A 'Pawmodoro' shortcut was added to your Desktop and Start Menu."
 Write-Host "Double-click it to launch. (If something looks wrong, run"

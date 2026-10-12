@@ -54,7 +54,7 @@ fi
 cat > "$INSTALL_DIR/run.sh" <<EOF
 #!/usr/bin/env bash
 cd "$INSTALL_DIR"
-exec "$INSTALL_DIR/venv/bin/python3" main.py
+exec "$INSTALL_DIR/venv/bin/python3" main.py "\$@"
 EOF
 chmod +x "$INSTALL_DIR/run.sh"
 
