@@ -11,7 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-24.04, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -36,7 +36,7 @@ jobs:
   # supabase/schema.sql against a real Postgres (the version Supabase runs),
   # loaded twice, then tests/sql/schema_tests.sql's assertions.
   schema:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     services:
       postgres:
         image: postgres:17
@@ -55,7 +55,7 @@ jobs:
 
   # The phone app (docs/) in a simulated browser.
   pwa:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
