@@ -2291,32 +2291,51 @@ begin
   end if;
   select jsonb_build_object(
     'decks', (
-      select coalesce(jsonb_agg(jsonb_build_object('id', d.id, 'game_id', d.game_id, 'data', d.data)), '[]'::jsonb)
+      select coalesce(jsonb_agg(jsonb_build_object('id', d.id, 'game_id', d.game_id, 'data', d.data) order by d.id), '[]'::jsonb)
       from deckbuilder_decks d where d.user_id = auth.uid()
     ),
     'binders', (
-      select coalesce(jsonb_agg(jsonb_build_object('id', b.id, 'data', b.data)), '[]'::jsonb)
+      select coalesce(jsonb_agg(jsonb_build_object('id', b.id, 'data', b.data) order by b.id), '[]'::jsonb)
       from deckbuilder_binders b where b.user_id = auth.uid()
     ),
     'collection', (
       select coalesce(jsonb_agg(jsonb_build_object(
         'game_id', c.game_id, 'card_id', c.card_id, 'card_name', c.card_name,
         'set_code', c.set_code, 'quantity', c.quantity, 'for_trade', c.for_trade
-      )), '[]'::jsonb)
+      ) order by c.game_id, c.card_id), '[]'::jsonb)
       from deckbuilder_collection c where c.user_id = auth.uid()
     ),
     'wants', (
       select coalesce(jsonb_agg(jsonb_build_object(
         'game_id', w.game_id, 'card_id', w.card_id, 'card_name', w.card_name, 'quantity', w.quantity
-      )), '[]'::jsonb)
+      ) order by w.game_id, w.card_id), '[]'::jsonb)
       from deckbuilder_wants w where w.user_id = auth.uid()
     ),
     'items', (
-      select coalesce(jsonb_agg(jsonb_build_object('kind', i.kind, 'key', i.key, 'data', i.data)), '[]'::jsonb)
+      select coalesce(jsonb_agg(jsonb_build_object('kind', i.kind, 'key', i.key, 'data', i.data) order by i.kind, i.key), '[]'::jsonb)
       from deckbuilder_user_items i where i.user_id = auth.uid()
     )
   ) into result;
   return result;
+end;
+$$;
+
+-- What Brewhouse polls every 20 seconds: deckbuilder_sync_pull(), plus a fingerprint of it. A
+-- caller that passes the fingerprint of the state it already has gets just {unchanged,
+-- fingerprint} back when nothing changed, so an idle poll costs a few bytes instead of the whole
+-- account (most of this project's egress before it). deckbuilder_sync_pull orders its rows so the
+-- fingerprint only changes when the data does. Same idea as sync_pull_if_changed; Brewhouse falls
+-- back to deckbuilder_sync_pull on an older schema.
+create or replace function deckbuilder_sync_pull_if_changed(p_fingerprint text default null) returns jsonb
+language plpgsql security invoker set search_path = public, extensions as $$
+declare
+  r jsonb := deckbuilder_sync_pull();
+  fp text := md5(r::text);
+begin
+  if p_fingerprint is not distinct from fp then
+    return jsonb_build_object('unchanged', true, 'fingerprint', fp);
+  end if;
+  return r || jsonb_build_object('fingerprint', fp);
 end;
 $$;
 
