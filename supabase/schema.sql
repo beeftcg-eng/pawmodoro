@@ -2409,7 +2409,7 @@ declare
 begin
   select jsonb_build_object(
     'game_id', d.game_id,
-    'data', d.data - 'shareToken' - 'locked' - 'notes' - 'folder' - 'versions',
+    'data', d.data - 'shareToken' - 'locked' - 'notes' - 'matchupPlans' - 'folder' - 'versions',
     'updated_at', d.updated_at,
     'owner_name', nullif(trim(coalesce(pr.display_name, '')), '')
   ) into result
