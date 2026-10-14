@@ -8,6 +8,8 @@ import into Google Calendar, Outlook, Apple Calendar, Thunderbird...
                          daily task with a reminder time (at that time)
     shared list          a one-off with a date, and daily / weekly / monthly
                          items (at their time, if they have one)
+    calendar events      yours and the household's, over their days (all
+                         day, or from their start time to their end time)
 
 Plain daily / weekly tasks without a time would only fill every day of the
 calendar, so they're left out. Times are "floating" (no time zone): the
@@ -127,11 +129,44 @@ def shared_events(household, today):
     return events
 
 
-def build_ics(tasks, household=None, today=None, now=None):
+EVENT_DEFAULT_MINUTES = 60  # a calendar event with a start time but no end time
+
+
+def calendar_events(events, household=None):
+    out = []
+    for event, shared in [(e, False) for e in events or []] + [(e, True) for e in (household or {}).get("events", []) or []]:
+        start, end = _parse_date(event.get("start_date")), _parse_date(event.get("end_date"))
+        if start is None:
+            continue
+        end = end or start
+        lines = ["BEGIN:VEVENT", f"UID:event-{event['id']}@pawmodoro"]
+        if event.get("start_time"):
+            begins = datetime.combine(start, datetime.strptime(event["start_time"], "%H:%M").time())
+            if event.get("end_time"):
+                ends = datetime.combine(end, datetime.strptime(event["end_time"], "%H:%M").time())
+            elif end == start:
+                ends = begins + timedelta(minutes=EVENT_DEFAULT_MINUTES)
+            else:
+                ends = datetime.combine(end + timedelta(days=1), datetime.min.time())
+            lines += [f"DTSTART:{begins:%Y%m%dT%H%M%S}", f"DTEND:{max(ends, begins):%Y%m%dT%H%M%S}"]
+        else:
+            lines += [f"DTSTART;VALUE=DATE:{start:%Y%m%d}", f"DTEND;VALUE=DATE:{end + timedelta(days=1):%Y%m%d}"]
+        lines.append(f"SUMMARY:{_escape(event.get('title', ''))}")
+        note = (event.get("note") or "").strip()
+        if note:
+            lines.append(f"DESCRIPTION:{_escape(note)}")
+        if shared:
+            lines.append("CATEGORIES:Shared")
+        lines.append("END:VEVENT")
+        out.append(lines)
+    return out
+
+
+def build_ics(tasks, household=None, today=None, now=None, events=None):
     """The whole .ics text, and how many events it holds."""
     today = today or date.today()
     stamp = f"DTSTAMP:{(now or datetime.now(timezone.utc)):%Y%m%dT%H%M%SZ}"
-    events = personal_events(tasks, today) + shared_events(household, today)
+    events = calendar_events(events, household) + personal_events(tasks, today) + shared_events(household, today)
     lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Pawmodoro//Checklist//EN", "CALSCALE:GREGORIAN",
              "X-WR-CALNAME:Pawmodoro"]
     for event in events:

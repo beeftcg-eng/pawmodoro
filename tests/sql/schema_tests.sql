@@ -482,4 +482,146 @@ begin
     'leaving hands your items back to anyone';
 end $$;
 reset role;
+-- ============ Calendar events and attached files ============
+-- A, B and Cal are in one household by now? Start clean: A and B share one.
+set role authenticated;
+select set_config('request.jwt.claim.sub', :'A', false);
+do $$ begin perform household_leave(); end $$;
+select set_config('request.jwt.claim.sub', :'B', false);
+do $$ begin perform household_leave(); end $$;
+select set_config('request.jwt.claim.sub', :'A', false);
+select household_create('Ann') ->> 'invite_code' as code \gset
+select set_config('request.jwt.claim.sub', :'B', false);
+select household_join(:'code', 'Bo') is not null;
+select set_config('request.jwt.claim.sub', :'A', false);
+do $$
+declare r jsonb; fp text;
+begin
+  r := save_event('ev1', 'Lisbon trip', '2026-10-20', '2026-10-25', null, null, 'flight TP123', false);
+  assert r->>'title' = 'Lisbon trip' and not r ? 'user_id', 'saved: ' || r;
+  r := sync_pull();
+  assert jsonb_array_length(r->'events') = 1 and r->'events'->0->>'note' = 'flight TP123'
+         and (r->'events'->0->>'created_by_me')::boolean, 'personal event in sync_pull: ' || (r->'events');
+  assert jsonb_array_length(household_pull()->'events') = 0, 'not on the household calendar';
+  perform save_event('ev1', 'Lisbon trip', '2026-10-20', '2026-10-26', '08:30', null, 'flight TP123', false);
+  assert (sync_pull()->'events'->0->>'end_date') = '2026-10-26' and sync_pull()->'events'->0->>'start_time' = '08:30',
+    'updated in place';
+  begin
+    perform save_event('bad', 'Backwards', '2026-10-20', '2026-10-19', null, null, '', false);
+    assert false, 'an event ending before it starts';
+  exception when raise_exception then null;
+  end;
+  begin
+    perform save_event('bad', 'Odd', '2026-10-20', '2026-10-20', null, '10:00', '', false);
+    assert false, 'an end time without a start time';
+  exception when raise_exception then null;
+  end;
+  perform save_event('ev2', 'Dinner at Mum''s', '2026-10-18', '2026-10-18', '19:00', '21:00', '', true);
+  assert jsonb_array_length(sync_pull()->'events') = 1, 'a shared event is not in sync_pull';
+  r := household_pull()->'events'->0;
+  assert r->>'id' = 'ev2' and r->>'created_by_name' = 'Ann' and r->>'end_time' = '21:00', 'shared event: ' || r;
+
+  -- A file on a personal task: registered, then uploaded, then listed.
+  perform add_task('Pay rent', 'monthly', null, 'checklist', 'rent1', 1);
+  r := add_attachment('file0001', 'task', 'rent1', 'receipt.pdf', 'application/pdf', 1000);
+  assert r->>'path' = 'u/11111111-1111-1111-1111-111111111111/file0001' and not (r->>'uploaded')::boolean, 'registered: ' || r;
+  assert add_attachment('file0001', 'task', 'rent1', 'receipt.pdf', 'application/pdf', 1000)->>'path' = r->>'path',
+    'registering again is a no-op';
+  assert jsonb_array_length(sync_pull()->'attachments') = 0, 'not listed before the upload finished';
+  insert into storage.objects (bucket_id, name) values ('attachments', 'u/11111111-1111-1111-1111-111111111111/file0001');
+  perform attachment_uploaded('file0001');
+  r := sync_pull()->'attachments';
+  assert jsonb_array_length(r) = 1 and r->0->>'file_name' = 'receipt.pdf' and (r->0->>'size')::int = 1000, 'listed: ' || r;
+  begin
+    insert into storage.objects (bucket_id, name) values ('attachments', 'u/11111111-1111-1111-1111-111111111111/unregistered');
+    assert false, 'uploaded a file with no row';
+  exception when insufficient_privilege then null;
+  end;
+  begin
+    perform add_attachment('file-big', 'task', 'rent1', 'huge.mov', 'video/mp4', 26 * 1024 * 1024);
+    assert false, 'a file over the limit';
+  exception when raise_exception then null;
+  end;
+
+  -- On a shared event: the household's path, and in household_pull.
+  r := add_attachment('file0002', 'event', 'ev2', 'menu.jpg', 'image/jpeg', 2000);
+  assert r->>'path' like 'h/%/file0002', 'household path: ' || r;
+  insert into storage.objects (bucket_id, name) values ('attachments', r->>'path');
+  perform attachment_uploaded('file0002');
+  assert household_pull()->'attachments'->0->>'id' = 'file0002', 'in household_pull';
+  assert jsonb_array_length(sync_pull()->'attachments') = 1, 'not in sync_pull';
+
+  -- Removing the item puts its files in the trash; putting it back takes them out.
+  perform remove_task('rent1');
+  assert jsonb_array_length(sync_pull()->'attachments') = 0, 'gone with its task';
+  r := sync_pull()->'attachments_trash';
+  assert jsonb_array_length(r) = 1 and r->0->>'id' = 'file0001' and r->0->>'trashed_at' is not null, 'in the trash: ' || r;
+  perform add_task('Pay rent', 'monthly', null, 'checklist', 'rent1', 1);
+  assert jsonb_array_length(sync_pull()->'attachments') = 1 and jsonb_array_length(sync_pull()->'attachments_trash') = 0,
+    'an undo brings it back';
+end $$;
+
+-- The other member sees (and can open) the household's file, not A's own.
+select set_config('request.jwt.claim.sub', :'B', false);
+do $$
+declare r jsonb;
+begin
+  r := household_pull();
+  assert r->'attachments'->0->>'added_by_name' = 'Ann' and not (r->'attachments'->0->>'added_by_me')::boolean, 'B sees it';
+  assert jsonb_array_length(sync_pull()->'attachments') = 0 and jsonb_array_length(sync_pull()->'events') = 0,
+    'A''s own calendar stays A''s';
+  assert (select count(*) from storage.objects where bucket_id = 'attachments') = 1, 'B can read only the shared file';
+  begin
+    perform save_event('ev2', 'Dinner', '2026-10-18', '2026-10-18', null, null, '', false);
+    assert false, 'B took A''s event off the shared calendar';
+  exception when raise_exception then null;
+  end;
+  perform save_event('ev2', 'Dinner at Mum''s', '2026-10-18', '2026-10-18', '19:30', null, 'bring wine', true);
+  assert household_pull()->'events'->0->>'start_time' = '19:30', 'any member edits a shared event';
+  begin
+    perform save_event('ev1', 'Hijack', '2026-10-01', '2026-10-01', null, null, '', false);
+    assert false, 'B overwrote A''s personal event';
+  exception when unique_violation then null;
+  end;
+  begin
+    perform add_attachment('file0003', 'event', 'ev1', 'x.txt', 'text/plain', 1);
+    assert false, 'B attached a file to A''s personal event';
+  exception when raise_exception then null;
+  end;
+end $$;
+
+-- Someone outside the household sees none of it.
+select set_config('request.jwt.claim.sub', :'C', false);
+do $$
+begin
+  assert (select count(*) from storage.objects where bucket_id = 'attachments') = 0, 'C can read no files';
+  assert (select count(*) from attachments) = 0 and (select count(*) from calendar_events) = 0, 'C sees no rows';
+end $$;
+
+-- A shared event taken back off the calendar, then removed; a file deleted.
+select set_config('request.jwt.claim.sub', :'A', false);
+do $$
+declare r jsonb;
+begin
+  perform save_event('ev2', 'Dinner at Mum''s', '2026-10-18', '2026-10-18', null, null, '', false);
+  assert jsonb_array_length(household_pull()->'events') = 0 and jsonb_array_length(household_pull()->'attachments') = 0,
+    'off the household calendar, with its file';
+  r := sync_pull()->'attachments';
+  assert jsonb_array_length(r) = 2 and (select path from attachments where id = 'file0002') like 'h/%',
+    'the file follows (and keeps its Storage path)';
+  perform remove_event('ev2');
+  assert jsonb_array_length(sync_pull()->'attachments_trash') = 1, 'its file is in the trash';
+  delete from storage.objects where name = (select path from attachments where id = 'file0002');
+  perform remove_attachment('file0002');
+  perform remove_attachment('file0001');
+  assert jsonb_array_length(sync_pull()->'attachments_trash') = 0 and jsonb_array_length(sync_pull()->'attachments') = 0,
+    'removed';
+  perform remove_event('ev1');
+  perform remove_task('rent1');
+  perform household_leave();
+end $$;
+select set_config('request.jwt.claim.sub', :'B', false);
+do $$ begin perform household_leave(); end $$;
+reset role;
+
 \echo 'all schema assertions passed'

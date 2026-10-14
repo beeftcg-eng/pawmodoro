@@ -48,6 +48,21 @@ async function bootApp(handlers = {}) {
       if (name === "sync_pull") return { data: state, error: null };
       return { data: null, error: null };
     },
+    // Storage (attached files): recorded as "storage.<method>", answered by handlers of the same name.
+    storage: {
+      from: bucket => {
+        const call = (method, params, fallback) => {
+          calls.push({ name: `storage.${method}`, params: { bucket, ...params } });
+          return handlers[`storage.${method}`] ? handlers[`storage.${method}`](params) : fallback;
+        };
+        return {
+          upload: async (path, file, options) => call("upload", { path, size: file.size, options }, { data: { path }, error: null }),
+          remove: async paths => call("remove", { paths }, { data: [], error: null }),
+          createSignedUrls: async (paths, expiresIn) => call("createSignedUrls", { paths, expiresIn },
+            { data: paths.map(path => ({ path, signedUrl: `https://signed.example/${path}` })), error: null }),
+        };
+      },
+    },
   };
   const dom = new JSDOM(`<!doctype html><body><div id="app"></div></body>`, {
     url: "https://beeftcg-eng.github.io/pawmodoro/", runScripts: "dangerously", pretendToBeVisual: true,
@@ -385,6 +400,16 @@ test("date rules match the desktop's (tests/parity)", async () => {
     for (const c of cases.reminds) {
       assert.equal(call("taskRemindsToday", c.task, at(c.day)), c.expect, `taskRemindsToday(${JSON.stringify(c.task)}, ${c.day})`);
     }
+    for (const c of cases.calendar_task) {
+      const what = `${JSON.stringify(c.task)} on ${c.day}`;
+      assert.equal(call("taskOnDay", c.task, c.day), c.expect.on, `taskOnDay(${what})`);
+      assert.equal(call("taskDoneOn", c.task, c.day), c.expect.done, `taskDoneOn(${what})`);
+    }
+    for (const c of cases.calendar_shared) {
+      const what = `${JSON.stringify(c.task)} on ${c.day}`;
+      assert.equal(call("sharedOnDay", c.task, c.day), c.expect.on, `sharedOnDay(${what})`);
+      assert.equal(call("sharedDoneOn", c.task, c.day, c.today), c.expect.done, `sharedDoneOn(${what}, today ${c.today})`);
+    }
   } finally { app.close(); }
 });
 
@@ -501,5 +526,171 @@ test("its own timer counts its sessions with a key, even on an older cloud", asy
     assert.match(calls[0].p_session, /^work:/);
     assert.equal(calls[1].p_session, undefined, "retried without the key");
     assert.equal(app.window.eval("pomodoro.phase"), "short_break");
+  } finally { app.close(); }
+});
+
+// ---------- Calendar: events and attached files ----------
+
+function calendarState(app, extra = {}) {
+  Object.assign(app.state, {
+    events: [{ id: "ev1", title: "Lisbon trip", start_date: "2026-10-20", end_date: "2026-10-22", start_time: null,
+      end_time: null, note: "TP123", created_by_me: true }],
+    attachments: [{ id: "f1", item_kind: "event", item_id: "ev1", file_name: "hotel.jpg", mime: "image/jpeg", size: 2048,
+      path: "u/u1/f1", added_by_me: true }],
+    attachments_trash: [],
+    ...extra,
+  });
+  app.state.checklist.push({ id: "t3", text: "Renew passport", recurrence: "once", due_date: "2026-10-21",
+    completed_today: false, source: "checklist" });
+}
+
+function showDay(app, day) {
+  app.window.eval(`calendarDay = "${day}"; calendarMonth = null; calendarOpen = null; switchTab("calendar")`);
+}
+
+test("the calendar puts events and dated tasks on their days", async () => {
+  const app = await bootApp();
+  try {
+    calendarState(app);
+    showDay(app, "2026-10-21");
+    const doc = app.window.document;
+    const cell = doc.querySelector('.cal-cell[data-day="2026-10-21"]');
+    assert.equal(cell.querySelectorAll(".cal-dot").length, 2);
+    assert.ok(cell.classList.contains("selected"));
+    assert.equal(doc.querySelectorAll('.cal-cell[data-day="2026-10-23"] .cal-dot').length, 0, "the trip is over by then");
+    const items = [...doc.querySelectorAll("#cal-day-list .cal-entry")].map(li => li.textContent.replace(/\s+/g, " ").trim());
+    assert.equal(items.length, 2);
+    assert.match(items[0], /… Lisbon trip/);
+    assert.match(items[0], /📎1/);
+    assert.match(items[1], /Renew passport/);
+    doc.querySelector("#cal-day-list .cal-entry-head").click();
+    await settle();
+    const details = doc.querySelector(".cal-details");
+    assert.match(details.textContent, /TP123/);
+    const link = details.querySelector(".cal-files a");
+    assert.equal(link.href, "https://signed.example/u/u1/f1", "a signed link to the private file");
+    assert.equal(link.querySelector("img").src, "https://signed.example/u/u1/f1", "a thumbnail for a photo");
+  } finally { app.close(); }
+});
+
+test("adding an event sends it, all day or at a time", async () => {
+  const app = await bootApp({ save_event: () => ({ data: {}, error: null }) });
+  try {
+    calendarState(app);
+    showDay(app, "2026-10-14");
+    const doc = app.window.document;
+    doc.querySelector('[data-add="event"]').click();
+    doc.getElementById("ev-title").value = "Dentist";
+    doc.getElementById("ev-allday").checked = false;
+    doc.getElementById("ev-allday").dispatchEvent(new app.window.Event("change"));
+    doc.getElementById("ev-start-time").value = "15:30";
+    doc.getElementById("ev-end-time").value = "16:00";
+    doc.getElementById("ev-save").click();
+    await settle();
+    const sent = plain(app.calls.find(c => c.name === "save_event").params);
+    assert.match(sent.p_id, /^[0-9a-f]{12}$/);
+    assert.deepEqual({ ...sent, p_id: undefined }, { p_id: undefined, p_title: "Dentist", p_start_date: "2026-10-14",
+      p_end_date: "2026-10-14", p_start_time: "15:30", p_end_time: "16:00", p_note: "", p_shared: false });
+    assert.equal(app.window.eval("calendarOpen"), `event:${sent.p_id}`, "its details open, ready for files");
+  } finally { app.close(); }
+});
+
+test("a task or a shared item can be put on a day", async () => {
+  const household = { id: "h1", invite_code: "C", members: [{ user_id: "u1", name: "Me", is_me: true }], tasks: [] };
+  const app = await bootApp({ household_pull: () => ({ data: household, error: null }) });
+  try {
+    calendarState(app);
+    await app.window.eval("refreshHousehold(true)");
+    showDay(app, "2026-10-14");
+    const doc = app.window.document;
+    doc.querySelector('[data-add="shared"]').click();
+    doc.getElementById("day-item-text").value = "Pick up the keys";
+    doc.getElementById("day-item-time").value = "18:00";
+    doc.getElementById("day-item-add").click();
+    await settle();
+    assert.deepEqual(plain(app.calls.find(c => c.name === "shared_add_task").params), {
+      p_text: "Pick up the keys", p_recurrence: "once", p_weekday: null, p_month_day: null,
+      p_due_date: "2026-10-14", p_due_time: "18:00" });
+    doc.querySelector('[data-add="task"]').click();
+    doc.getElementById("day-item-text").value = "Renew passport";
+    doc.getElementById("day-item-add").click();
+    await settle();
+    assert.deepEqual(plain(app.calls.find(c => c.name === "add_task").params), {
+      p_text: "Renew passport", p_recurrence: "once", p_reminder_time: null, p_due_date: "2026-10-14" });
+  } finally { app.close(); }
+});
+
+function attachFile(app, file) {
+  const input = app.window.document.querySelector(".cal-attach input");
+  Object.defineProperty(input, "files", { value: [file] });
+  input.dispatchEvent(new app.window.Event("change"));
+}
+
+test("a file is registered, uploaded to its path, then marked done", async () => {
+  const app = await bootApp({ add_attachment: params => ({ data: { path: `u/u1/${params.p_id}` }, error: null }) });
+  try {
+    calendarState(app);
+    showDay(app, "2026-10-20");
+    app.window.document.querySelector("#cal-day-list .cal-entry-head").click();
+    await settle();
+    attachFile(app, new app.window.File(["%PDF-1.4"], "ticket.pdf", { type: "application/pdf" }));
+    await until(() => app.calls.some(c => c.name === "attachment_uploaded"));
+    const add = plain(app.calls.find(c => c.name === "add_attachment").params);
+    assert.deepEqual({ ...add, p_id: undefined }, { p_id: undefined, p_item_kind: "event", p_item_id: "ev1",
+      p_file_name: "ticket.pdf", p_mime: "application/pdf", p_size: 8 });
+    const upload = plain(app.calls.find(c => c.name === "storage.upload").params);
+    assert.equal(upload.bucket, "attachments");
+    assert.equal(upload.path, `u/u1/${add.p_id}`);
+    assert.deepEqual(upload.options, { upsert: true, contentType: "application/pdf" });
+    assert.equal(app.calls.find(c => c.name === "attachment_uploaded").params.p_id, add.p_id);
+  } finally { app.close(); }
+});
+
+test("a failed upload takes its registration back, and big files never start", async () => {
+  const app = await bootApp({
+    add_attachment: params => ({ data: { path: `u/u1/${params.p_id}` }, error: null }),
+    "storage.upload": () => ({ data: null, error: { message: "network" } }),
+  });
+  try {
+    calendarState(app);
+    showDay(app, "2026-10-20");
+    app.window.document.querySelector("#cal-day-list .cal-entry-head").click();
+    await settle();
+    attachFile(app, new app.window.File(["x"], "a.txt", { type: "text/plain" }));
+    await until(() => app.calls.some(c => c.name === "remove_attachment"));
+    assert.ok(!app.calls.some(c => c.name === "attachment_uploaded"));
+    const big = await app.window.eval(`uploadAttachment("event", "ev1", { name: "film.mov", size: ${26 * 1024 * 1024} })`);
+    assert.equal(big, false);
+    assert.equal(app.calls.filter(c => c.name === "add_attachment").length, 1);
+  } finally { app.close(); }
+});
+
+test("removing a file deletes it from Storage before forgetting it", async () => {
+  const app = await bootApp();
+  try {
+    calendarState(app);
+    showDay(app, "2026-10-20");
+    app.window.document.querySelector("#cal-day-list .cal-entry-head").click();
+    await settle();
+    app.window.document.querySelector(".cal-files .remove-btn").click();
+    await until(() => app.calls.some(c => c.name === "remove_attachment"));
+    const names = app.calls.map(c => c.name).filter(n => n === "storage.remove" || n === "remove_attachment");
+    assert.deepEqual(names, ["storage.remove", "remove_attachment"]);
+    assert.deepEqual(plain(app.calls.find(c => c.name === "storage.remove").params.paths), ["u/u1/f1"]);
+  } finally { app.close(); }
+});
+
+test("files in the trash for over an hour are deleted, once", async () => {
+  const old = new Date(Date.now() - 2 * 3600 * 1000).toISOString();
+  const app = await bootApp();
+  try {
+    calendarState(app, { attachments_trash: [{ id: "gone", path: "u/u1/gone", trashed_at: old },
+      { id: "recent", path: "u/u1/recent", trashed_at: new Date().toISOString() }] });
+    await app.window.eval("pullAndRender()");
+    await app.window.eval("pullAndRender()");
+    await settle();
+    const removed = app.calls.filter(c => c.name === "storage.remove").map(c => plain(c.params.paths));
+    assert.deepEqual(removed, [["u/u1/gone"]]);
+    assert.deepEqual(app.calls.filter(c => c.name === "remove_attachment").map(c => c.params.p_id), ["gone"]);
   } finally { app.close(); }
 });

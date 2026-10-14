@@ -410,6 +410,7 @@ function renderShell() {
       <button data-tab="pomodoro">⏱️ Pomodoro</button>
       <button data-tab="progress">\u{1F3C6} Progress</button>
       <button data-tab="shared">\u{1F3E0} Shared</button>
+      <button data-tab="calendar">\u{1F4C5} Calendar</button>
     </nav>`;
   document.getElementById("logout-btn").addEventListener("click", async () => {
     stopPolling();
@@ -434,6 +435,7 @@ function switchTab(tab) {
   else if (tab === "pomodoro") renderPomodoro();
   else if (tab === "progress") renderProgress();
   else if (tab === "shared") renderShared();
+  else if (tab === "calendar") renderCalendar();
 }
 
 let pullRequestId = 0;
@@ -469,6 +471,7 @@ async function pullAndRender({ poll = false } = {}) {
     stateFingerprint = data?.fingerprint ?? null;
     state = data;
     followRemoteTimer(state?.timer);
+    purgeTrashedAttachments();
   }
   await refreshHousehold(false);
   if (requestId !== pullRequestId) return;
@@ -496,6 +499,9 @@ function rerenderActiveTab() {
     if (renderKeys.progress !== progressKey()) renderProgress();
   } else if (activeTab === "shared") {
     if (renderKeys.shared !== sharedKey()) renderShared();
+  } else if (activeTab === "calendar") {
+    // not while the add / edit form is open: it would lose what's typed
+    if (!calendarForm && renderKeys.calendar !== calendarKey()) renderCalendar();
   }
 }
 
@@ -1872,6 +1878,458 @@ function renderShared() {
     if (r.ok) { householdState = null; renderShared(); }
   });
   restoreDraft();
+}
+
+// ---------- Calendar tab ----------
+// What's on each day -- dated tasks, scheduled shared items and the
+// calendar's own events (trips, appointments) -- and the files attached to
+// them (tickets, reservations, receipts, photos), kept in the cloud's
+// "attachments" Storage bucket. Which day a thing lands on is the desktop's
+// rule (calendar_view.py); tests/parity checks taskOnDay / taskDoneOn /
+// sharedOnDay / sharedDoneOn against it.
+
+const ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024;  // attachment_max_bytes() in schema.sql
+const ATTACHMENT_TRASH_MS = 3600 * 1000;        // a removed item's files wait this long (an undo brings them back)
+const CAL_KIND_ICONS = { event: "\u{1F4C5}", task: "✅", shared: "\u{1F3E0}" };
+const CAL_KIND_ORDER = { event: 0, shared: 1, task: 2 };
+let calendarMonth = null;   // { year, month (0-11) } on screen
+let calendarDay = null;     // "YYYY-MM-DD" selected
+let calendarOpen = null;    // "kind:id" of the entry whose details are open
+let calendarForm = null;    // { kind: "event" | "task" | "shared", event? } -- the add / edit form showing
+const purgedAttachments = new Set();
+
+function isoToDate(iso) {
+  const [y, m, d] = iso.split("-").map(Number);
+  return new Date(y, m - 1, d);
+}
+
+function randomHexId() {
+  return Array.from(crypto.getRandomValues(new Uint8Array(6)), b => b.toString(16).padStart(2, "0")).join("");
+}
+
+// The most recent day on or before d that a repeating shared item came due
+// (shared_schedule.last_occurrence), or null for a one-off.
+function sharedOccurrence(task, d) {
+  if (task.recurrence === "daily") return localISODate(d);
+  if (task.recurrence === "weekly") {
+    const back = ((d.getDay() + 6) % 7 - (task.weekday ?? 0) + 7) % 7;
+    return localISODate(new Date(d.getFullYear(), d.getMonth(), d.getDate() - back));
+  }
+  if (task.recurrence === "monthly") return monthOccurrence(task.month_day ?? 1, d);
+  return null;
+}
+
+function taskOnDay(task, day) {
+  if (task.source === "wishlist") return false;
+  if (task.recurrence === "once") return (task.due_date || "").slice(0, 10) === day;
+  if (task.recurrence === "monthly") return monthOccurrence(task.month_day || 1, isoToDate(day)) === day;
+  if (task.recurrence === "weekday") return task.weekday === (isoToDate(day).getDay() + 6) % 7;
+  return false;
+}
+
+function taskDoneOn(task, day) {
+  return (task.done_days || []).includes(day) || (task.recurrence === "once" && Boolean(task.completed_today));
+}
+
+function sharedOnDay(task, day) {
+  const recurrence = task.recurrence || "once";
+  if (recurrence === "once") return (task.due_date || "").slice(0, 10) === day;
+  if (recurrence === "weekly" || recurrence === "monthly") return sharedOccurrence(task, isoToDate(day)) === day;
+  return false;
+}
+
+// A shared item only knows whether its current occurrence is ticked.
+function sharedDoneOn(task, day, today) {
+  if (!task.done) return false;
+  if ((task.recurrence || "once") === "once") return true;
+  return sharedOccurrence(task, isoToDate(today)) === day;
+}
+
+function calendarEntriesOn(day, today = localISODate(new Date())) {
+  const out = [];
+  const addEvent = (event, shared) => {
+    const start = event.start_date, end = event.end_date || event.start_date;
+    if (!(start <= day && day <= end)) return;
+    out.push({ kind: "event", id: event.id, title: event.title, item: event, shared, done: false,
+      time: day === start ? event.start_time || null : null,
+      span: start === end ? null : day === start ? "start" : day === end ? "end" : "middle" });
+  };
+  (state?.events ?? []).forEach(e => addEvent(e, false));
+  (householdState?.events ?? []).forEach(e => addEvent(e, true));
+  for (const task of householdState?.tasks ?? []) {
+    if (sharedOnDay(task, day)) out.push({ kind: "shared", id: task.id, title: task.text, item: task, shared: true,
+      time: task.due_time || null, done: sharedDoneOn(task, day, today), span: null });
+  }
+  for (const task of state?.checklist ?? []) {
+    if (taskOnDay(task, day)) out.push({ kind: "task", id: task.id, title: task.text, item: task, shared: false,
+      time: task.reminder_time || null, done: taskDoneOn(task, day), span: null });
+  }
+  return out.sort((a, b) => (a.time !== null) - (b.time !== null) || (a.time || "").localeCompare(b.time || "")
+    || CAL_KIND_ORDER[a.kind] - CAL_KIND_ORDER[b.kind] || a.title.toLowerCase().localeCompare(b.title.toLowerCase()));
+}
+
+function attachmentsFor(kind, id) {
+  return [...(state?.attachments ?? []), ...(householdState?.attachments ?? [])]
+    .filter(a => a.item_kind === kind && a.item_id === id);
+}
+
+function humanSize(size) {
+  let n = Number(size) || 0;
+  for (const unit of ["B", "KB", "MB", "GB"]) {
+    if (n < 1024 || unit === "GB") return unit === "B" ? `${n} B` : `${n.toFixed(1)} ${unit}`;
+    n /= 1024;
+  }
+}
+
+function describeEvent(event) {
+  const fmt = iso => {
+    const d = isoToDate(iso);
+    return d.toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short",
+      year: d.getFullYear() === new Date().getFullYear() ? undefined : "numeric" });
+  };
+  const end = event.end_date || event.start_date;
+  let text = fmt(event.start_date) + (event.start_time ? `, ${event.start_time}` : "");
+  if (end !== event.start_date) text += ` – ${fmt(end)}` + (event.end_time ? `, ${event.end_time}` : "");
+  else if (event.end_time) text += `–${event.end_time}`;
+  return text;
+}
+
+function calendarKey() {
+  return JSON.stringify([state?.checklist, state?.events, state?.attachments, householdState]);
+}
+
+function calendarCall(name, params, failTitle) {
+  return supabaseClient.rpc(name, params).then(({ data, error }) => {
+    if (error) {
+      toast(failTitle, isMissingFunction(error)
+        ? "The cloud database needs updating: re-run supabase/schema.sql (see MOBILE_SYNC.md)."
+        : error.message || "Check your connection and try again.");
+      return { ok: false };
+    }
+    return { ok: true, data };
+  });
+}
+
+async function reloadCalendar() {
+  await pullAndRender();
+  await refreshHousehold(true);
+  if (activeTab === "calendar") renderCalendar();
+}
+
+function renderCalendar() {
+  renderKeys.calendar = calendarKey();
+  const today = localISODate(new Date());
+  calendarDay ??= today;
+  calendarMonth ??= { year: isoToDate(calendarDay).getFullYear(), month: isoToDate(calendarDay).getMonth() };
+  const { year, month } = calendarMonth;
+  const supported = !state || "events" in state;
+  const first = new Date(year, month, 1);
+  const start = new Date(year, month, 1 - (first.getDay() + 6) % 7);
+  const lastDay = new Date(year, month + 1, 0);
+  const cells = [];
+  for (let d = new Date(start); d <= lastDay || cells.length % 7; d.setDate(d.getDate() + 1)) {
+    const iso = localISODate(d);
+    const inMonth = d.getMonth() === month;
+    const entries = inMonth ? calendarEntriesOn(iso, today) : [];
+    const dots = entries.slice(0, 3).map(e => `<i class="cal-dot ${e.kind}${e.done ? " done" : ""}"></i>`).join("")
+      + (entries.length > 3 ? `<i class="cal-more">+</i>` : "");
+    cells.push(`<button class="cal-cell${inMonth ? "" : " other"}${iso === today ? " today" : ""}${iso === calendarDay ? " selected" : ""}"
+      data-day="${iso}"><span class="cal-num">${d.getDate()}</span><span class="cal-dots">${dots}</span></button>`);
+  }
+  const dayDate = isoToDate(calendarDay);
+  const dayTitle = dayDate.toLocaleDateString(undefined, { weekday: "long", day: "numeric", month: "long",
+    year: dayDate.getFullYear() === new Date().getFullYear() ? undefined : "numeric" });
+  const entries = calendarEntriesOn(calendarDay, today);
+  const view = document.getElementById("view");
+  view.innerHTML = `
+    <div class="pane">
+      ${supported ? "" : `<p class="hint">Events and files need the cloud database updated: re-run
+        <code>supabase/schema.sql</code> (see MOBILE_SYNC.md). Dated tasks still show.</p>`}
+      <div class="cal-nav">
+        <button id="cal-prev" title="Previous month">‹</button>
+        <strong>${escapeHtml(first.toLocaleDateString(undefined, { month: "long", year: "numeric" }))}</strong>
+        <button id="cal-next" title="Next month">›</button>
+        <button id="cal-today" class="secondary-btn">Today</button>
+      </div>
+      <div class="cal-grid">
+        ${["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].map(d => `<span class="cal-dow">${d}</span>`).join("")}
+        ${cells.join("")}
+      </div>
+      <h3 class="section-heading">${escapeHtml(dayTitle)}${calendarDay === today ? " (today)" : ""}</h3>
+      <ul id="cal-day-list" class="task-list"></ul>
+      <div class="add-row cal-add">
+        ${supported ? `<button data-add="event">+ Event</button>` : ""}
+        <button data-add="task">+ Task</button>
+        ${householdState ? `<button data-add="shared">+ Shared</button>` : ""}
+      </div>
+      <div id="cal-form"></div>
+    </div>`;
+
+  document.getElementById("cal-prev").addEventListener("click", () => stepCalendarMonth(-1));
+  document.getElementById("cal-next").addEventListener("click", () => stepCalendarMonth(1));
+  document.getElementById("cal-today").addEventListener("click", () => {
+    calendarDay = today;
+    calendarMonth = null;
+    calendarOpen = null;
+    renderCalendar();
+  });
+  view.querySelectorAll(".cal-cell").forEach(cell => cell.addEventListener("click", () => {
+    calendarDay = cell.dataset.day;
+    const d = isoToDate(calendarDay);
+    calendarMonth = { year: d.getFullYear(), month: d.getMonth() };
+    calendarOpen = null;
+    renderCalendar();
+  }));
+  view.querySelectorAll("[data-add]").forEach(btn => btn.addEventListener("click", () => {
+    calendarForm = { kind: btn.dataset.add };
+    renderCalendarForm();
+  }));
+
+  const list = document.getElementById("cal-day-list");
+  if (!entries.length) list.innerHTML = `<li class="hint">Nothing on this day.</li>`;
+  for (const entry of entries) list.appendChild(calendarEntryItem(entry));
+  renderCalendarForm();
+}
+
+function stepCalendarMonth(delta) {
+  const { year, month } = calendarMonth;
+  const target = new Date(year, month + delta, 1);
+  const day = Math.min(isoToDate(calendarDay).getDate(), new Date(target.getFullYear(), target.getMonth() + 1, 0).getDate());
+  calendarDay = localISODate(new Date(target.getFullYear(), target.getMonth(), day));
+  calendarMonth = { year: target.getFullYear(), month: target.getMonth() };
+  calendarOpen = null;
+  renderCalendar();
+}
+
+function calendarEntryItem(entry) {
+  const key = `${entry.kind}:${entry.id}`;
+  const files = attachmentsFor(entry.kind, entry.id);
+  const li = document.createElement("li");
+  li.className = "task-item cal-entry" + (entry.done ? " done" : "");
+  li.dataset.key = key;
+  const label = (entry.time ? `${entry.time} ` : "") + entry.title;
+  li.innerHTML = `
+    <button class="cal-entry-head">
+      <span>${CAL_KIND_ICONS[entry.kind]} ${escapeHtml(entry.span === "middle" || entry.span === "end" ? `… ${entry.title}` : label)}</span>
+      ${entry.kind === "event" && entry.shared ? `<em>\u{1F3E0}</em>` : ""}
+      ${files.length ? `<em>\u{1F4CE}${files.length}</em>` : ""}
+    </button>`;
+  li.querySelector(".cal-entry-head").addEventListener("click", () => {
+    calendarOpen = calendarOpen === key ? null : key;
+    renderCalendar();
+  });
+  if (calendarOpen === key) li.appendChild(calendarDetails(entry, files));
+  return li;
+}
+
+function calendarDetails(entry, files) {
+  const box = document.createElement("div");
+  box.className = "cal-details";
+  const lines = [];
+  if (entry.kind === "event") {
+    lines.push(escapeHtml(describeEvent(entry.item)));
+    if (entry.shared) {
+      const by = entry.item.created_by_me ? "you" : entry.item.created_by_name || "someone";
+      lines.push(`\u{1F3E0} On the household's calendar (added by ${escapeHtml(by)})`);
+    }
+  } else {
+    lines.push(entry.kind === "task" ? "Task" : "Shared item");
+  }
+  if (entry.item.note) lines.push(escapeHtml(entry.item.note).replace(/\n/g, "<br>"));
+  const filesAllowed = state && "attachments" in state;
+  box.innerHTML = `
+    <p>${lines.join("<br>")}</p>
+    ${entry.kind === "event" ? `<div class="add-row"><button class="secondary-btn" data-act="edit">Edit</button>
+      <button class="secondary-btn" data-act="delete">Delete</button></div>` : ""}
+    <ul class="cal-files">${files.map(f => `
+      <li data-id="${escapeHtml(f.id)}">
+        <a target="_blank" rel="noopener" data-path="${escapeHtml(f.path)}">${f.mime?.startsWith("image/")
+          ? `<img class="cal-thumb" alt="">` : "\u{1F4C4}"} ${escapeHtml(f.file_name)}</a>
+        <em>${humanSize(f.size)}${f.added_by_me === false && f.added_by_name ? ` · ${escapeHtml(f.added_by_name)}` : ""}</em>
+        <button class="remove-btn" title="Remove this file">✕</button>
+      </li>`).join("")}</ul>
+    ${filesAllowed ? `<label class="cal-attach">\u{1F4CE} Add a file or photo<input type="file" multiple hidden></label>` : ""}`;
+  box.querySelector('[data-act="edit"]')?.addEventListener("click", () => {
+    calendarForm = { kind: "event", event: entry.item, shared: entry.shared };
+    renderCalendarForm();
+  });
+  box.querySelector('[data-act="delete"]')?.addEventListener("click", async () => {
+    const extra = files.length ? ` and its ${files.length} file${files.length === 1 ? "" : "s"}` : "";
+    if (!confirm(`Delete “${entry.title}”${extra}?${entry.shared ? " It's removed for everyone in your household." : ""}`)) return;
+    calendarOpen = null;
+    await calendarCall("remove_event", { p_id: entry.id }, "⚠️ Couldn't delete it");
+    await reloadCalendar();
+  });
+  box.querySelectorAll(".cal-files li").forEach(row => {
+    row.querySelector(".remove-btn").addEventListener("click", async () => {
+      const file = files.find(f => f.id === row.dataset.id);
+      if (!confirm(`Remove “${file.file_name}”?${entry.shared ? " It's removed for everyone in your household." : ""}`)) return;
+      await removeAttachment(file);
+      await reloadCalendar();
+    });
+  });
+  box.querySelector(".cal-attach input")?.addEventListener("change", async e => {
+    const picked = Array.from(e.target.files || []);
+    for (const file of picked) {
+      toast("\u{1F4CE} Uploading…", file.name || "photo");
+      await uploadAttachment(entry.kind, entry.id, file);
+    }
+    await reloadCalendar();
+  });
+  signFileLinks(box, files);
+  return box;
+}
+
+// The bucket is private: links (and thumbnails) are signed for an hour.
+async function signFileLinks(box, files) {
+  const paths = files.map(f => f.path).filter(Boolean);
+  if (!paths.length) return;
+  const { data, error } = await supabaseClient.storage.from("attachments").createSignedUrls(paths, 3600);
+  if (error || !Array.isArray(data)) return;
+  for (const signed of data) {
+    if (!signed?.signedUrl) continue;
+    box.querySelectorAll("a[data-path]").forEach(a => {
+      if (a.dataset.path !== signed.path) return;
+      a.href = signed.signedUrl;
+      const img = a.querySelector("img");
+      if (img) img.src = signed.signedUrl;
+    });
+  }
+}
+
+async function uploadAttachment(kind, itemId, file) {
+  if (file.size > ATTACHMENT_MAX_BYTES) {
+    toast("⚠️ Too big", `${file.name}: files can be at most ${ATTACHMENT_MAX_BYTES / 1024 / 1024} MB.`);
+    return false;
+  }
+  const id = randomHexId();
+  const mime = file.type || "application/octet-stream";
+  const registered = await calendarCall("add_attachment", { p_id: id, p_item_kind: kind, p_item_id: itemId,
+    p_file_name: file.name || "photo.jpg", p_mime: mime, p_size: file.size }, "⚠️ Couldn't add the file");
+  if (!registered.ok) return false;
+  const { error } = await supabaseClient.storage.from("attachments")
+    .upload(registered.data.path, file, { upsert: true, contentType: mime });
+  if (error) {
+    toast("⚠️ Couldn't upload the file", error.message || "Check your connection and try again.");
+    await supabaseClient.rpc("remove_attachment", { p_id: id });  // or it would count against the space
+    return false;
+  }
+  return (await calendarCall("attachment_uploaded", { p_id: id }, "⚠️ Couldn't add the file")).ok;
+}
+
+// Storage first: its policy needs the attachments row to still be there.
+async function removeAttachment(file) {
+  const { error } = await supabaseClient.storage.from("attachments").remove([file.path]);
+  if (error) {
+    toast("⚠️ Couldn't remove the file", error.message || "Check your connection and try again.");
+    return false;
+  }
+  return (await calendarCall("remove_attachment", { p_id: file.id }, "⚠️ Couldn't remove the file")).ok;
+}
+
+// Files whose task / item / event was removed over an hour ago (sync_pull's
+// attachments_trash): deleted for good. The desktop does the same.
+async function purgeTrashedAttachments() {
+  const now = Date.now();
+  for (const entry of state?.attachments_trash ?? []) {
+    if (purgedAttachments.has(entry.id) || now - new Date(entry.trashed_at).getTime() < ATTACHMENT_TRASH_MS) continue;
+    purgedAttachments.add(entry.id);
+    const { error } = await supabaseClient.storage.from("attachments").remove([entry.path]);
+    if (!error) await supabaseClient.rpc("remove_attachment", { p_id: entry.id });
+  }
+}
+
+function renderCalendarForm() {
+  const box = document.getElementById("cal-form");
+  if (!box) return;
+  if (!calendarForm) {
+    box.innerHTML = "";
+    return;
+  }
+  const { kind } = calendarForm;
+  if (kind === "event") {
+    const e = calendarForm.event || {};
+    const allDay = !e.start_time;
+    box.innerHTML = `
+      <section class="card">
+        <h2>${e.id ? "Edit event" : "New event"}</h2>
+        <div class="stack">
+          <input id="ev-title" type="text" maxlength="200" placeholder="e.g. Trip to Lisbon, Dentist" value="${escapeHtml(e.title || "")}">
+          <label class="cal-check"><input id="ev-allday" type="checkbox" ${allDay ? "checked" : ""}> All day</label>
+          <div class="add-row"><input id="ev-start" type="date" value="${e.start_date || calendarDay}">
+            <input id="ev-start-time" type="time" value="${e.start_time || "09:00"}"></div>
+          <div class="add-row"><input id="ev-end" type="date" value="${e.end_date || e.start_date || calendarDay}">
+            <input id="ev-end-time" type="time" value="${e.end_time || ""}" title="End time (optional)"></div>
+          <textarea id="ev-note" rows="3" placeholder="Booking number, address, flight…">${escapeHtml(e.note || "")}</textarea>
+          ${householdState ? `<label class="cal-check"><input id="ev-shared" type="checkbox" ${calendarForm.shared ? "checked" : ""}
+            ${calendarForm.shared && e.created_by_me === false ? "disabled" : ""}>
+            \u{1F3E0} On the household's calendar</label>` : ""}
+          <div class="add-row"><button id="ev-save">Save</button><button id="ev-cancel" class="secondary-btn">Cancel</button></div>
+        </div>
+      </section>`;
+    const sync = () => {
+      const timed = !document.getElementById("ev-allday").checked;
+      document.getElementById("ev-start-time").hidden = !timed;
+      document.getElementById("ev-end-time").hidden = !timed;
+    };
+    document.getElementById("ev-allday").addEventListener("change", sync);
+    sync();
+    document.getElementById("ev-start").addEventListener("change", ev => {
+      const end = document.getElementById("ev-end");
+      if (end.value < ev.target.value) end.value = ev.target.value;
+    });
+    document.getElementById("ev-cancel").addEventListener("click", () => { calendarForm = null; renderCalendarForm(); });
+    document.getElementById("ev-save").addEventListener("click", async () => {
+      const title = document.getElementById("ev-title").value.trim();
+      const startDate = document.getElementById("ev-start").value;
+      const endDate = document.getElementById("ev-end").value || startDate;
+      const timed = !document.getElementById("ev-allday").checked;
+      const startTime = timed ? document.getElementById("ev-start-time").value || null : null;
+      const endTime = timed && startTime ? document.getElementById("ev-end-time").value || null : null;
+      if (!title || !startDate) return toast("Almost there", "Give the event a title and a date.");
+      if (endDate < startDate || (endDate === startDate && endTime && endTime < startTime)) {
+        return toast("Check the dates", "It ends before it starts.");
+      }
+      const id = e.id || randomHexId();
+      const { ok } = await calendarCall("save_event", { p_id: id, p_title: title, p_start_date: startDate,
+        p_end_date: endDate, p_start_time: startTime, p_end_time: endTime,
+        p_note: document.getElementById("ev-note").value.trim(),
+        p_shared: Boolean(document.getElementById("ev-shared")?.checked) }, "⚠️ Couldn't save the event");
+      if (!ok) return;
+      calendarForm = null;
+      calendarDay = startDate;
+      calendarMonth = null;
+      calendarOpen = `event:${id}`;
+      await reloadCalendar();
+    });
+    if (!e.id) document.getElementById("ev-title").focus();
+    return;
+  }
+  box.innerHTML = `
+    <section class="card">
+      <h2>${kind === "task" ? "New task" : "New shared item"} on ${escapeHtml(isoToDate(calendarDay).toLocaleDateString(undefined, { day: "numeric", month: "short" }))}</h2>
+      <div class="stack">
+        <input id="day-item-text" type="text" placeholder="${kind === "task" ? "e.g. Renew passport" : "e.g. Pick up the keys"}">
+        <input id="day-item-time" type="time" title="Time (optional, you get a reminder then)">
+        <div class="add-row"><button id="day-item-add">Add</button><button id="day-item-cancel" class="secondary-btn">Cancel</button></div>
+      </div>
+    </section>`;
+  document.getElementById("day-item-cancel").addEventListener("click", () => { calendarForm = null; renderCalendarForm(); });
+  document.getElementById("day-item-add").addEventListener("click", async () => {
+    const text = document.getElementById("day-item-text").value.trim();
+    const time = document.getElementById("day-item-time").value || null;
+    if (!text) return;
+    const { ok } = kind === "task"
+      ? await calendarCall("add_task", { p_text: text, p_recurrence: "once", p_reminder_time: time, p_due_date: calendarDay },
+          "⚠️ Couldn't add the task")
+      : await calendarCall("shared_add_task", { p_text: text,
+          ...sharedScheduleParams({ recurrence: "once", due_date: calendarDay, due_time: time || "" }) },
+          "⚠️ Couldn't add the item");
+    if (!ok) return;
+    calendarForm = null;
+    await reloadCalendar();
+  });
+  document.getElementById("day-item-text").focus();
 }
 
 // ---------- Small utilities ----------

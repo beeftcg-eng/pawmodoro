@@ -10,11 +10,15 @@ low-level urllib exception, so storage.py can catch one exception type
 and fall back to local-only behavior without the desktop app ever being
 disrupted by a flaky or unconfigured connection.
 """
+import base64
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 
 TIMEOUT = 5
+TRANSFER_TIMEOUT = 120  # an attached file going to or coming from Storage
+ATTACHMENTS_BUCKET = "attachments"
 
 
 class SyncError(Exception):
@@ -45,9 +49,9 @@ class SyncError(Exception):
 
 
 # The cloud schema this app was written against (schema_version() in
-# supabase/schema.sql, 220 = v2.20). An older one still syncs, with
+# supabase/schema.sql, 221 = v2.21). An older one still syncs, with
 # fallbacks, but the app says it should be updated.
-SCHEMA_VERSION = 220
+SCHEMA_VERSION = 221
 
 
 class SupabaseSync:
@@ -65,18 +69,31 @@ class SupabaseSync:
     def logged_in(self):
         return bool(self.access_token)
 
-    def _request(self, path, body=None, method="POST", auth=True):
+    @property
+    def user_id(self):
+        """The signed-in account's id (the session token's `sub`)."""
+        try:
+            payload = (self.access_token or "").split(".")[1]
+            return json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))).get("sub")
+        except (IndexError, ValueError, AttributeError):
+            return None
+
+    def _request(self, path, body=None, method="POST", auth=True, raw_body=None, content_type=None,
+                 extra_headers=None, timeout=TIMEOUT, parse=True):
         headers = {
-            "Content-Type": "application/json",
+            "Content-Type": content_type or "application/json",
             "apikey": self.anon_key,
+            **(extra_headers or {}),
         }
         if auth and self.access_token:
             headers["Authorization"] = f"Bearer {self.access_token}"
-        data = json.dumps(body).encode("utf-8") if body is not None else None
+        data = raw_body if raw_body is not None else json.dumps(body).encode("utf-8") if body is not None else None
         try:
             req = urllib.request.Request(f"{self.url}{path}", data=data, headers=headers, method=method)
-            with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 raw = resp.read()
+                if not parse:
+                    return raw
                 return json.loads(raw) if raw else None
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", "replace")
@@ -314,3 +331,65 @@ class SupabaseSync:
 
     def shared_clear_done(self):
         return self._rpc("shared_clear_done")
+
+    # ---------- Calendar (schema v2.21) ----------
+
+    def save_event(self, event, shared):
+        return self._rpc("save_event", {
+            "p_id": event["id"], "p_title": event["title"], "p_start_date": event["start_date"],
+            "p_end_date": event["end_date"], "p_start_time": event.get("start_time"),
+            "p_end_time": event.get("end_time"), "p_note": event.get("note") or "", "p_shared": bool(shared),
+        })
+
+    def remove_event(self, event_id):
+        return self._rpc("remove_event", {"p_id": event_id})
+
+    def add_attachment(self, attachment_id, item_kind, item_id, file_name, mime, size):
+        """Registers a file before its upload; returns its row, with the
+        Storage `path` to upload it to."""
+        return self._rpc("add_attachment", {
+            "p_id": attachment_id, "p_item_kind": item_kind, "p_item_id": item_id,
+            "p_file_name": file_name, "p_mime": mime, "p_size": size})
+
+    def attachment_uploaded(self, attachment_id):
+        return self._rpc("attachment_uploaded", {"p_id": attachment_id})
+
+    def remove_attachment(self, attachment_id):
+        return self._rpc("remove_attachment", {"p_id": attachment_id})
+
+    # ---------- Storage (the attached files themselves) ----------
+
+    def _storage(self, method, path, **kwargs):
+        """A Storage API call, refreshing an expired session once (Storage
+        answers that with a 400/403 naming the JWT rather than a 401)."""
+        url_path = f"/storage/v1/object/{urllib.parse.quote(path, safe='/')}"
+        try:
+            return self._request(url_path, method=method, timeout=TRANSFER_TIMEOUT, **kwargs)
+        except SyncError as e:
+            expired = e.status in (400, 401, 403) and ("jwt" in str(e).lower() or "exp" in str(e).lower())
+            if not (expired and self.refresh_token):
+                raise
+            try:
+                self.refresh_session()
+            except SyncError as refresh_error:
+                if refresh_error.status in (400, 401, 403):
+                    refresh_error.auth = True
+                raise refresh_error from e
+            return self._request(url_path, method=method, timeout=TRANSFER_TIMEOUT, **kwargs)
+
+    def upload_file(self, path, data, mime):
+        """Puts a file's bytes at `path` in the attachments bucket
+        (replacing a half-finished earlier try)."""
+        return self._storage("POST", f"{ATTACHMENTS_BUCKET}/{path}", raw_body=data,
+                             content_type=mime or "application/octet-stream", extra_headers={"x-upsert": "true"})
+
+    def download_file(self, path):
+        return self._storage("GET", f"authenticated/{ATTACHMENTS_BUCKET}/{path}", parse=False)
+
+    def delete_file(self, path):
+        """Deletes a file from the bucket; one that's already gone is fine."""
+        try:
+            self._storage("DELETE", f"{ATTACHMENTS_BUCKET}/{path}")
+        except SyncError as e:
+            if e.status != 404 and "not found" not in str(e).lower():
+                raise

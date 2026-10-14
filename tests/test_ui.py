@@ -421,6 +421,32 @@ class MainWindowTests(StorageTestCase):
         self.assertIn("Pause", window.tray_timer_action.text())
         self.assertIn("left", window.tray.toolTip())
 
+    def test_calendar_shows_a_day_and_takes_files(self):
+        import os
+        from datetime import date
+        st = self.storage
+        event = st.save_event("Lisbon trip", "2026-10-20", "2026-10-25", note="TP123")
+        st.add_task("Renew passport", "once", due_date="2026-10-21")
+        window = self.make_window()
+        tab = window.calendar_tab
+        window.tabs.setCurrentWidget(tab)
+        tab.show_month(2026, 10)
+        tab.grid.select(date(2026, 10, 21))
+        self.app.processEvents()
+        texts = [tab.day_list.item(i).text() for i in range(tab.day_list.count())]
+        self.assertTrue(any("Lisbon trip" in t for t in texts) and any("Renew passport" in t for t in texts), texts)
+        tab.day_list.setCurrentRow(next(i for i, t in enumerate(texts) if "Lisbon" in t))
+        self.assertIn("TP123", tab.details_label.text())
+        path = os.path.join(self.tmp, "hotel.pdf")
+        with open(path, "wb") as f:
+            f.write(b"%PDF")
+        tab.attach_paths([path])
+        self.assertEqual([a["file_name"] for a in window.storage.attachments_for("event", event["id"])], ["hotel.pdf"])
+        self.assertIn("hotel.pdf", tab.file_list.item(0).text())
+        self.assertFalse(tab.grid.grab().isNull())
+        tab._step_month(1)
+        self.assertEqual((tab.grid.year, tab.grid.month, tab.grid.selected), (2026, 11, date(2026, 11, 21)))
+
 
 if __name__ == "__main__":
     unittest.main()

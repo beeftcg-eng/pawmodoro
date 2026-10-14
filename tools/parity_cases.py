@@ -17,6 +17,7 @@ from datetime import date, timedelta
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
+import calendar_view  # noqa: E402
 import gamification  # noqa: E402
 import shared_schedule  # noqa: E402
 import storage  # noqa: E402
@@ -41,7 +42,7 @@ def iso(d):
 def build():
     cases = {"week_start": [], "month_occurrence": [], "reminds": [], "task_reset": [],
              "shared_occurrence": [], "quiet_hours": [], "daily_quests": [], "weekly_quests": [],
-             "done_days": [], "streak": []}
+             "done_days": [], "streak": [], "calendar_task": [], "calendar_shared": []}
 
     for d in DATES:
         cases["week_start"].append({"day": iso(d), "expect": iso(gamification.week_start_for(d))})
@@ -100,6 +101,27 @@ def build():
             cases["streak"].append({"task": task, "day": iso(day), "expect": task_dates.streak(task, day)})
     cases["streak"].append({"task": {"recurrence": "weekly", "done_days": histories["run"]},
                             "day": iso(today), "expect": 0})
+
+    # What the Calendar tab puts on a day (calendar_view), and whether it's ticked there.
+    today = date(2026, 10, 12)
+    cal_tasks = [{"recurrence": r} for r in ("daily", "weekly", "once")]
+    cal_tasks += [{"recurrence": "once", "due_date": due, "completed_today": done}
+                  for due in ("2026-10-05", "2026-02-28") for done in (False, True)]
+    cal_tasks += [{"recurrence": "monthly", "month_day": m, "done_days": ["2026-10-01", "2026-09-30", "2026-02-28"]}
+                  for m in (1, 15, 28, 31)]
+    cal_tasks += [{"recurrence": "once", "due_date": "2026-10-05", "source": "wishlist"}]
+    for d in DATES:
+        for task in cal_tasks:
+            cases["calendar_task"].append({"task": task, "day": iso(d), "expect": {
+                "on": calendar_view.task_on_day(task, d), "done": calendar_view.task_done_on(task, d)}})
+    cal_shared = [{"recurrence": "daily", "done": True}, {"recurrence": "once", "done": False},
+                  {"recurrence": "once", "due_date": "2026-10-05", "done": True}]
+    cal_shared += [{"recurrence": "weekly", "weekday": w, "done": done} for w in (0, 3, 6) for done in (False, True)]
+    cal_shared += [{"recurrence": "monthly", "month_day": m, "done": True} for m in (1, 12, 31)]
+    for d in DATES:
+        for task in cal_shared:
+            cases["calendar_shared"].append({"task": task, "day": iso(d), "today": iso(today), "expect": {
+                "on": calendar_view.shared_on_day(task, d), "done": calendar_view.shared_done_on(task, d, today)}})
 
     for d in DATES:
         cases["daily_quests"].append(

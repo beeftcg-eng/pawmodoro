@@ -20,6 +20,8 @@ How it fits together:
 Storage is only ever touched from here through its small, lock-protected
 outbox/token methods; everything else stays on the UI thread.
 """
+import json
+import os
 import threading
 import time
 import traceback
@@ -336,8 +338,68 @@ class SyncEngine:
             c.remove_note_page(a["id"])
         elif name == "note_pages_reorder":
             c.reorder_note_pages(a["ids"])
+        elif name == "event_save":
+            try:
+                self._new_in_schema(lambda: c.save_event(a, a.get("shared")))
+            except SyncError as e:
+                if not e.transient:
+                    self.storage.outbox_event_failed(a["id"], _readable(e))
+                raise
+        elif name == "event_remove":
+            self._new_in_schema(lambda: c.remove_event(a["id"]))
+        elif name == "attachment_add":
+            self._new_in_schema(lambda: self._upload_attachment(a))
+        elif name == "attachment_remove":
+            self._new_in_schema(lambda: self._remove_attachment(a))
         else:
             print(f"[sync] unknown queued operation {name!r}; dropping it")
+
+    def _upload_attachment(self, a):
+        """Registers the file (which says where it goes), sends its bytes to
+        Storage, then marks it done. Safe to repeat after a failure part way."""
+        import storage  # the module, for where files are kept (imported late: it imports this one)
+        local = storage.attachment_file(a["id"], a["file_name"])
+        if not os.path.exists(local):
+            print(f"[sync] attached file {a['file_name']!r} is gone; not uploading it")
+            return
+        c = self.client
+        try:
+            row = c.add_attachment(a["id"], a["item_kind"], a["item_id"], a["file_name"], a["mime"], a["size"])
+            with open(local, "rb") as f:
+                data = f.read()
+            try:
+                c.upload_file(row["path"], data, a["mime"])
+            except SyncError as e:
+                if e.status == 404:  # the schema ran, but the bucket couldn't be made
+                    raise SyncError("the cloud has no attachments bucket (see MOBILE_SYNC.md)", status=400) from e
+                raise
+            c.attachment_uploaded(a["id"])
+        except SyncError as e:
+            if not (e.transient or e.schema_outdated):
+                self.storage.outbox_attachment_failed(a["id"], _readable(e))
+            raise
+        self.storage.outbox_attachment_uploaded(a["id"], row["path"])
+
+    def _remove_attachment(self, a):
+        """Storage first: its policy needs the attachments row to still be there."""
+        c = self.client
+        path = a.get("path")
+        if not path:  # removed before a pull said where it went: where add_attachment put it
+            owner = f"h/{a['household_id']}" if a.get("household_id") else f"u/{c.user_id}"
+            path = f"{owner}/{a['id']}"
+        c.delete_file(path)
+        c.remove_attachment(a["id"])
+
+    def download(self, path, destination):
+        """Fetches an attached file to `destination` (for opening it). Runs
+        on the calling thread, which mustn't be the UI's. Raises SyncError."""
+        data = self.call_now(lambda c: c.download_file(path))
+        os.makedirs(os.path.dirname(destination), exist_ok=True)
+        partial = destination + ".part"
+        with open(partial, "wb") as f:
+            f.write(data)
+        os.replace(partial, destination)
+        return destination
 
     def _with_session_fallback(self, call, session):
         """A finished timer phase, with its session key; a cloud older than
@@ -450,3 +512,13 @@ class SyncEngine:
                 # of sync works fine, so just stop asking.
                 self._household_supported = False
             return False
+
+
+def _readable(error):
+    """The message out of a PostgREST / Storage error ("400: {...}")."""
+    text = str(error)
+    try:
+        body = json.loads(text.split(": ", 1)[1])
+        return body.get("message") or body.get("error") or text
+    except (IndexError, ValueError, AttributeError):
+        return text

@@ -1057,13 +1057,13 @@ $$;
 
 -- One call to fetch everything the web app / desktop app needs, after
 -- rolling over daily tasks and making sure quest lists are fresh.
--- Which schema this is: 220 = the one from v2.20. Bump it with any change an
+-- Which schema this is: 221 = the one from v2.21. Bump it with any change an
 -- app relies on (and supabase_sync.SCHEMA_VERSION to match), so the desktop
 -- can say "re-run schema.sql" up front instead of features quietly falling
 -- back.
 create or replace function schema_version() returns int
 language sql immutable set search_path = public, extensions as $$
-  select 220;
+  select 221;
 $$;
 
 create or replace function sync_pull() returns jsonb
@@ -1102,7 +1102,15 @@ begin
     'checklist', tasks,
     'history', hist,
     'notes_pages', pages,
-    'timer', (select t.state || jsonb_build_object('rev', t.rev) from timer_state t where t.user_id = auth.uid())
+    'timer', (select t.state || jsonb_build_object('rev', t.rev) from timer_state t where t.user_id = auth.uid()),
+    -- v2.21: the calendar's own events, files on personal tasks and events,
+    -- and this account's files whose item was removed (see attachments)
+    'events', calendar_events_json(null),
+    'attachments', attachments_json(null),
+    'attachments_trash', (
+      select coalesce(jsonb_agg(jsonb_build_object('id', a.id, 'path', a.path, 'trashed_at', a.trashed_at)
+        order by a.trashed_at, a.id), '[]'::jsonb)
+      from attachments a where a.user_id = auth.uid() and a.trashed_at is not null)
   );
 end;
 $$;
@@ -1261,7 +1269,10 @@ begin
           'assigned_to_me', coalesce(t.assigned_to = auth.uid(), false)
         ) order by t.sort_order, t.created_at), '[]'::jsonb)
       from shared_tasks t where t.household_id = h.id
-    )
+    ),
+    -- v2.21: the household's calendar, and the files on its items and events
+    'events', calendar_events_json(h.id),
+    'attachments', attachments_json(h.id)
   ) into result
   from households h where h.id = hid;
   return result;
@@ -1475,6 +1486,355 @@ create or replace function shared_clear_done() returns void
 language sql security invoker set search_path = public, extensions as $$
   delete from shared_tasks where household_id = my_household_id() and done and recurrence = 'once';
 $$;
+
+-- ============================================================
+-- Calendar: events and attached files (v2.21)
+-- ============================================================
+-- An event is a trip, an appointment, a booking: a title over one or more
+-- days, optionally at a time. Personal (household_id null, only its owner
+-- sees it, in sync_pull) or the household's (every member sees and edits
+-- it, in household_pull).
+create table if not exists calendar_events (
+  id text primary key default encode(gen_random_bytes(6), 'hex'),
+  user_id uuid not null references auth.users(id) on delete cascade,  -- who made it
+  household_id uuid references households(id) on delete cascade,
+  title text not null,
+  start_date date not null,
+  end_date date not null,
+  start_time text,  -- "HH:MM", or null for all day
+  end_time text,
+  note text not null default '',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+alter table calendar_events drop constraint if exists calendar_events_check;
+alter table calendar_events add constraint calendar_events_check check (
+  length(title) between 1 and 200
+  and end_date >= start_date and end_date - start_date <= 366
+  and (start_time is null or start_time ~ '^([01][0-9]|2[0-3]):[0-5][0-9]$')
+  and (end_time is null or (start_time is not null and end_time ~ '^([01][0-9]|2[0-3]):[0-5][0-9]$'))
+  and length(note) <= 5000
+);
+create index if not exists calendar_events_household on calendar_events (household_id) where household_id is not null;
+
+alter table calendar_events enable row level security;
+drop policy if exists "own or household events" on calendar_events;
+create policy "own or household events"
+  on calendar_events for all
+  using ((household_id is null and user_id = auth.uid()) or (household_id is not null and is_household_member(household_id)))
+  with check ((household_id is null and user_id = auth.uid()) or (household_id is not null and is_household_member(household_id)));
+
+-- Files attached to a personal task ('task'), a shared item ('shared') or an
+-- event ('event'): receipts, tickets, reservations, photos. The bytes live in
+-- the private Storage bucket "attachments" at `path` (u/<user>/<id> for
+-- personal ones, h/<household>/<id> for the household's); this is the list.
+-- An upload is: add_attachment (makes the row and the path), the file into
+-- Storage, attachment_uploaded. Only rows that finished show up in a pull.
+--
+-- Removing the item a file belongs to doesn't delete the file straight away:
+-- the triggers below put it in a trash (trashed_at) and putting the item back
+-- (an undo) takes it out again. sync_pull lists the caller's trash
+-- (attachments_trash) and the apps delete a file once it's been there an hour.
+create table if not exists attachments (
+  id text primary key,
+  user_id uuid not null references auth.users(id) on delete cascade,  -- who uploaded it
+  -- set null rather than cascade: the uploader still has to delete the file
+  household_id uuid references households(id) on delete set null,
+  item_kind text not null check (item_kind in ('task', 'shared', 'event')),
+  item_id text not null,
+  file_name text not null,
+  mime text not null default 'application/octet-stream',
+  size bigint not null,
+  path text not null unique,
+  uploaded boolean not null default false,
+  trashed_at timestamptz,
+  created_at timestamptz not null default now()
+);
+create index if not exists attachments_item on attachments (item_id);
+create index if not exists attachments_household on attachments (household_id) where household_id is not null;
+
+alter table attachments enable row level security;
+drop policy if exists "own or household attachments" on attachments;
+create policy "own or household attachments"
+  on attachments for select
+  using (user_id = auth.uid() or (household_id is not null and is_household_member(household_id)));
+drop policy if exists "add own attachments" on attachments;
+create policy "add own attachments"
+  on attachments for insert
+  with check (user_id = auth.uid() and (household_id is null or is_household_member(household_id)));
+drop policy if exists "change visible attachments" on attachments;
+create policy "change visible attachments"
+  on attachments for update
+  using (user_id = auth.uid() or (household_id is not null and is_household_member(household_id)));
+drop policy if exists "delete visible attachments" on attachments;
+create policy "delete visible attachments"
+  on attachments for delete
+  using (user_id = auth.uid() or (household_id is not null and is_household_member(household_id)));
+
+-- Limits, kept here so the apps can't be talked out of them.
+create or replace function attachment_max_bytes() returns bigint
+language sql immutable set search_path = public, extensions as $$ select 25 * 1024 * 1024::bigint $$;
+create or replace function attachment_quota_bytes() returns bigint
+language sql immutable set search_path = public, extensions as $$ select 250 * 1024 * 1024::bigint $$;
+
+create or replace function calendar_check_event(
+  p_title text, p_start_date date, p_end_date date, p_start_time text, p_end_time text
+) returns void
+language plpgsql immutable set search_path = public, extensions as $$
+begin
+  if coalesce(trim(p_title), '') = '' then
+    raise exception 'an event needs a title';
+  end if;
+  if p_start_date is null or p_end_date is null or p_end_date < p_start_date then
+    raise exception 'an event can''t end before it starts';
+  end if;
+  if p_end_date - p_start_date > 366 then
+    raise exception 'an event can last at most a year';
+  end if;
+  if (p_start_time is not null and p_start_time !~ '^([01][0-9]|2[0-3]):[0-5][0-9]$')
+     or (p_end_time is not null and p_end_time !~ '^([01][0-9]|2[0-3]):[0-5][0-9]$') then
+    raise exception 'times must be HH:MM';
+  end if;
+  if p_end_time is not null and p_start_time is null then
+    raise exception 'an end time needs a start time';
+  end if;
+  if p_end_time is not null and p_start_date = p_end_date and p_end_time < p_start_time then
+    raise exception 'an event can''t end before it starts';
+  end if;
+end;
+$$;
+
+-- Creates or updates an event (idempotent: the apps make the id). p_shared
+-- puts it on the household's calendar, or takes it back off (only whoever
+-- made it can, and only while every file on it is theirs). Its files move
+-- with it. Security invoker: RLS decides who may touch which row.
+create or replace function save_event(
+  p_id text, p_title text, p_start_date date, p_end_date date,
+  p_start_time text default null, p_end_time text default null, p_note text default '', p_shared boolean default false
+) returns jsonb
+language plpgsql security invoker set search_path = public, extensions as $$
+declare
+  hid uuid;
+  e calendar_events;
+begin
+  if auth.uid() is null then
+    raise exception 'not signed in';
+  end if;
+  perform calendar_check_event(p_title, p_start_date, p_end_date, p_start_time, p_end_time);
+  if p_shared then
+    hid := my_household_id();
+    if hid is null then
+      raise exception 'not in a household';
+    end if;
+  end if;
+  select * into e from calendar_events where id = p_id;
+  if found and e.household_id is not null and hid is null then
+    if e.user_id <> auth.uid() then
+      raise exception 'only whoever added it can take it off the shared calendar';
+    end if;
+    if exists (select 1 from attachments where item_kind = 'event' and item_id = p_id and user_id <> auth.uid()) then
+      raise exception 'others attached files to it, so it stays on the shared calendar';
+    end if;
+  end if;
+  update calendar_events set
+    title = left(trim(p_title), 200), start_date = p_start_date, end_date = p_end_date,
+    start_time = p_start_time, end_time = case when p_start_time is not null then p_end_time end,
+    note = left(coalesce(p_note, ''), 5000), household_id = hid, updated_at = now()
+  where id = p_id
+  returning * into e;
+  if not found then
+    insert into calendar_events (id, user_id, household_id, title, start_date, end_date, start_time, end_time, note)
+    values (coalesce(p_id, encode(gen_random_bytes(6), 'hex')), auth.uid(), hid, left(trim(p_title), 200),
+            p_start_date, p_end_date, p_start_time, case when p_start_time is not null then p_end_time end,
+            left(coalesce(p_note, ''), 5000))
+    returning * into e;
+  end if;
+  update attachments set household_id = hid
+  where item_kind = 'event' and item_id = e.id and household_id is distinct from hid;
+  return to_jsonb(e) - 'user_id';
+end;
+$$;
+
+create or replace function remove_event(p_id text) returns void
+language sql security invoker set search_path = public, extensions as $$
+  delete from calendar_events where id = p_id;
+$$;
+
+-- The caller's events (household_id null) or a household's, as the apps get them.
+create or replace function calendar_events_json(hid uuid) returns jsonb
+language sql stable security invoker set search_path = public, extensions as $$
+  select coalesce(jsonb_agg(jsonb_build_object(
+      'id', e.id, 'title', e.title, 'start_date', e.start_date, 'end_date', e.end_date,
+      'start_time', e.start_time, 'end_time', e.end_time, 'note', e.note,
+      'created_by_me', e.user_id = auth.uid(),
+      'created_by_name', case when hid is not null then
+        (select display_name from household_members where user_id = e.user_id) end
+    ) order by e.start_date, e.start_time nulls first, e.created_at), '[]'::jsonb)
+  from calendar_events e
+  where (hid is null and e.household_id is null and e.user_id = auth.uid())
+     or (hid is not null and e.household_id = hid);
+$$;
+
+create or replace function attachments_json(hid uuid) returns jsonb
+language sql stable security invoker set search_path = public, extensions as $$
+  select coalesce(jsonb_agg(jsonb_build_object(
+      'id', a.id, 'item_kind', a.item_kind, 'item_id', a.item_id, 'file_name', a.file_name,
+      'mime', a.mime, 'size', a.size, 'path', a.path, 'created_at', a.created_at,
+      'added_by_me', a.user_id = auth.uid(),
+      'added_by_name', case when hid is not null then
+        (select display_name from household_members where user_id = a.user_id) end
+    ) order by a.created_at, a.id), '[]'::jsonb)
+  from attachments a
+  where a.uploaded and a.trashed_at is null
+    and ((hid is null and a.household_id is null and a.user_id = auth.uid() and a.item_kind <> 'shared')
+         or (hid is not null and a.household_id = hid));
+$$;
+
+-- Registers a file before its upload and says where it goes. Idempotent (a
+-- retried upload gets the same row back). The item has to be the caller's:
+-- a shared item or event of their household, or one of their own events. A
+-- personal task isn't checked, because "specific day" tasks only exist on
+-- the desktop.
+create or replace function add_attachment(
+  p_id text, p_item_kind text, p_item_id text, p_file_name text, p_mime text, p_size bigint
+) returns jsonb
+language plpgsql security invoker set search_path = public, extensions as $$
+declare
+  hid uuid;
+  a attachments;
+begin
+  if auth.uid() is null then
+    raise exception 'not signed in';
+  end if;
+  select * into a from attachments where id = p_id and user_id = auth.uid();
+  if found then
+    return to_jsonb(a) - 'user_id';
+  end if;
+  if p_id !~ '^[0-9a-zA-Z_-]{6,40}$' then
+    raise exception 'invalid attachment id';
+  end if;
+  if coalesce(trim(p_file_name), '') = '' then
+    raise exception 'a file needs a name';
+  end if;
+  if p_size is null or p_size < 0 or p_size > attachment_max_bytes() then
+    raise exception 'files can be at most % MB', attachment_max_bytes() / 1024 / 1024;
+  end if;
+  if (select coalesce(sum(size), 0) from attachments where user_id = auth.uid()) + p_size > attachment_quota_bytes() then
+    raise exception 'your attachments are using all % MB; remove some first', attachment_quota_bytes() / 1024 / 1024;
+  end if;
+  if p_item_kind = 'shared' then
+    select household_id into hid from shared_tasks where id = p_item_id and household_id = my_household_id();
+    if hid is null then
+      raise exception 'item not found';
+    end if;
+  elsif p_item_kind = 'event' then
+    select household_id into hid from calendar_events where id = p_item_id;
+    if not found then
+      raise exception 'event not found';
+    end if;
+  elsif p_item_kind <> 'task' then
+    raise exception 'invalid item kind: %', p_item_kind;
+  end if;
+  insert into attachments (id, user_id, household_id, item_kind, item_id, file_name, mime, size, path)
+  values (p_id, auth.uid(), hid, p_item_kind, p_item_id, left(trim(p_file_name), 200),
+          left(coalesce(nullif(trim(p_mime), ''), 'application/octet-stream'), 100), p_size,
+          case when hid is null then 'u/' || auth.uid() else 'h/' || hid end || '/' || p_id)
+  returning * into a;
+  return to_jsonb(a) - 'user_id';
+end;
+$$;
+
+create or replace function attachment_uploaded(p_id text) returns void
+language plpgsql security invoker set search_path = public, extensions as $$
+begin
+  update attachments set uploaded = true where id = p_id and user_id = auth.uid();
+  if not found then
+    raise exception 'attachment not found';
+  end if;
+end;
+$$;
+
+-- Forgets a file; the app deletes it from Storage first (Storage's own
+-- policy needs this row to still be there).
+create or replace function remove_attachment(p_id text) returns void
+language sql security invoker set search_path = public, extensions as $$
+  delete from attachments where id = p_id;
+$$;
+
+-- An item going (or coming back, e.g. an undo) takes its files to (or out of)
+-- the trash. Security definer: whoever removes a shared item also trashes the
+-- files the other members put on it.
+create or replace function trash_item_attachments() returns trigger
+language plpgsql security definer set search_path = public, extensions as $$
+declare
+  kind text := case tg_table_name when 'checklist_tasks' then 'task'
+                                  when 'shared_tasks' then 'shared' else 'event' end;
+  row_id text;
+  owner uuid;  -- a personal task's files are only its owner's
+begin
+  if tg_op = 'DELETE' then
+    row_id := old.id;
+    if kind = 'task' then
+      owner := old.user_id;
+    end if;
+    update attachments set trashed_at = now()
+    where item_kind = kind and item_id = row_id and (owner is null or user_id = owner) and trashed_at is null;
+  else
+    row_id := new.id;
+    if kind = 'task' then
+      owner := new.user_id;
+    end if;
+    update attachments set trashed_at = null
+    where item_kind = kind and item_id = row_id and (owner is null or user_id = owner) and trashed_at is not null;
+  end if;
+  return null;
+end;
+$$;
+revoke all on function trash_item_attachments() from public, anon, authenticated;
+
+drop trigger if exists trash_attachments on checklist_tasks;
+create trigger trash_attachments after insert or delete on checklist_tasks
+  for each row execute function trash_item_attachments();
+drop trigger if exists trash_attachments on shared_tasks;
+create trigger trash_attachments after insert or delete on shared_tasks
+  for each row execute function trash_item_attachments();
+drop trigger if exists trash_attachments on calendar_events;
+create trigger trash_attachments after insert or delete on calendar_events
+  for each row execute function trash_item_attachments();
+
+-- The Storage side: a private bucket, and access to a file only through its
+-- row in `attachments` (the policies' subqueries run under that table's RLS,
+-- so "the row is visible" means "it's yours or your household's"). Only the
+-- uploader writes; anyone who can see it can read or delete it. Skipped (with
+-- a warning) where there's no Storage, or no right to change it.
+do $$
+begin
+  if to_regclass('storage.objects') is null or to_regclass('storage.buckets') is null then
+    raise warning 'no Supabase Storage here: attached files won''t work';
+    return;
+  end if;
+  insert into storage.buckets (id, name, public, file_size_limit)
+    values ('attachments', 'attachments', false, 25 * 1024 * 1024)
+    on conflict (id) do update set public = false, file_size_limit = excluded.file_size_limit;
+  drop policy if exists "pawmodoro attachments read" on storage.objects;
+  create policy "pawmodoro attachments read" on storage.objects for select to authenticated
+    using (bucket_id = 'attachments' and exists (select 1 from public.attachments a where a.path = objects.name));
+  drop policy if exists "pawmodoro attachments upload" on storage.objects;
+  create policy "pawmodoro attachments upload" on storage.objects for insert to authenticated
+    with check (bucket_id = 'attachments' and exists (
+      select 1 from public.attachments a where a.path = objects.name and a.user_id = auth.uid()));
+  drop policy if exists "pawmodoro attachments replace" on storage.objects;
+  create policy "pawmodoro attachments replace" on storage.objects for update to authenticated
+    using (bucket_id = 'attachments' and exists (
+      select 1 from public.attachments a where a.path = objects.name and a.user_id = auth.uid()))
+    with check (bucket_id = 'attachments' and exists (
+      select 1 from public.attachments a where a.path = objects.name and a.user_id = auth.uid()));
+  drop policy if exists "pawmodoro attachments delete" on storage.objects;
+  create policy "pawmodoro attachments delete" on storage.objects for delete to authenticated
+    using (bucket_id = 'attachments' and exists (select 1 from public.attachments a where a.path = objects.name));
+exception when insufficient_privilege then
+  raise warning 'couldn''t set up the attachments bucket (%): attached files won''t work', sqlerrm;
+end $$;
 
 -- ============================================================
 -- Phone push notifications (v2.16, extended in v2.17)

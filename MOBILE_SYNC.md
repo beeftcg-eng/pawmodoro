@@ -105,6 +105,19 @@ timers stay separate, and a shared item's assignment stays on the computer
 it was set on. The ☁️ Sync button shows ⚠ with "the cloud database is older
 than this app" until then.
 
+**v2.21.0** adds the calendar: events, and files attached to events, tasks
+and shared items. Re-run `schema.sql` only (`push_reminders.sql` and the push
+function are unchanged). It also creates a private Storage bucket called
+`attachments`, with policies that let each account read only its own files
+and its household's. Check **Storage** in the Supabase dashboard
+afterwards: if there's no `attachments` bucket, the SQL Editor printed
+"couldn't set up the attachments bucket" (Supabase can refuse changes to its
+storage schema). Then create a private bucket named `attachments` by hand
+(25 MB file limit) and re-run `schema.sql`, which will add the policies.
+Until the schema is re-run, events and files stay on the computer they were
+made on and upload by themselves afterwards. The phone shows dated tasks on
+its calendar but can't add events or files yet.
+
 **From v2.20.0 the schema can update itself**: the **Deploy cloud** GitHub
 workflow (`.github/workflows/deploy-functions.yml`) tests `schema.sql` and
 then runs it, and `push_reminders.sql`, against your project whenever they
@@ -262,6 +275,7 @@ own devices — not between different people's separate accounts.
 | Notes | ✅ including extra pages (v2.16.0+). Bold/underline/lists are editable on the phone; other desktop formatting (highlights, colors) isn't, but isn't lost either |
 | Checklist | ✅ (tasks, order, renames, reminders, snoozes, steps and notes, and since v2.20.0 the days each task was done, for 🔥 streaks; the desktop-only "specific day" tasks and 🍅 counts stay on the desktop) |
 | Shared household list | ✅ — shared with the people in your household, including whose turn an item is (v2.20.0) |
+| Calendar events and attached files | ✅ since v2.21.0. Household events, and files on shared items and household events, are shared with your household. Files are kept in the project's private `attachments` Storage bucket (25 MB each, 250 MB per account) |
 | The pomodoro timer | ✅ since v2.20.0: start, pause, reset or skip on one device and the others follow; a finished session counts once. Turn it off per device under Timer settings ("One timer on all my devices") |
 | Focus-minutes history | ✅ |
 | XP, level, streak | ✅ |

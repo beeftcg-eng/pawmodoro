@@ -24,6 +24,7 @@ from notes_checklist_tab import NotesChecklistTab
 from pomodoro_tab import PomodoroTab, phase_name as pomodoro_phase_name
 from progress_tab import ProgressTab
 from shared_tab import SharedTab
+from calendar_tab import CalendarTab
 from music_tab import MusicTab
 from widget_window import WidgetWindow
 from player_bar import PlayerBar
@@ -85,12 +86,14 @@ class MainWindow(QMainWindow):
         self.pomodoro_tab = PomodoroTab(self.storage)
         self.progress_tab = ProgressTab(self.storage)
         self.shared_tab = SharedTab(self.storage)
+        self.calendar_tab = CalendarTab(self.storage)
         self.music_tab = MusicTab(self.spotify_client)
 
         self.tabs.addTab(self.notes_checklist_tab, "Notes && Checklist")
         self.tabs.addTab(self.pomodoro_tab, "Pomodoro")
         self.tabs.addTab(self.progress_tab, "\U0001F3C6 Progress")
         self.tabs.addTab(self.shared_tab, "\U0001F3E0 Shared")
+        self.tabs.addTab(self.calendar_tab, "\U0001F4C5 Calendar")
         self.tabs.addTab(self.music_tab, "Music")
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
@@ -145,6 +148,10 @@ class MainWindow(QMainWindow):
         self.pomodoro_tab.celebrate.connect(self._on_celebrate)
         self.checklist_tab.celebrate.connect(self._on_celebrate)
         self.shared_tab.household_changed.connect(self.progress_tab.refresh)
+        self.shared_tab.household_changed.connect(self.calendar_tab.refresh)
+        self.calendar_tab.items_changed.connect(self._on_calendar_items_changed)
+        self.calendar_tab.open_task.connect(self._open_task)
+        self.calendar_tab.open_shared.connect(self._open_shared_tab)
 
         self.widget_window = WidgetWindow(self.storage)
         self.widget_window.restore_requested.connect(self.restore_from_widget)
@@ -207,6 +214,13 @@ class MainWindow(QMainWindow):
             self.progress_tab.refresh(new_quote=True)
         elif self.tabs.widget(index) is self.pomodoro_tab:
             self.pomodoro_tab.refresh_focus_tasks()
+        elif self.tabs.widget(index) is self.calendar_tab:
+            self.calendar_tab.refresh()  # tasks may have been given dates elsewhere
+
+    def _on_calendar_items_changed(self):
+        self.checklist_tab.refresh()
+        self.shared_tab.refresh()
+        self.widget_window.refresh_tasks()
 
     def _on_remote_pulled(self, remote, household, rev):
         """Runs on the main thread, and is the only place a cloud pull is
@@ -226,6 +240,7 @@ class MainWindow(QMainWindow):
         self._refresh_level_indicator()
         self.widget_window.refresh_tasks()
         self.shared_tab.refresh()
+        self.calendar_tab.refresh()
         self.pomodoro_tab.refresh_focus_tasks()
         self.pomodoro_tab.follow_remote_timer(self.storage.take_remote_timer())
         notes_tab.maybe_reload_from_remote()
@@ -245,6 +260,7 @@ class MainWindow(QMainWindow):
         if self.storage.roll_day_if_needed():
             self.checklist_tab.refresh()
             self.shared_tab.refresh()
+            self.calendar_tab.refresh()
             self.progress_tab.refresh()
             self._refresh_level_indicator()
             self.widget_window.refresh_tasks()
@@ -368,7 +384,8 @@ class MainWindow(QMainWindow):
             f"Saved {pages} notes page{'s' if pages != 1 else ''}, your checklist and all your data to\n{path}")
 
     def _export_calendar(self):
-        text, count = calendar_export.build_ics(self.storage.get_checklist(), self.storage.get_household())
+        text, count = calendar_export.build_ics(self.storage.get_checklist(), self.storage.get_household(),
+                                               events=self.storage.get_events())
         if not count:
             QMessageBox.information(
                 self, "Export to calendar",
@@ -425,6 +442,7 @@ class MainWindow(QMainWindow):
         for task in self.storage.check_due_shared_reminders():
             notifier.send("Shared list reminder", task["text"], on_click=self._open_shared_tab)
         self.shared_tab.refresh()  # cheap; picks up "overdue" markers as time passes
+        self.storage.purge_trashed_attachments()
 
     def _open_task(self, task_id):
         """A reminder notification was clicked: show that task, with the
@@ -573,6 +591,7 @@ class MainWindow(QMainWindow):
         self.pomodoro_tab.refresh_theme()
         self.progress_tab.refresh_theme()
         self.shared_tab.refresh_theme()
+        self.calendar_tab.refresh_theme()
         self.music_tab.refresh_theme()
         self.widget_window.refresh_theme()
         self.player_bar.refresh_theme()
