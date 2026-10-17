@@ -711,4 +711,102 @@ begin
 end $$;
 reset role;
 
+-- ============ Dungeons Desk: online tables ============
+set role authenticated;
+select set_config('request.jwt.claim.sub', :'A', false);
+select dmdesk_table_open(null, 'Thornwood') as table_code \gset
+select set_config('dd.code', :'table_code', false);
+do $$
+declare c text := current_setting('dd.code'); r jsonb;
+begin
+  assert length(c) = 14 and c ~ '^[a-z0-9]+$', 'a long random code: ' || c;
+  assert dmdesk_table_open(c, 'Thornwood 2') = c, 'reopening keeps the code';
+  assert dmdesk_table_list() = array[c], 'listed';
+  perform dmdesk_table_publish(c, jsonb_build_object('', '{"party":["Thorin"]}'::jsonb, 'thorin', '{"party":["Thorin"],"card":{"name":"Thorin"}}'::jsonb), array['', 'thorin']);
+end $$;
+reset role;
+
+-- Players need no account, just the code.
+set role anon;
+select set_config('request.jwt.claim.sub', '', false);
+do $$
+declare c text := current_setting('dd.code'); r jsonb; rev bigint;
+begin
+  assert not (dmdesk_table_join('wrongcode12345', 'Thorin')->>'ok')::boolean, 'a wrong code gets nothing';
+  assert not (dmdesk_table_view('wrongcode12345', 'Thorin', null)->>'ok')::boolean, 'no view for a wrong code';
+  r := dmdesk_table_join(c, 'Thorin');
+  assert (r->>'ok')::boolean and r->>'name' = 'Thornwood 2', 'join: ' || r;
+  r := dmdesk_table_view(c, 'Thorin', null);
+  assert r->'view'->'card'->>'name' = 'Thorin', 'Thorin gets his own view: ' || r;
+  rev := (r->>'rev')::bigint;
+  r := dmdesk_table_view(c, 'thorin', rev);
+  assert (r->>'ok')::boolean and r->'view' is null, 'unchanged view isn''t sent again: ' || r;
+  r := dmdesk_table_view(c, 'Mira', null);
+  assert r->'view'->'card' is null and r->'view'->'party'->>0 = 'Thorin', 'someone else gets the shared view, no card: ' || r;
+  r := dmdesk_table_act(c, 'Thorin', 'move', '{"map":"m1","token":"t1","x":10,"y":20}');
+  assert (r->>'ok')::boolean, 'action: ' || r;
+  begin
+    perform dmdesk_table_act(c, 'Thorin', 'delete_everything', '{}');
+    assert false, 'unknown action types are refused';
+  exception when raise_exception then null;
+  end;
+  begin
+    perform dmdesk_table_act(c, 'Thorin', 'ping', jsonb_build_object('x', repeat('9', 3000)));
+    assert false, 'oversized actions are refused';
+  exception when raise_exception then null;
+  end;
+  for i in 1..19 loop perform dmdesk_table_act(c, 'Thorin', 'ping', '{"x":1,"y":1}'); end loop;
+  r := dmdesk_table_act(c, 'Thorin', 'ping', '{"x":1,"y":1}');
+  assert not (r->>'ok')::boolean and (r->>'slow')::boolean, 'too many actions too fast: ' || r;
+  assert (select count(*) from dmdesk_table_views) = 0 and (select count(*) from dmdesk_tables) = 0
+    and (select count(*) from dmdesk_table_actions) = 0, 'anon can''t read the tables directly';
+  begin
+    perform dmdesk_table_poll(c, 0);
+    assert false, 'anon can''t read the DM''s queue';
+  exception when insufficient_privilege then null;
+  end;
+end $$;
+reset role;
+
+set role authenticated;
+select set_config('request.jwt.claim.sub', :'B', false);
+do $$
+declare c text := current_setting('dd.code');
+begin
+  assert not (dmdesk_table_poll(c, 0)->>'exists')::boolean, 'B can''t read A''s table';
+  begin
+    perform dmdesk_table_publish(c, '{"thorin":{"fake":true}}', array['thorin']);
+    assert false, 'B can''t publish to A''s table';
+  exception when raise_exception then null;
+  end;
+  perform dmdesk_table_close(c);
+  assert (select count(*) from dmdesk_table_views) = 0, 'B sees no views';
+  begin
+    insert into storage.objects (bucket_id, name) values ('dmdesk-table', '11111111-1111-1111-1111-111111111111/' || c || '/m/x.png');
+    assert false, 'B can''t upload into A''s table images';
+  exception when insufficient_privilege then null;
+  end;
+end $$;
+
+select set_config('request.jwt.claim.sub', :'A', false);
+do $$
+declare c text := current_setting('dd.code'); r jsonb; last bigint;
+begin
+  insert into storage.objects (bucket_id, name) values ('dmdesk-table', '11111111-1111-1111-1111-111111111111/' || c || '/m/x.png');
+  r := dmdesk_table_poll(c, 0);
+  assert (r->>'exists')::boolean and r->'members'->0->>'name' = 'Thorin' and jsonb_array_length(r->'actions') = 20, 'A sees who''s there and their actions: ' || r;
+  assert r->'actions'->0->>'type' = 'move' and r->'actions'->0->'data'->>'token' = 't1', 'actions in order';
+  last := (r->'actions'->-1->>'id')::bigint;
+  r := dmdesk_table_poll(c, last);
+  assert jsonb_array_length(r->'actions') = 0, 'handled actions are gone: ' || r;
+  perform dmdesk_table_publish(c, '{}', array['']);
+  assert dmdesk_table_view(c, 'Thorin', null)->'view'->'card' is null, 'views not kept are removed: Thorin is back to the shared one';
+  perform dmdesk_table_open(null, 'two'); perform dmdesk_table_open(null, 'three'); perform dmdesk_table_open(null, 'four');
+  assert array_length(dmdesk_table_list(), 1) = 3, 'at most 3 tables per DM';
+  assert not (c = any (dmdesk_table_list())), 'the oldest went';
+  foreach c in array dmdesk_table_list() loop perform dmdesk_table_close(c); end loop;
+  assert array_length(dmdesk_table_list(), 1) is null, 'closed';
+end $$;
+reset role;
+
 \echo 'all schema assertions passed'

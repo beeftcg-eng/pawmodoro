@@ -3026,6 +3026,205 @@ exception when insufficient_privilege then
   raise warning 'couldn''t set up the dmdesk bucket (%): Dungeons Desk images won''t sync', sqlerrm;
 end $$;
 
+-- Dungeons Desk online tables: a DM's game played over the internet instead of the same Wi-Fi.
+-- The DM app (signed in) opens a table and gets a secret code for the players' link. It publishes each
+-- player's view (already filtered by the app, exactly what its LAN server would send that phone) and
+-- reads back the players' actions (move a token, roll, save their sheet…), which it checks like LAN ones.
+-- Players have no account: the code is the key, so it's long and random, and every player function goes
+-- through these security definer functions; the tables have RLS with no policies for anyone else.
+-- Images the views use go to the public `dmdesk-table` bucket under <DM's user id>/<code>/, which only
+-- that DM can list (so the app can clear out the images of tables that are gone).
+create table if not exists dmdesk_tables (
+  code text primary key,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  name text not null default '',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index if not exists dmdesk_tables_user on dmdesk_tables (user_id);
+alter table dmdesk_tables enable row level security;
+drop policy if exists "own dmdesk tables" on dmdesk_tables;
+create policy "own dmdesk tables" on dmdesk_tables for all
+  using (auth.uid() = user_id) with check (auth.uid() = user_id);
+
+-- One view per player (lowercased name); '' is the view before choosing a character.
+create table if not exists dmdesk_table_views (
+  code text not null references dmdesk_tables (code) on delete cascade,
+  player text not null,
+  view jsonb not null,
+  rev bigint not null default nextval('dmdesk_seq'),
+  primary key (code, player)
+);
+alter table dmdesk_table_views enable row level security;
+
+create table if not exists dmdesk_table_members (
+  code text not null references dmdesk_tables (code) on delete cascade,
+  player text not null,
+  name text not null,
+  last_seen timestamptz not null default now(),
+  primary key (code, player)
+);
+alter table dmdesk_table_members enable row level security;
+
+create table if not exists dmdesk_table_actions (
+  id bigint generated always as identity primary key,
+  code text not null references dmdesk_tables (code) on delete cascade,
+  player text not null,
+  type text not null,
+  data jsonb not null,
+  created_at timestamptz not null default now()
+);
+create index if not exists dmdesk_table_actions_code on dmdesk_table_actions (code, id);
+create index if not exists dmdesk_table_actions_player on dmdesk_table_actions (code, player, created_at);
+alter table dmdesk_table_actions enable row level security;
+
+-- Opens a table, or reopens the DM's own one with the same code so the players' link keeps working.
+-- A new code is 14 letters and digits (about 69 bits). A DM keeps at most 3 tables.
+create or replace function dmdesk_table_open(p_code text, p_name text) returns text
+language plpgsql security invoker set search_path = public, extensions as $$
+declare c text; abc constant text := 'abcdefghjkmnpqrstuvwxyz23456789'; b bytea;
+begin
+  if auth.uid() is null then raise exception 'not signed in'; end if;
+  if p_code is not null and exists (select 1 from dmdesk_tables where code = p_code and user_id = auth.uid()) then
+    update dmdesk_tables set name = left(coalesce(p_name, ''), 120), updated_at = clock_timestamp() where code = p_code;
+    return p_code;
+  end if;
+  b := gen_random_bytes(14);
+  c := '';
+  for i in 0..13 loop c := c || substr(abc, 1 + get_byte(b, i) % length(abc), 1); end loop;
+  insert into dmdesk_tables (code, user_id, name, updated_at) values (c, auth.uid(), left(coalesce(p_name, ''), 120), clock_timestamp());
+  delete from dmdesk_tables where user_id = auth.uid() and code in
+    (select code from dmdesk_tables where user_id = auth.uid() order by updated_at desc offset 3);
+  return c;
+end;
+$$;
+
+create or replace function dmdesk_table_list() returns text[]
+language sql stable security invoker set search_path = public, extensions as $$
+  select coalesce(array_agg(code order by updated_at desc), '{}') from dmdesk_tables where user_id = auth.uid();
+$$;
+
+create or replace function dmdesk_table_close(p_code text) returns void
+language sql security invoker set search_path = public, extensions as $$
+  delete from dmdesk_tables where code = p_code and user_id = auth.uid();
+$$;
+
+-- The DM's views: p_views is {player: view} for the ones that changed, p_keep every player that has one.
+create or replace function dmdesk_table_publish(p_code text, p_views jsonb, p_keep text[]) returns void
+language plpgsql security definer set search_path = public, extensions as $$
+declare k text; v jsonb;
+begin
+  if not exists (select 1 from dmdesk_tables where code = p_code and user_id = auth.uid()) then raise exception 'no such table'; end if;
+  if jsonb_typeof(p_views) <> 'object' or coalesce(array_length(p_keep, 1), 0) > 60 then raise exception 'bad views'; end if;
+  for k, v in select * from jsonb_each(p_views) loop
+    if length(k) > 40 or length(v::text) > 3000000 then raise exception 'view too big'; end if;
+    insert into dmdesk_table_views (code, player, view) values (p_code, k, v)
+    on conflict (code, player) do update set view = excluded.view, rev = nextval('dmdesk_seq')
+      where dmdesk_table_views.view is distinct from excluded.view;
+  end loop;
+  delete from dmdesk_table_views where code = p_code and not (player = any (coalesce(p_keep, '{}')));
+  update dmdesk_tables set updated_at = clock_timestamp() where code = p_code;
+end;
+$$;
+
+-- What the DM app needs from its table: who's there, and the players' actions after p_since (the ones up to
+-- p_since were handled, so they're removed).
+create or replace function dmdesk_table_poll(p_code text, p_since bigint) returns jsonb
+language plpgsql security definer set search_path = public, extensions as $$
+begin
+  if not exists (select 1 from dmdesk_tables where code = p_code and user_id = auth.uid()) then
+    return jsonb_build_object('exists', false);
+  end if;
+  delete from dmdesk_table_actions where code = p_code and id <= coalesce(p_since, 0);
+  return jsonb_build_object('exists', true,
+    'members', coalesce((select jsonb_agg(jsonb_build_object('player', player, 'name', name, 'seen', extract(epoch from now() - last_seen)::int) order by name)
+      from dmdesk_table_members where code = p_code), '[]'::jsonb),
+    'actions', coalesce((select jsonb_agg(jsonb_build_object('id', id, 'player', player, 'type', type, 'data', data) order by id)
+      from dmdesk_table_actions where code = p_code and id > coalesce(p_since, 0)), '[]'::jsonb));
+end;
+$$;
+
+-- Players (no account needed). Joining with a name makes the DM app publish that player's view.
+create or replace function dmdesk_table_join(p_code text, p_player text) returns jsonb
+language plpgsql security definer set search_path = public, extensions as $$
+declare t dmdesk_tables; n text := btrim(coalesce(p_player, ''));
+begin
+  select * into t from dmdesk_tables where code = p_code;
+  if not found then return jsonb_build_object('ok', false); end if;
+  if length(n) > 40 then raise exception 'name too long'; end if;
+  if n <> '' then
+    if (select count(*) from dmdesk_table_members where code = p_code and player <> lower(n)) >= 40 then
+      return jsonb_build_object('ok', false, 'full', true);
+    end if;
+    insert into dmdesk_table_members (code, player, name) values (p_code, lower(n), n)
+    on conflict (code, player) do update set name = excluded.name, last_seen = now();
+  end if;
+  return jsonb_build_object('ok', true, 'name', t.name);
+end;
+$$;
+
+-- A player's view, unless they already have rev p_rev. Also marks them as here (at most every 15 seconds).
+create or replace function dmdesk_table_view(p_code text, p_player text, p_rev bigint) returns jsonb
+language plpgsql security definer set search_path = public, extensions as $$
+declare v dmdesk_table_views; n text := lower(btrim(coalesce(p_player, '')));
+begin
+  if not exists (select 1 from dmdesk_tables where code = p_code) then return jsonb_build_object('ok', false); end if;
+  if n <> '' then
+    update dmdesk_table_members set last_seen = now() where code = p_code and player = n and last_seen < now() - interval '15 seconds';
+  end if;
+  select * into v from dmdesk_table_views where code = p_code and player = n;
+  if not found then select * into v from dmdesk_table_views where code = p_code and player = ''; end if;
+  if not found then return jsonb_build_object('ok', true, 'rev', 0); end if;
+  if v.rev = coalesce(p_rev, -1) then return jsonb_build_object('ok', true, 'rev', v.rev); end if;
+  return jsonb_build_object('ok', true, 'rev', v.rev, 'view', v.view);
+end;
+$$;
+
+-- A player's action for the DM app. Only the LAN server's kinds, size-capped, at most 20 per player per
+-- 10 seconds and 300 waiting per table.
+create or replace function dmdesk_table_act(p_code text, p_player text, p_type text, p_data jsonb) returns jsonb
+language plpgsql security definer set search_path = public, extensions as $$
+declare n text := btrim(coalesce(p_player, ''));
+  cap int := case p_type when 'token' then 1500000 when 'sheet' then 400000 when 'offer' then 400000 when 'share' then 10000 else 2000 end;
+begin
+  if not exists (select 1 from dmdesk_tables where code = p_code) then return jsonb_build_object('ok', false); end if;
+  if n = '' or length(n) > 40 then raise exception 'bad player'; end if;
+  if p_type not in ('move', 'ping', 'token', 'sheet', 'share', 'offer') then raise exception 'bad action'; end if;
+  if p_data is null or jsonb_typeof(p_data) <> 'object' or length(p_data::text) > cap then raise exception 'action too big'; end if;
+  if (select count(*) from dmdesk_table_actions where code = p_code and lower(player) = lower(n) and created_at > now() - interval '10 seconds') >= 20
+    or (select count(*) from dmdesk_table_actions where code = p_code) >= 300 then
+    return jsonb_build_object('ok', false, 'slow', true);
+  end if;
+  insert into dmdesk_table_actions (code, player, type, data) values (p_code, n, p_type, p_data);
+  return jsonb_build_object('ok', true);
+end;
+$$;
+
+revoke execute on function dmdesk_table_open(text, text), dmdesk_table_list(), dmdesk_table_close(text), dmdesk_table_publish(text, jsonb, text[]),
+  dmdesk_table_poll(text, bigint) from public, anon;
+grant execute on function dmdesk_table_open(text, text), dmdesk_table_list(), dmdesk_table_close(text), dmdesk_table_publish(text, jsonb, text[]),
+  dmdesk_table_poll(text, bigint) to authenticated;
+grant execute on function dmdesk_table_join(text, text), dmdesk_table_view(text, text, bigint),
+  dmdesk_table_act(text, text, text, jsonb) to anon, authenticated;
+
+-- The tables' images: public to read by exact name, listed and written only by the DM in the first folder.
+do $$
+begin
+  if to_regclass('storage.objects') is null or to_regclass('storage.buckets') is null then
+    raise warning 'no Supabase Storage here: online table images won''t work';
+    return;
+  end if;
+  insert into storage.buckets (id, name, public, file_size_limit)
+    values ('dmdesk-table', 'dmdesk-table', true, 10 * 1024 * 1024)
+    on conflict (id) do update set public = true, file_size_limit = excluded.file_size_limit;
+  drop policy if exists "dmdesk table images" on storage.objects;
+  create policy "dmdesk table images" on storage.objects for all to authenticated
+    using (bucket_id = 'dmdesk-table' and split_part(name, '/', 1) = auth.uid()::text)
+    with check (bucket_id = 'dmdesk-table' and split_part(name, '/', 1) = auth.uid()::text);
+exception when insufficient_privilege then
+  raise warning 'couldn''t set up the dmdesk-table bucket (%): online table images won''t work', sqlerrm;
+end $$;
+
 -- Tell PostgREST to re-read the functions now, rather than whenever its
 -- cache next refreshes (a dropped overload would linger until then).
 notify pgrst, 'reload schema';
