@@ -624,4 +624,91 @@ select set_config('request.jwt.claim.sub', :'B', false);
 do $$ begin perform household_leave(); end $$;
 reset role;
 
+-- ============ Dungeons Desk: characters and campaign files ============
+set role authenticated;
+select set_config('request.jwt.claim.sub', :'A', false);
+do $$
+declare r jsonb; s bigint;
+begin
+  r := dmdesk_put_character('c1', 'Thorin', '{"cls":"Fighter"}', null);
+  assert (r->>'ok')::boolean and (r->>'rev')::int = 1, 'new character: ' || r;
+  r := dmdesk_put_character('c1', 'Thorin', '{"cls":"Fighter","level":2}', 1);
+  assert (r->>'ok')::boolean and (r->>'rev')::int = 2, 'save on top: ' || r;
+  r := dmdesk_put_character('c1', 'Thorin', '{"cls":"Wizard"}', 1);
+  assert not (r->>'ok')::boolean and (r->>'rev')::int = 2 and r->'data'->>'level' = '2', 'stale save refused, newer comes back: ' || r;
+  r := dmdesk_pull_characters(0);
+  assert jsonb_array_length(r->'rows') = 1 and r->'rows'->0->>'name' = 'Thorin', 'pull everything: ' || r;
+  s := (r->>'since')::bigint;
+  assert jsonb_array_length(dmdesk_pull_characters(s)->'rows') = 0, 'nothing new after since';
+  assert (dmdesk_pull_characters(s)->>'since')::bigint = s, 'since stays put when idle';
+  r := dmdesk_delete_character('c1', 1);
+  assert not (r->>'ok')::boolean, 'stale delete refused';
+  r := dmdesk_delete_character('c1', 2);
+  assert (r->>'ok')::boolean, 'delete';
+  r := dmdesk_pull_characters(s);
+  assert jsonb_array_length(r->'rows') = 1 and (r->'rows'->0->>'deleted')::boolean and r->'rows'->0->'data' = 'null'::jsonb, 'deletion is pulled, without data: ' || r;
+  r := dmdesk_put_character('c1', 'Thorin again', '{}', 3);
+  assert (r->>'ok')::boolean and (r->>'rev')::int = 4, 'a deleted character can come back: ' || r;
+
+  perform dmdesk_save_campaign('camp1', 'Thornwood');
+  assert jsonb_array_length(dmdesk_campaigns_list()) = 1, 'campaign listed';
+  r := dmdesk_put_file('camp1', 'NPCs/Mira.md', '# Mira', 0);
+  assert (r->>'ok')::boolean and (r->>'rev')::int = 1, 'new file: ' || r;
+  r := dmdesk_put_file('camp1', '.dmtools/state.json', '{}', null);
+  assert (r->>'ok')::boolean, 'state file: ' || r;
+  r := dmdesk_put_file('camp1', 'NPCs/Mira.md', '# Mira (other device)', 0);
+  assert not (r->>'ok')::boolean and r->>'content' = '# Mira', 'two devices creating the same note: second is refused: ' || r;
+  assert (dmdesk_campaigns_list()->0->>'notes')::int = 1, 'note count leaves out state.json';
+  r := dmdesk_pull_files('camp1', 0);
+  assert (r->>'exists')::boolean and jsonb_array_length(r->'rows') = 2, 'pull files: ' || r;
+  s := (r->>'since')::bigint;
+  r := dmdesk_delete_file('camp1', 'NPCs/Mira.md', 1);
+  assert (r->>'ok')::boolean and (r->>'rev')::int = 2, 'delete file: ' || r;
+  r := dmdesk_pull_files('camp1', s);
+  assert jsonb_array_length(r->'rows') = 1 and (r->'rows'->0->>'deleted')::boolean, 'deletion pulled: ' || r;
+  begin
+    perform dmdesk_put_file('camp1', '../escape.md', 'x', 0);
+    assert false, 'a path with .. must be refused';
+  exception when raise_exception then null;
+  end;
+  begin
+    perform dmdesk_put_file('nope', 'a.md', 'x', 0);
+    assert false, 'files need a campaign';
+  exception when raise_exception then null;
+  end;
+end $$;
+
+-- Another user sees none of it and can't write into it.
+select set_config('request.jwt.claim.sub', :'B', false);
+do $$
+declare r jsonb;
+begin
+  assert jsonb_array_length(dmdesk_pull_characters(0)->'rows') = 0, 'B sees no characters';
+  assert jsonb_array_length(dmdesk_campaigns_list()) = 0, 'B sees no campaigns';
+  r := dmdesk_pull_files('camp1', 0);
+  assert not (r->>'exists')::boolean and jsonb_array_length(r->'rows') = 0, 'B can''t pull A''s files: ' || r;
+  begin
+    perform dmdesk_put_file('camp1', 'x.md', 'x', 0);
+    assert false, 'B can''t write into A''s campaign';
+  exception when raise_exception then null;
+  end;
+  r := dmdesk_put_character('c1', 'B''s own', '{}', null);
+  assert (r->>'ok')::boolean and (r->>'rev')::int = 1, 'same id, separate per user: ' || r;
+  insert into storage.objects (bucket_id, name) values ('dmdesk', '22222222-2222-2222-2222-222222222222/camp/media/a.png');
+  begin
+    insert into storage.objects (bucket_id, name) values ('dmdesk', '11111111-1111-1111-1111-111111111111/camp1/media/b.png');
+    assert false, 'B can''t upload under A''s folder';
+  exception when insufficient_privilege then null;
+  end;
+end $$;
+
+select set_config('request.jwt.claim.sub', :'A', false);
+do $$
+begin
+  assert (select count(*) from storage.objects where bucket_id = 'dmdesk') = 0, 'A can''t see B''s images';
+  perform dmdesk_delete_campaign('camp1');
+  assert jsonb_array_length(dmdesk_campaigns_list()) = 0 and not (dmdesk_pull_files('camp1', 0)->>'exists')::boolean, 'campaign deleted';
+end $$;
+reset role;
+
 \echo 'all schema assertions passed'

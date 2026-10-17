@@ -2823,6 +2823,209 @@ $$;
 
 grant execute on function deckbuilder_report_bug(text, text, jsonb) to anon, authenticated;
 
+-- ============================================================
+-- Dungeons Desk (a separate app: ~/Desktop/DmTools, beeftcg-eng/dungeons-desk)
+-- ============================================================
+-- Like Deckbuilder, Dungeons Desk only borrows this project for sign-in and storage; nothing here
+-- touches Pawmodoro's own tables. Two things sync, local-first, each row conflict-checked by `rev`:
+--   * dmdesk_characters: the phone character sheet app's characters (data = the sheet model).
+--   * dmdesk_campaigns + dmdesk_files: a DM's campaign between the desktop and phone apps. A file is
+--     a note (its vault path, e.g. "NPCs/Mira.md") or the app state (".dmtools/state.json").
+--     Images go to the private `dmdesk` Storage bucket under <user id>/<campaign id>/.
+-- Every change takes the next value of dmdesk_seq, so a client polls with "what changed after the
+-- highest seq I've seen" (the *_pull functions) and an idle poll returns nothing.
+-- A save names the rev it was based on; if someone saved since, it's refused and the newer row
+-- comes back ({ok: false, rev, deleted, data/content}) for the client to resolve.
+create sequence if not exists dmdesk_seq;
+grant usage, select on sequence dmdesk_seq to authenticated;
+
+create table if not exists dmdesk_characters (
+  user_id uuid not null references auth.users(id) on delete cascade,
+  id text not null,
+  name text not null default '',
+  data jsonb not null default '{}'::jsonb,
+  rev bigint not null default 1,
+  deleted boolean not null default false,
+  seq bigint not null default nextval('dmdesk_seq'),
+  updated_at timestamptz not null default now(),
+  primary key (user_id, id)
+);
+create index if not exists dmdesk_characters_seq on dmdesk_characters (user_id, seq);
+alter table dmdesk_characters enable row level security;
+drop policy if exists "own dmdesk characters" on dmdesk_characters;
+create policy "own dmdesk characters" on dmdesk_characters for all
+  using (auth.uid() = user_id) with check (auth.uid() = user_id);
+
+create or replace function dmdesk_put_character(p_id text, p_name text, p_data jsonb, p_base_rev bigint) returns jsonb
+language plpgsql security invoker set search_path = public, extensions as $$
+declare cur dmdesk_characters;
+begin
+  if auth.uid() is null then raise exception 'not signed in'; end if;
+  if p_id is null or length(p_id) = 0 or length(p_id) > 40 then raise exception 'bad character id'; end if;
+  if p_data is null or jsonb_typeof(p_data) <> 'object' or length(p_data::text) > 500000 then raise exception 'character too big'; end if;
+  select * into cur from dmdesk_characters where user_id = auth.uid() and id = p_id for update;
+  if found and cur.rev <> coalesce(p_base_rev, 0) then
+    return jsonb_build_object('ok', false, 'rev', cur.rev, 'deleted', cur.deleted, 'name', cur.name, 'data', cur.data);
+  end if;
+  insert into dmdesk_characters (user_id, id, name, data, rev, deleted, seq, updated_at)
+  values (auth.uid(), p_id, left(coalesce(p_name, ''), 80), p_data, 1, false, nextval('dmdesk_seq'), now())
+  on conflict (user_id, id) do update set name = excluded.name, data = excluded.data, rev = dmdesk_characters.rev + 1,
+    deleted = false, seq = excluded.seq, updated_at = now()
+  returning * into cur;
+  return jsonb_build_object('ok', true, 'rev', cur.rev, 'seq', cur.seq);
+end;
+$$;
+
+create or replace function dmdesk_delete_character(p_id text, p_base_rev bigint) returns jsonb
+language plpgsql security invoker set search_path = public, extensions as $$
+declare cur dmdesk_characters;
+begin
+  if auth.uid() is null then raise exception 'not signed in'; end if;
+  select * into cur from dmdesk_characters where user_id = auth.uid() and id = p_id for update;
+  if not found or cur.deleted then return jsonb_build_object('ok', true); end if;
+  if cur.rev <> coalesce(p_base_rev, 0) then
+    return jsonb_build_object('ok', false, 'rev', cur.rev, 'deleted', false, 'name', cur.name, 'data', cur.data);
+  end if;
+  update dmdesk_characters set deleted = true, data = '{}'::jsonb, rev = rev + 1, seq = nextval('dmdesk_seq'), updated_at = now()
+    where user_id = auth.uid() and id = p_id;
+  return jsonb_build_object('ok', true);
+end;
+$$;
+
+-- Everything that changed after p_since (0 = everything), and the seq to ask from next time.
+create or replace function dmdesk_pull_characters(p_since bigint) returns jsonb
+language sql stable security invoker set search_path = public, extensions as $$
+  select jsonb_build_object(
+    'since', coalesce((select max(seq) from dmdesk_characters where user_id = auth.uid()), coalesce(p_since, 0)),
+    'rows', coalesce((select jsonb_agg(jsonb_build_object('id', id, 'name', name, 'rev', rev, 'deleted', deleted, 'data', case when deleted then null else data end) order by seq)
+      from dmdesk_characters where user_id = auth.uid() and seq > coalesce(p_since, 0)), '[]'::jsonb));
+$$;
+
+create table if not exists dmdesk_campaigns (
+  user_id uuid not null references auth.users(id) on delete cascade,
+  id text not null,
+  name text not null default '',
+  deleted boolean not null default false,
+  updated_at timestamptz not null default now(),
+  primary key (user_id, id)
+);
+alter table dmdesk_campaigns enable row level security;
+drop policy if exists "own dmdesk campaigns" on dmdesk_campaigns;
+create policy "own dmdesk campaigns" on dmdesk_campaigns for all
+  using (auth.uid() = user_id) with check (auth.uid() = user_id);
+
+create table if not exists dmdesk_files (
+  user_id uuid not null,
+  campaign_id text not null,
+  path text not null,
+  content text not null default '',
+  rev bigint not null default 1,
+  deleted boolean not null default false,
+  seq bigint not null default nextval('dmdesk_seq'),
+  updated_at timestamptz not null default now(),
+  primary key (user_id, campaign_id, path),
+  foreign key (user_id, campaign_id) references dmdesk_campaigns (user_id, id) on delete cascade
+);
+create index if not exists dmdesk_files_seq on dmdesk_files (user_id, campaign_id, seq);
+alter table dmdesk_files enable row level security;
+drop policy if exists "own dmdesk files" on dmdesk_files;
+create policy "own dmdesk files" on dmdesk_files for all
+  using (auth.uid() = user_id) with check (auth.uid() = user_id);
+
+create or replace function dmdesk_save_campaign(p_id text, p_name text) returns void
+language plpgsql security invoker set search_path = public, extensions as $$
+begin
+  if auth.uid() is null then raise exception 'not signed in'; end if;
+  if p_id is null or length(p_id) = 0 or length(p_id) > 40 then raise exception 'bad campaign id'; end if;
+  insert into dmdesk_campaigns (user_id, id, name) values (auth.uid(), p_id, left(coalesce(p_name, ''), 120))
+  on conflict (user_id, id) do update set name = excluded.name, deleted = false, updated_at = now();
+end;
+$$;
+
+-- The user's campaigns, with how many notes each has.
+create or replace function dmdesk_campaigns_list() returns jsonb
+language sql stable security invoker set search_path = public, extensions as $$
+  select coalesce(jsonb_agg(jsonb_build_object('id', c.id, 'name', c.name, 'updated_at', c.updated_at,
+    'notes', (select count(*) from dmdesk_files f where f.user_id = c.user_id and f.campaign_id = c.id and not f.deleted and f.path like '%.md')) order by c.updated_at desc), '[]'::jsonb)
+  from dmdesk_campaigns c where c.user_id = auth.uid() and not c.deleted;
+$$;
+
+-- Removes a campaign and its notes from the cloud (the apps delete its images from Storage first).
+create or replace function dmdesk_delete_campaign(p_id text) returns void
+language sql security invoker set search_path = public, extensions as $$
+  delete from dmdesk_files where user_id = auth.uid() and campaign_id = p_id;
+  update dmdesk_campaigns set deleted = true, updated_at = now() where user_id = auth.uid() and id = p_id;
+$$;
+
+create or replace function dmdesk_put_file(p_campaign text, p_path text, p_content text, p_base_rev bigint) returns jsonb
+language plpgsql security invoker set search_path = public, extensions as $$
+declare cur dmdesk_files;
+begin
+  if auth.uid() is null then raise exception 'not signed in'; end if;
+  if p_path is null or length(p_path) = 0 or length(p_path) > 400 or p_path like '/%' or p_path ~ '(^|/)\.\.(/|$)' then raise exception 'bad path'; end if;
+  if length(coalesce(p_content, '')) > 5000000 then raise exception 'file too big'; end if;
+  if not exists (select 1 from dmdesk_campaigns where user_id = auth.uid() and id = p_campaign and not deleted) then raise exception 'no such campaign'; end if;
+  select * into cur from dmdesk_files where user_id = auth.uid() and campaign_id = p_campaign and path = p_path for update;
+  if found and cur.rev <> coalesce(p_base_rev, 0) then
+    return jsonb_build_object('ok', false, 'rev', cur.rev, 'deleted', cur.deleted, 'content', cur.content);
+  end if;
+  insert into dmdesk_files (user_id, campaign_id, path, content, rev, deleted, seq, updated_at)
+  values (auth.uid(), p_campaign, p_path, coalesce(p_content, ''), 1, false, nextval('dmdesk_seq'), now())
+  on conflict (user_id, campaign_id, path) do update set content = excluded.content, rev = dmdesk_files.rev + 1,
+    deleted = false, seq = excluded.seq, updated_at = now()
+  returning * into cur;
+  return jsonb_build_object('ok', true, 'rev', cur.rev);
+end;
+$$;
+
+create or replace function dmdesk_delete_file(p_campaign text, p_path text, p_base_rev bigint) returns jsonb
+language plpgsql security invoker set search_path = public, extensions as $$
+declare cur dmdesk_files;
+begin
+  if auth.uid() is null then raise exception 'not signed in'; end if;
+  select * into cur from dmdesk_files where user_id = auth.uid() and campaign_id = p_campaign and path = p_path for update;
+  if not found or cur.deleted then return jsonb_build_object('ok', true, 'rev', coalesce(cur.rev, 0)); end if;
+  if cur.rev <> coalesce(p_base_rev, 0) then
+    return jsonb_build_object('ok', false, 'rev', cur.rev, 'deleted', false, 'content', cur.content);
+  end if;
+  update dmdesk_files set deleted = true, content = '', rev = rev + 1, seq = nextval('dmdesk_seq'), updated_at = now()
+    where user_id = auth.uid() and campaign_id = p_campaign and path = p_path
+    returning * into cur;
+  return jsonb_build_object('ok', true, 'rev', cur.rev);
+end;
+$$;
+
+create or replace function dmdesk_pull_files(p_campaign text, p_since bigint) returns jsonb
+language sql stable security invoker set search_path = public, extensions as $$
+  select jsonb_build_object(
+    'exists', exists (select 1 from dmdesk_campaigns where user_id = auth.uid() and id = p_campaign and not deleted),
+    'since', coalesce((select max(seq) from dmdesk_files where user_id = auth.uid() and campaign_id = p_campaign), coalesce(p_since, 0)),
+    'rows', coalesce((select jsonb_agg(jsonb_build_object('path', path, 'rev', rev, 'deleted', deleted, 'content', case when deleted then null else content end) order by seq)
+      from dmdesk_files where user_id = auth.uid() and campaign_id = p_campaign and seq > coalesce(p_since, 0)), '[]'::jsonb));
+$$;
+
+revoke execute on function dmdesk_put_character(text, text, jsonb, bigint), dmdesk_delete_character(text, bigint), dmdesk_pull_characters(bigint),
+  dmdesk_save_campaign(text, text), dmdesk_campaigns_list(), dmdesk_delete_campaign(text),
+  dmdesk_put_file(text, text, text, bigint), dmdesk_delete_file(text, text, bigint), dmdesk_pull_files(text, bigint) from anon;
+
+-- Images: a private bucket where each user reads and writes only under their own id.
+do $$
+begin
+  if to_regclass('storage.objects') is null or to_regclass('storage.buckets') is null then
+    raise warning 'no Supabase Storage here: Dungeons Desk images won''t sync';
+    return;
+  end if;
+  insert into storage.buckets (id, name, public, file_size_limit)
+    values ('dmdesk', 'dmdesk', false, 15 * 1024 * 1024)
+    on conflict (id) do update set public = false, file_size_limit = excluded.file_size_limit;
+  drop policy if exists "dmdesk own files" on storage.objects;
+  create policy "dmdesk own files" on storage.objects for all to authenticated
+    using (bucket_id = 'dmdesk' and split_part(name, '/', 1) = auth.uid()::text)
+    with check (bucket_id = 'dmdesk' and split_part(name, '/', 1) = auth.uid()::text);
+exception when insufficient_privilege then
+  raise warning 'couldn''t set up the dmdesk bucket (%): Dungeons Desk images won''t sync', sqlerrm;
+end $$;
+
 -- Tell PostgREST to re-read the functions now, rather than whenever its
 -- cache next refreshes (a dropped overload would linger until then).
 notify pgrst, 'reload schema';
