@@ -8,8 +8,8 @@ one-off tasks.
                 last day), else None
     due_date    "YYYY-MM-DD" for a "once" task, or None
 
-Mirrored in supabase/schema.sql (personal_month_occurrence,
-roll_recurring_tasks, complete_task, checklist_done_on, due_push_reminders)
+Mirrored in supabase/schema.sql (month_occurrence, checklist_needs_reset,
+task_reminds_on, complete_task, checklist_done_on, due_push_reminders)
 -- change both, or desktop-offline and cloud diverge.
 """
 from datetime import date, timedelta
@@ -54,7 +54,7 @@ def needs_reset(task, today):
     each new day, a specific-day one when its weekday comes round, weekly
     ones when the quest week rolls over (Tuesday), monthly ones when their
     day comes round; "once" never. Mirrored by roll_recurring_tasks() and
-    checklist_done_on() in supabase/schema.sql (which don't know "weekday")."""
+    checklist_done_on() in supabase/schema.sql, through checklist_needs_reset()."""
     recurrence = task.get("recurrence")
     last = task.get("last_completed")
     if recurrence == "daily":

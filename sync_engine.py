@@ -277,7 +277,7 @@ class SyncEngine:
             self._save_page_checked(self.storage.MAIN_NOTES_PAGE, None, a["text"])
         elif name == "add_task":
             c.add_task(a["text"], a["recurrence"], a.get("reminder_time"), a.get("source", "checklist"), a["id"],
-                       a.get("month_day"), a.get("due_date"))
+                       a.get("month_day"), a.get("due_date"), a.get("weekday"))
         elif name == "set_task_due_date":
             c.set_task_due_date(a["id"], a["due_date"])
         elif name == "set_task_details":
@@ -300,6 +300,8 @@ class SyncEngine:
             c.reorder_tasks(a["ids"])
         elif name == "complete_task":
             c.complete_task(a["id"], a["done"])
+        elif name == "task_flag":
+            c.set_task_completed_flag(a["id"], a["done"])
         elif name == "pomodoro":
             c.record_pomodoro_completed(a.get("minutes", 25), a.get("session"))
         elif name == "break":

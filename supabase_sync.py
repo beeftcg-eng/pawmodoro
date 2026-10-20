@@ -49,9 +49,9 @@ class SyncError(Exception):
 
 
 # The cloud schema this app was written against (schema_version() in
-# supabase/schema.sql, 221 = v2.21). Sync waits on an older one until
+# supabase/schema.sql, 222 = v2.22). Sync waits on an older one until
 # schema.sql is re-run (SyncEngine._schema_current).
-SCHEMA_VERSION = 221
+SCHEMA_VERSION = 222
 
 
 class SupabaseSync:
@@ -208,12 +208,12 @@ class SupabaseSync:
         return self._rpc("set_tz_offset", {"p_minutes": minutes})
 
     def add_task(self, text, recurrence, reminder_time=None, source="checklist", task_id=None,
-                 month_day=None, due_date=None):
+                 month_day=None, due_date=None, weekday=None):
         # task_id lets the desktop create the task under the id it already
         # gave it locally (safe to retry: the server returns the existing row).
         return self._rpc("add_task", {
             "p_text": text, "p_recurrence": recurrence, "p_reminder_time": reminder_time, "p_source": source,
-            "p_id": task_id, "p_month_day": month_day, "p_due_date": due_date or None,
+            "p_id": task_id, "p_month_day": month_day, "p_due_date": due_date or None, "p_weekday": weekday,
         })
 
     def set_task_due_date(self, task_id, due_date):
@@ -236,6 +236,10 @@ class SupabaseSync:
 
     def reorder_tasks(self, ordered_ids):
         return self._rpc("reorder_tasks", {"p_ordered_ids": ordered_ids})
+
+    def set_task_completed_flag(self, task_id, done):
+        """Ticks a task without paying out XP (a task first uploaded ticked)."""
+        return self._rpc("set_task_completed_flag", {"p_task_id": task_id, "p_done": done})
 
     def complete_task(self, task_id, done):
         return self._rpc("complete_task", {"p_task_id": task_id, "p_done": done})

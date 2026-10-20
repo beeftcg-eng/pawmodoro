@@ -26,17 +26,18 @@ begin
 
   for r in select * from jsonb_array_elements(cases->'reminds') loop
     t := r->'task';
-    got := task_reminds_on(t->>'recurrence', (t->>'month_day')::int, (t->>'due_date')::date, (r->>'day')::date)::text;
+    got := task_reminds_on(t->>'recurrence', (t->>'month_day')::int, (t->>'due_date')::date, (r->>'day')::date,
+                           (t->>'weekday')::int)::text;
     assert got = r->>'expect', format('task_reminds_on(%s, %s) = %s, Python says %s', t, r->>'day', got, r->>'expect');
   end loop;
 
   for r in select * from jsonb_array_elements(cases->'task_reset') loop
     t := r->'task';
     got := checklist_needs_reset(t->>'recurrence', (t->>'last_completed')::date, (t->>'month_day')::int,
-                                 (r->>'day')::date)::text;
+                                 (r->>'day')::date, (t->>'weekday')::int)::text;
     assert got = r->>'expect', format('checklist_needs_reset(%s, %s) = %s, Python says %s', t, r->>'day', got, r->>'expect');
     got := (not coalesce(checklist_done_on(true, t->>'recurrence', (t->>'last_completed')::date, (r->>'day')::date,
-                                           (t->>'month_day')::int), false))::text;
+                                           (t->>'month_day')::int, (t->>'weekday')::int), false))::text;
     assert got = r->>'expect', format('checklist_done_on disagrees with the reset for %s on %s', t, r->>'day');
   end loop;
 

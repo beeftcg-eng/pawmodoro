@@ -441,6 +441,9 @@ class MainWindow(QMainWindow):
             self.checklist_tab.refresh()  # a snooze that just ended drops its 💤
         for task in self.storage.check_due_shared_reminders():
             notifier.send("Shared list reminder", task["text"], on_click=self._open_shared_tab)
+        for event in self.storage.check_due_event_reminders():
+            notifier.send(f"\U0001F4C5 {event['title']}", f"Starts at {event['start_time']}",
+                          on_click=self._open_calendar_today)
         self.shared_tab.refresh()  # cheap; picks up "overdue" markers as time passes
         self.storage.purge_trashed_attachments()
 
@@ -454,6 +457,11 @@ class MainWindow(QMainWindow):
     def _open_shared_tab(self):
         self.restore_from_widget()
         self.tabs.setCurrentWidget(self.shared_tab)
+
+    def _open_calendar_today(self):
+        self.restore_from_widget()
+        self.tabs.setCurrentWidget(self.calendar_tab)
+        self.calendar_tab.go_to_today()
 
     # ---------- Menu ----------
     def _build_menu(self):

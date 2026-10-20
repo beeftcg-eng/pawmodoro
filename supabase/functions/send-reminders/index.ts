@@ -1,6 +1,7 @@
 // send-reminders - Supabase Edge Function that sends Pawmodoro's phone
 // notifications as Web Push, so they arrive even when the phone app is
-// closed: checklist reminders, shared-list items, and the phone timer.
+// closed: checklist reminders, shared-list items, calendar events and the
+// phone timer.
 //
 // A pg_cron job (supabase/push_reminders.sql) calls it every 30 seconds with
 // the secret from the server_settings table; anyone else is turned away.
@@ -20,7 +21,7 @@ const SUBJECT = "https://github.com/beeftcg-eng/pawmodoro";
 
 type Due = {
   endpoint: string; p256dh: string; auth: string;
-  kind: "daily" | "every" | "snooze" | "shared" | "timer";
+  kind: "daily" | "every" | "snooze" | "shared" | "event" | "timer";
   ref: string; owner: string; occurrence: string | null;
   title: string; body: string; token: string | null;
 };
@@ -50,12 +51,13 @@ Deno.serve(async (req) => {
   let dropped = 0, failed = 0;
   await Promise.all(due.map(async (row) => {
     const itemKey = `${row.kind}|${row.ref}|${row.owner}|${row.occurrence}`;
-    const actions = row.kind === "timer" ? []
+    const actions = row.kind === "timer" || row.kind === "event" ? []
       : row.kind === "shared" ? [{ action: "done", title: "✅ Done" }]
       : [{ action: "done", title: "✅ Done" }, { action: "snooze", title: "💤 15 min" }];
     const payload = JSON.stringify({
       title: row.title, body: row.body,
-      tag: row.kind === "timer" ? "pawmodoro-timer" : `${row.kind === "shared" ? "shared" : "task"}-${row.ref}`,
+      tag: row.kind === "timer" ? "pawmodoro-timer"
+        : `${row.kind === "shared" || row.kind === "event" ? row.kind : "task"}-${row.ref}`,
       actions, token: row.token, api,
     });
     try {

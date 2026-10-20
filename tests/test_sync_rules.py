@@ -15,14 +15,34 @@ class OutboxTests(StorageTestCase):
         self.storage.add_task("Walk", "daily")
         self.assertEqual(self.outbox_ops(), [])
 
-    def test_specific_day_tasks_never_reach_the_cloud(self):
+    def test_specific_day_tasks_sync_with_their_day(self):
         task = self.storage.add_task("Trash", "weekday", weekday=2)
         self.storage.rename_task(task["id"], "Bins")
         self.storage.set_task_reminder(task["id"], "07:00")
+        self.storage.set_task_done(task["id"], True)
         self.storage.remove_task(task["id"])
-        self.assertNotIn("add_task", self.outbox_ops())
-        self.assertNotIn("set_task_reminder", self.outbox_ops())
-        self.assertNotIn("remove_task", self.outbox_ops())
+        self.assertEqual(self.outbox_ops(), ["add_task", "rename_task", "set_task_reminder_mode", "complete_task",
+                                             "remove_task"])
+        self.assertEqual(self.storage.data["sync_outbox"][0]["args"]["weekday"], 2)
+
+    def test_other_tasks_send_no_weekday(self):
+        self.storage.add_task("Walk", "daily", weekday=3)
+        self.assertIsNone(self.storage.data["sync_outbox"][0]["args"]["weekday"])
+
+    def test_existing_specific_day_tasks_go_up_once(self):
+        st = self.storage
+        st.data["sync"]["enabled"] = False
+        bins = st.add_task("Bins", "weekday", weekday=0)
+        st.set_task_reminder(bins["id"], None, every_hours=2)
+        st.set_task_done(bins["id"], True)
+        st.add_task("Walk", "daily")
+        self.enable_sync()
+        st.data["weekday_tasks_synced"] = False  # as an older version left it
+        st._queue_unsynced_weekday_tasks()
+        self.assertEqual(self.outbox_ops(), ["add_task", "set_task_reminder_mode", "task_flag", "reorder_tasks"])
+        self.assertTrue(st.data["weekday_tasks_synced"])
+        st._queue_unsynced_weekday_tasks()
+        self.assertEqual(len(self.outbox_ops()), 4, "only once")
 
     def test_repeating_reminder_is_queued(self):
         task = self.storage.add_task("Water", "daily", reminder_time="09:00")
@@ -261,6 +281,12 @@ class ReminderPullTests(StorageTestCase):
 
 
 class PullTests(StorageTestCase):
+    def test_a_specific_day_task_comes_back_with_its_day(self):
+        remote = [{"id": "b1", "text": "Bins", "recurrence": "weekday", "weekday": 4, "reminder_time": "07:00"}]
+        self.storage._apply_remote_state(remote_state(remote))
+        task = self.storage._find_task("b1")
+        self.assertEqual((task["recurrence"], task["weekday"]), ("weekday", 4))
+
     def test_stale_pull_is_refused(self):
         rev = self.storage.rev
         self.storage.add_task("Made after the pull began", "daily")
@@ -284,7 +310,6 @@ class PullTests(StorageTestCase):
         self.storage.set_task_reminder(task["id"], None, every_hours=8)
         self.storage.snooze_task_reminder(task["id"], 30)
         self.storage.record_pomodoro_completed(25, task_id=task["id"])
-        weekday_task = self.storage.add_task("Trash", "weekday", weekday=1)
         page = self.storage.add_note_page("Ideas")
         self.storage.set_page_html(page, "<p>kept</p>")
 
@@ -296,7 +321,6 @@ class PullTests(StorageTestCase):
         self.assertIsNotNone(pulled["snoozed_until"])
         self.assertEqual(pulled["focus_pomodoros"], 1)
         self.assertEqual(pulled["focus_min"], 25)
-        self.assertIsNotNone(self.storage._find_task(weekday_task["id"]), "specific-day task was deleted")
         self.assertEqual(self.storage.get_page_html(page), "<p>kept</p>")
 
     def test_a_time_set_on_the_phone_replaces_a_repeating_reminder(self):

@@ -45,6 +45,7 @@ DEFAULT_DATA = {
     "notes_conflicts": [],  # other devices' versions to keep as pages: {page_id, title, html, at}
     "notes_pages": [],  # extra notes pages: list of {id, title, html} (sync from v2.16, table notes_pages)
     "notes_pages_synced": False,  # every local page has been queued for upload to this account
+    "weekday_tasks_synced": False,  # every specific-day task has been (v2.22: they used to stay here)
     "notes_current_page": "main",  # "main" or a notes_pages id
     "checklist": [],  # list of {id, text, recurrence, last_completed, completed_today,
                        #          reminder_time ("HH:MM" or None), last_reminded (date or None),
@@ -130,6 +131,9 @@ DEFAULT_DATA = {
     # Calendar (v2.21, see calendar_view.py). Household events and files live
     # in data["household"] ("events", "attachments") instead.
     "events": [],  # personal: {id, title, start_date, end_date, start_time, end_time, note, synced}
+    # "<event id>:<start date>" -> the day it was reminded about (pruned after
+    # a few days). None until the first check, which lets earlier ones go.
+    "event_reminded": None,
     "attachments": [],  # personal files: {id, item_kind, item_id, file_name, mime, size, path, uploaded,
                         #                  upload_error}; the bytes are cached under attachments_dir()
     "attachment_trash": [],  # this account's files whose item was removed: {id, path, trashed_at} (from sync_pull)
@@ -205,6 +209,7 @@ class Storage(RemoteStateMixin, HouseholdMixin, CalendarMixin):
         # Created here, started by MainWindow once its UI callbacks are wired.
         self.sync = SyncEngine(self)
         self._queue_unsynced_pages()
+        self._queue_unsynced_weekday_tasks()
         self._prune_orphan_attachments()
 
     # ---------- Loading / saving ----------
@@ -640,7 +645,7 @@ class Storage(RemoteStateMixin, HouseholdMixin, CalendarMixin):
             "last_completed": None,
             "completed_today": False,
             "reminder_time": reminder_time,  # "HH:MM" or None
-            "weekday": weekday,  # 0=Monday..6=Sunday, only meaningful for recurrence="weekday"; local-only, doesn't sync
+            "weekday": weekday,  # 0=Monday..6=Sunday, only meaningful for recurrence="weekday"
             "last_reminded": None,  # date isoformat, so a reminder fires at most once/day (local-only)
             "reminder_every_h": None,  # hours between repeating reminders, or None (local-only, doesn't sync)
             "last_reminded_at": None,  # datetime isoformat the repeating reminder last fired/was set (local-only)
@@ -659,25 +664,40 @@ class Storage(RemoteStateMixin, HouseholdMixin, CalendarMixin):
         return task
 
     def _enqueue_task_add(self, task):
-        # "weekday" tasks are local-only: the cloud's CHECK constraint on
-        # checklist_tasks.recurrence doesn't allow that value (see
-        # _apply_remote_state, which preserves them across a pull).
-        if task["recurrence"] != "weekday":
-            self._enqueue("add_task", {
-                "id": task["id"], "text": task["text"], "recurrence": task["recurrence"],
-                "reminder_time": task.get("reminder_time"), "source": task.get("source", "checklist"),
-                "month_day": task.get("month_day"), "due_date": task.get("due_date"),
-            })
-            if task.get("note") or task.get("subtasks"):  # e.g. a removal being undone
-                self._enqueue_task_details(task)
+        self._enqueue("add_task", {
+            "id": task["id"], "text": task["text"], "recurrence": task["recurrence"],
+            "reminder_time": task.get("reminder_time"), "source": task.get("source", "checklist"),
+            "month_day": task.get("month_day"), "due_date": task.get("due_date"),
+            "weekday": task.get("weekday") if task["recurrence"] == "weekday" else None,
+        })
+        if task.get("note") or task.get("subtasks"):  # e.g. a removal being undone
+            self._enqueue_task_details(task)
+
+    def _queue_unsynced_weekday_tasks(self):
+        """Uploads this computer's specific-day tasks once per account: they
+        stayed on the desktop before v2.22. A task already ticked goes up
+        ticked without paying out its XP again."""
+        if self.data.get("weekday_tasks_synced") or not self.sync_configured():
+            return
+        tasks = [t for t in self.data.get("checklist", []) if t.get("recurrence") == "weekday"]
+        for task in tasks:
+            self._enqueue_task_add(task)
+            if task.get("reminder_every_h"):
+                self._enqueue("set_task_reminder_mode",
+                              {"id": task["id"], "reminder_time": None, "every_h": task["reminder_every_h"]})
+            if task.get("completed_today"):
+                self._enqueue("task_flag", {"id": task["id"], "done": True})
+        if tasks:
+            self._enqueue("reorder_tasks", {"ids": [t["id"] for t in self.data["checklist"]]}, key="reorder")
+        self.data["weekday_tasks_synced"] = True
+        self.save()
 
     def rename_task(self, task_id, text):
         task = self._find_task(task_id)
         if task is None:
             return
         task["text"] = text
-        if task["recurrence"] != "weekday":
-            self._enqueue("rename_task", {"id": task_id, "text": text})
+        self._enqueue("rename_task", {"id": task_id, "text": text})
         self.save()
 
     def set_task_due_date(self, task_id, due_date):
@@ -739,23 +759,20 @@ class Storage(RemoteStateMixin, HouseholdMixin, CalendarMixin):
         if sub is None:
             return
         sub["done"] = bool(done)
-        if task["recurrence"] != "weekday":
-            self._enqueue("set_subtask_done", {"id": task_id, "sub_id": sub_id, "done": bool(done)})
+        self._enqueue("set_subtask_done", {"id": task_id, "sub_id": sub_id, "done": bool(done)})
         self.save()
 
     def _enqueue_task_details(self, task):
-        if task["recurrence"] != "weekday":
-            self._enqueue("set_task_details", {
-                "id": task["id"], "note": task.get("note") or "",
-                "subtasks": [{"id": s["id"], "text": s["text"]} for s in task.get("subtasks") or []],
-            }, key=f"details:{task['id']}")
+        self._enqueue("set_task_details", {
+            "id": task["id"], "note": task.get("note") or "",
+            "subtasks": [{"id": s["id"], "text": s["text"]} for s in task.get("subtasks") or []],
+        }, key=f"details:{task['id']}")
 
     def set_task_reminder(self, task_id, reminder_time, every_hours=None):
         """reminder_time: "HH:MM" string for a once-a-day reminder, or
         every_hours: an int for a reminder repeating every that many hours
         (counted from now). Neither clears the task's reminder. A task has
-        at most one kind. Both sync (the repeating one from v2.17; an older
-        cloud just gets the time cleared, see SyncEngine)."""
+        at most one kind. Both sync."""
         task = self._find_task(task_id)
         if task is None:
             return
@@ -765,9 +782,8 @@ class Storage(RemoteStateMixin, HouseholdMixin, CalendarMixin):
         task["last_reminded"] = None
         task["reminder_every_h"] = every_hours or None
         task["last_reminded_at"] = datetime.now().isoformat(timespec="seconds") if every_hours else None
-        if task["recurrence"] != "weekday":
-            self._enqueue("set_task_reminder_mode",
-                          {"id": task_id, "reminder_time": reminder_time, "every_h": every_hours or None})
+        self._enqueue("set_task_reminder_mode",
+                      {"id": task_id, "reminder_time": reminder_time, "every_h": every_hours or None})
         self.save()
 
     def get_reminder_settings(self):
@@ -794,8 +810,7 @@ class Storage(RemoteStateMixin, HouseholdMixin, CalendarMixin):
             return
         until = datetime.now() + timedelta(minutes=minutes)
         task["snoozed_until"] = until.isoformat(timespec="seconds")
-        if task["recurrence"] != "weekday":
-            self._enqueue("snooze_task", {"id": task_id, "until": until.astimezone().isoformat(timespec="seconds")})
+        self._enqueue("snooze_task", {"id": task_id, "until": until.astimezone().isoformat(timespec="seconds")})
         self.save()
 
     def check_due_reminders(self):
@@ -857,8 +872,7 @@ class Storage(RemoteStateMixin, HouseholdMixin, CalendarMixin):
         for index, task in enumerate(self.data["checklist"]):
             if task["id"] == task_id:
                 del self.data["checklist"][index]
-                if task["recurrence"] != "weekday":
-                    self._enqueue("remove_task", {"id": task_id})
+                self._enqueue("remove_task", {"id": task_id})
                 self.save()
                 return task, index
         return None
@@ -879,9 +893,7 @@ class Storage(RemoteStateMixin, HouseholdMixin, CalendarMixin):
         new_order = [by_id[i] for i in ordered_ids if i in by_id]
         remaining = [t for t in self.data["checklist"] if t["id"] not in ordered_ids]
         self.data["checklist"] = new_order + remaining
-        # "weekday" tasks never exist in the cloud, so leave them out.
-        remote_ids = [t["id"] for t in self.data["checklist"] if t["recurrence"] != "weekday"]
-        self._enqueue("reorder_tasks", {"ids": remote_ids}, key="reorder")
+        self._enqueue("reorder_tasks", {"ids": [t["id"] for t in self.data["checklist"]]}, key="reorder")
         self.save()
 
     def set_task_done(self, task_id, done):
@@ -905,8 +917,7 @@ class Storage(RemoteStateMixin, HouseholdMixin, CalendarMixin):
             self._ensure_daily_quests()
             self._ensure_weekly_quests()
             result = self._award_task(task, today)
-        if task["recurrence"] != "weekday":
-            self._enqueue("complete_task", {"id": task_id, "done": done})
+        self._enqueue("complete_task", {"id": task_id, "done": done})
         self.save()
         return result
 
@@ -1074,8 +1085,10 @@ class Storage(RemoteStateMixin, HouseholdMixin, CalendarMixin):
                 self._outbox_inflight = None
             self.data["household"] = None
             self.data["notes_pages_synced"] = False  # bring this computer's pages to that account
+            self.data["weekday_tasks_synced"] = False  # and its specific-day tasks
         self.save()
         self._queue_unsynced_pages()
+        self._queue_unsynced_weekday_tasks()
         self.sync.reconfigure()
 
     # ---------- History (focus minutes etc. per day) ----------

@@ -53,6 +53,7 @@ def build():
     tasks = [{"recurrence": r} for r in ("daily", "weekly", "once")]
     tasks += [{"recurrence": "monthly", "month_day": m} for m in MONTH_DAYS]
     tasks += [{"recurrence": "once", "due_date": due} for due in ("2026-10-05", "2026-02-28", "2027-01-01")]
+    tasks += [{"recurrence": "weekday", "weekday": w} for w in (0, 3, 6)]
     for d in DATES:
         for task in tasks:
             cases["reminds"].append({"task": task, "day": iso(d), "expect": task_dates.reminds_today(task, d)})
@@ -60,6 +61,7 @@ def build():
     # A ticked task's last completion, a few days before each date.
     reset_tasks = [{"recurrence": r} for r in ("daily", "weekly", "once")]
     reset_tasks += [{"recurrence": "monthly", "month_day": m} for m in (1, 15, 31)]
+    reset_tasks += [{"recurrence": "weekday", "weekday": w} for w in (0, 3, 6)]
     for d in DATES:
         for task in reset_tasks:
             for back in (None, 0, 1, 7, 30):
@@ -101,6 +103,19 @@ def build():
             cases["streak"].append({"task": task, "day": iso(day), "expect": task_dates.streak(task, day)})
     cases["streak"].append({"task": {"recurrence": "weekly", "done_days": histories["run"]},
                             "day": iso(today), "expect": 0})
+    # A specific-day task's streak counts weeks (today is a Monday).
+    weekly_runs = {
+        "on_its_day": [iso(today - timedelta(days=7 * n)) for n in range(4)],
+        "last_week_on": [iso(today - timedelta(days=7 * n)) for n in range(1, 4)],
+        "gap": [iso(today - timedelta(days=7 * n)) for n in (0, 1, 3)],
+    }
+    for name, days in weekly_runs.items():
+        for weekday in (0, 3):
+            for back in (0, 1, 3):
+                day = today + timedelta(days=back)
+                task = {"recurrence": "weekday", "weekday": weekday,
+                        "done_days": [iso(date.fromisoformat(d) + timedelta(days=weekday)) for d in days]}
+                cases["streak"].append({"task": task, "day": iso(day), "expect": task_dates.streak(task, day)})
 
     # What the Calendar tab puts on a day (calendar_view), and whether it's ticked there.
     today = date(2026, 10, 12)
@@ -110,6 +125,7 @@ def build():
     cal_tasks += [{"recurrence": "monthly", "month_day": m, "done_days": ["2026-10-01", "2026-09-30", "2026-02-28"]}
                   for m in (1, 15, 28, 31)]
     cal_tasks += [{"recurrence": "once", "due_date": "2026-10-05", "source": "wishlist"}]
+    cal_tasks += [{"recurrence": "weekday", "weekday": w, "done_days": ["2026-10-05", "2026-10-08"]} for w in (0, 3)]
     for d in DATES:
         for task in cal_tasks:
             cases["calendar_task"].append({"task": task, "day": iso(d), "expect": {

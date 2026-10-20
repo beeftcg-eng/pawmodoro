@@ -145,12 +145,12 @@ class DetailSyncTests(StorageTestCase):
         self.assertEqual(st.data["sync_outbox"][-1]["op"], "set_subtask_done")
         self.assertEqual(st.data["sync_outbox"][-1]["args"], {"id": task["id"], "sub_id": a["id"], "done": True})
 
-    def test_specific_day_task_details_stay_local(self):
+    def test_specific_day_task_details_sync(self):
         task = self.storage.add_task("Trash", "weekday", weekday=1)
         sub = self.storage.add_subtask(task["id"], "Recycling too")
         self.storage.set_subtask_done(task["id"], sub["id"], True)
         self.storage.set_task_note(task["id"], "blue bin")
-        self.assertEqual(self.outbox_ops(), [])
+        self.assertEqual(sorted(self.outbox_ops()), ["add_task", "set_subtask_done", "set_task_details"])
 
     def test_undoing_a_removal_brings_the_details_back(self):
         st = self.storage

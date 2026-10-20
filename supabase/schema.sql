@@ -146,9 +146,15 @@ alter table checklist_tasks add column if not exists note text not null default 
 alter table checklist_tasks add column if not exists subtasks jsonb not null default '[]'::jsonb;
 -- v2.20: the days a task was ticked (see task_done_days), for per-task streaks.
 alter table checklist_tasks add column if not exists done_days date[] not null default '{}';
+-- v2.22: "specific day" tasks (recurrence 'weekday', on weekday 0=Monday..6=Sunday),
+-- which used to stay on the desktop.
+alter table checklist_tasks add column if not exists weekday int;
 alter table checklist_tasks drop constraint if exists checklist_tasks_recurrence_check;
 alter table checklist_tasks add constraint checklist_tasks_recurrence_check
-  check (recurrence in ('daily', 'weekly', 'once', 'monthly'));
+  check (recurrence in ('daily', 'weekly', 'once', 'monthly', 'weekday'));
+alter table checklist_tasks drop constraint if exists checklist_tasks_weekday_check;
+alter table checklist_tasks add constraint checklist_tasks_weekday_check
+  check ((recurrence = 'weekday') = (weekday is not null) and (weekday is null or weekday between 0 and 6));
 alter table checklist_tasks drop constraint if exists checklist_tasks_month_day_check;
 alter table checklist_tasks add constraint checklist_tasks_month_day_check
   check ((recurrence = 'monthly') = (month_day is not null) and (month_day is null or month_day between 1 and 31));
@@ -711,7 +717,7 @@ begin
   perform ensure_daily_quests();
   perform ensure_weekly_quests();
 
-  task_xp := case p_recurrence when 'daily' then 10 when 'weekly' then 15 when 'once' then 25 when 'monthly' then 20 else 10 end;
+  task_xp := case p_recurrence when 'daily' then 10 when 'weekly' then 15 when 'once' then 25 when 'monthly' then 20 when 'weekday' then 15 else 10 end;
 
   perform bump_streak();
   update app_state set total_tasks = total_tasks + 1, updated_at = now() where user_id = auth.uid();
@@ -748,7 +754,7 @@ begin
   perform ensure_daily_quests();
   perform ensure_weekly_quests();
   update app_state set total_tasks = greatest(0, total_tasks - 1), updated_at = now() where user_id = auth.uid();
-  perform add_xp(-case p_recurrence when 'daily' then 10 when 'weekly' then 15 when 'once' then 25 when 'monthly' then 20 else 10 end);
+  perform add_xp(-case p_recurrence when 'daily' then 10 when 'weekly' then 15 when 'once' then 25 when 'monthly' then 20 when 'weekday' then 15 else 10 end);
   return jsonb_build_object('completed_quests', '[]'::jsonb);
 end;
 $$;
@@ -786,15 +792,19 @@ end;
 $$;
 
 -- Whether a ticked personal task un-ticks itself on local day d: daily ones
--- each new day, weekly ones when the quest week rolls over (Tuesday, the
--- same reset as the weekly quests), monthly ones when their day of the month
--- comes round; one-offs never. Mirrors task_dates.needs_reset (checked by
--- tests/parity), and is the one place roll_recurring_tasks() and
--- checklist_done_on() take it from.
-create or replace function checklist_needs_reset(p_recurrence text, p_last date, p_month_day int, d date)
+-- each new day, specific-day ones when their weekday comes round, weekly ones
+-- when the quest week rolls over (Tuesday, the same reset as the weekly
+-- quests), monthly ones when their day of the month comes round; one-offs
+-- never. Mirrors task_dates.needs_reset (checked by tests/parity), and is the
+-- one place roll_recurring_tasks() and checklist_done_on() take it from.
+drop function if exists checklist_needs_reset(text, date, int, date);
+create or replace function checklist_needs_reset(p_recurrence text, p_last date, p_month_day int, d date,
+                                                 p_weekday int default null)
 returns boolean language sql immutable set search_path = public, extensions as $$
   select case p_recurrence
     when 'daily' then p_last is distinct from d
+    when 'weekday' then p_weekday is not null and extract(isodow from d)::int - 1 = p_weekday
+                        and p_last is distinct from d
     when 'weekly' then p_last is null or p_last < week_start_for(d)
     when 'monthly' then p_last is null or p_last < month_occurrence(coalesce(p_month_day, 1), d)
     else false
@@ -812,7 +822,7 @@ language sql security invoker set search_path = public, extensions as $$
                          from jsonb_array_elements(subtasks) with ordinality as x(s, i)), '[]'::jsonb)
   where user_id = auth.uid()
     and completed_today = true
-    and checklist_needs_reset(recurrence, last_completed, month_day, user_today());
+    and checklist_needs_reset(recurrence, last_completed, month_day, user_today(), weekday);
 $$;
 
 create or replace function set_notes(p_notes text) returns void
@@ -886,14 +896,17 @@ $$;
 -- under the id it already gave it locally; calling again with an id that
 -- exists just returns the existing row, so a retried request is harmless.
 -- The older versions are dropped so they can't be ambiguous with this one.
--- v2.18: p_month_day (monthly tasks) and p_due_date (one-off tasks); the
--- one that doesn't apply to p_recurrence is ignored.
+-- v2.18: p_month_day (monthly tasks) and p_due_date (one-off tasks); v2.22:
+-- p_weekday (specific-day tasks, 0=Monday..6=Sunday). The ones that don't
+-- apply to p_recurrence are ignored.
 drop function if exists add_task(text, text, text);  -- from before p_source; clashed with the phone's 3-argument call
 drop function if exists add_task(text, text, text, text);
 drop function if exists add_task(text, text, text, text, text);
+drop function if exists add_task(text, text, text, text, text, int, date);
 create or replace function add_task(p_text text, p_recurrence text, p_reminder_time text default null,
                                     p_source text default 'checklist', p_id text default null,
-                                    p_month_day int default null, p_due_date date default null)
+                                    p_month_day int default null, p_due_date date default null,
+                                    p_weekday int default null)
 returns checklist_tasks
 language plpgsql security invoker set search_path = public, extensions as $$
 declare
@@ -910,10 +923,14 @@ begin
   if p_recurrence = 'monthly' and (p_month_day is null or p_month_day not between 1 and 31) then
     raise exception 'a monthly task needs a day of the month (1-31)';
   end if;
-  insert into checklist_tasks (id, user_id, text, recurrence, reminder_time, sort_order, source, month_day, due_date)
+  if p_recurrence = 'weekday' and (p_weekday is null or p_weekday not between 0 and 6) then
+    raise exception 'a specific-day task needs a day of the week (0-6)';
+  end if;
+  insert into checklist_tasks (id, user_id, text, recurrence, reminder_time, sort_order, source, month_day, due_date, weekday)
     values (coalesce(p_id, encode(gen_random_bytes(6), 'hex')), auth.uid(), p_text, p_recurrence, p_reminder_time, next_order, p_source,
             case when p_recurrence = 'monthly' then p_month_day end,
-            case when p_recurrence = 'once' then p_due_date end)
+            case when p_recurrence = 'once' then p_due_date end,
+            case when p_recurrence = 'weekday' then p_weekday end)
     returning * into t;
   return t;
 end;
@@ -1063,7 +1080,7 @@ $$;
 -- back.
 create or replace function schema_version() returns int
 language sql immutable set search_path = public, extensions as $$
-  select 221;
+  select 222;
 $$;
 
 create or replace function sync_pull() returns jsonb
@@ -1888,6 +1905,19 @@ create table if not exists shared_push_sent (
 alter table shared_push_sent enable row level security;
 revoke all on shared_push_sent from anon, authenticated;
 
+-- v2.22: which calendar events (with a time) have been pushed to whom. Keyed
+-- by the start date too, so moving an event to another day reminds again.
+create table if not exists event_push_sent (
+  event_id text not null,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  occurrence date not null,
+  claimed_at timestamptz,
+  sent boolean not null default false,
+  primary key (event_id, user_id, occurrence)
+);
+alter table event_push_sent enable row level security;
+revoke all on event_push_sent from anon, authenticated;
+
 -- The phone's running pomodoro: one pending "session over" push per phone.
 create table if not exists timer_pushes (
   endpoint text primary key references push_subscriptions(endpoint) on delete cascade,
@@ -1966,19 +1996,23 @@ $$;
 -- the way roll_recurring_tasks() would: nobody may have opened the app (and
 -- so rolled the tasks over) since midnight.
 drop function if exists checklist_done_on(boolean, text, date, date);
+drop function if exists checklist_done_on(boolean, text, date, date, int);
 create or replace function checklist_done_on(p_completed boolean, p_recurrence text, p_last date, d date,
-                                             p_month_day int default null)
+                                             p_month_day int default null, p_weekday int default null)
 returns boolean language sql immutable set search_path = public, extensions as $$
-  select p_completed and p_recurrence in ('once', 'daily', 'weekly', 'monthly')
-    and not checklist_needs_reset(p_recurrence, p_last, p_month_day, d);
+  select p_completed and p_recurrence in ('once', 'daily', 'weekly', 'monthly', 'weekday')
+    and not checklist_needs_reset(p_recurrence, p_last, p_month_day, d, p_weekday);
 $$;
 
 -- Whether a task's reminders may go out on local day d (mirrors
--- task_dates.reminds_today): a monthly task only on its day, a one-off with
--- a due date not before that date.
-create or replace function task_reminds_on(p_recurrence text, p_month_day int, p_due_date date, d date)
+-- task_dates.reminds_today): a specific-day task only on its weekday, a
+-- monthly task only on its day, a one-off with a due date not before that date.
+drop function if exists task_reminds_on(text, int, date, date);
+create or replace function task_reminds_on(p_recurrence text, p_month_day int, p_due_date date, d date,
+                                           p_weekday int default null)
 returns boolean language sql immutable set search_path = public, extensions as $$
   select case
+    when p_recurrence = 'weekday' then p_weekday is null or extract(isodow from d)::int - 1 = p_weekday
     when p_recurrence = 'monthly' then month_occurrence(coalesce(p_month_day, 1), d) = d
     when p_recurrence = 'once' and p_due_date is not null then p_due_date <= d
     else true
@@ -2025,7 +2059,7 @@ begin
       case
         when t.snoozed_until is not null and t.snoozed_until <= now() then 'snooze'
         when t.snoozed_until is not null then null  -- snoozed: its other reminders wait
-        when not task_reminds_on(t.recurrence, t.month_day, t.due_date, p.ts::date) then null
+        when not task_reminds_on(t.recurrence, t.month_day, t.due_date, p.ts::date, t.weekday) then null
         when t.reminder_every_h is not null then
           case when now() - coalesce(t.push_last_at, t.created_at) >= t.reminder_every_h * interval '1 hour'
                     and not in_quiet_hours(p.quiet_enabled, p.quiet_start, p.quiet_end, to_char(p.ts, 'HH24:MI'))
@@ -2037,7 +2071,7 @@ begin
     from checklist_tasks t join people p on p.user_id = t.user_id
     where t.source = 'checklist'
       and (t.push_claimed_at is null or t.push_claimed_at < stale)
-      and not checklist_done_on(t.completed_today, t.recurrence, t.last_completed, p.ts::date, t.month_day)
+      and not checklist_done_on(t.completed_today, t.recurrence, t.last_completed, p.ts::date, t.month_day, t.weekday)
   ),
   claimed as (
     update checklist_tasks t set push_claimed_at = now()
@@ -2091,6 +2125,41 @@ begin
   select 'shared', d.id, d.user_id, d.occ, 'Shared list reminder', d.text, encode(gen_random_bytes(16), 'hex')
   from due d join claimed c on c.task_id = d.id and c.user_id = d.user_id and c.occurrence = d.occ;
 
+  -- v2.22: calendar events with a time, at that time on their first day: a
+  -- personal one to its maker, a household one to every member. Like a
+  -- one-off shared item, one more than a day late is let go.
+  with recipients as (
+    select e.id, e.title, e.start_date, e.start_time, r.user_id,
+           (now() at time zone 'utc') + coalesce(a.tz_offset_min, 0) * interval '1 minute' as ts
+    from calendar_events e
+    join lateral (
+      select e.user_id where e.household_id is null
+      union
+      select m.user_id from household_members m where m.household_id = e.household_id
+    ) r on true
+    left join app_state a on a.user_id = r.user_id
+    where e.start_time is not null
+      and exists (select 1 from push_subscriptions s where s.user_id = r.user_id)
+  ),
+  due as (
+    select c.* from recipients c
+    where (c.start_date + c.start_time::time) <= c.ts
+      and (c.start_date + c.start_time::time) > c.ts - interval '1 day'
+      and not exists (
+        select 1 from event_push_sent x
+        where x.event_id = c.id and x.user_id = c.user_id and x.occurrence = c.start_date
+          and (x.sent or x.claimed_at >= stale))
+  ),
+  claimed as (
+    insert into event_push_sent (event_id, user_id, occurrence, claimed_at)
+    select d.id, d.user_id, d.start_date, now() from due d
+    on conflict on constraint event_push_sent_pkey do update set claimed_at = now()
+    returning event_push_sent.event_id, event_push_sent.user_id, event_push_sent.occurrence
+  )
+  insert into due_items
+  select 'event', d.id, d.user_id, d.start_date, '📅 ' || d.title, 'Starts at ' || d.start_time, null
+  from due d join claimed c on c.event_id = d.id and c.user_id = d.user_id and c.occurrence = d.start_date;
+
   -- The phone timer: only to the phone that started it.
   with claimed as (
     update timer_pushes tp set claimed_at = now()
@@ -2132,6 +2201,9 @@ begin
       when 'shared' then
         update shared_push_sent set sent = true
         where task_id = item->>'ref' and user_id = (item->>'owner')::uuid and occurrence = (item->>'occurrence')::date;
+      when 'event' then
+        update event_push_sent set sent = true
+        where event_id = item->>'ref' and user_id = (item->>'owner')::uuid and occurrence = (item->>'occurrence')::date;
       when 'timer' then
         delete from timer_pushes where endpoint = item->>'ref' and fire_at <= now();
       else null;

@@ -118,6 +118,14 @@ Until the schema is re-run, events and files stay on the computer they were
 made on and upload by themselves afterwards. The phone shows dated tasks on
 its calendar but can't add events or files yet.
 
+**v2.22.0** syncs "specific day" tasks (trash day) and adds reminders for
+calendar events with a time, on the desktop and as phone notifications.
+Re-run `schema.sql`, and redeploy the `send-reminders` function (it learned
+the new event notifications; `push_reminders.sql` is unchanged). The
+**Deploy cloud** workflow does both when this reaches `main`. Your
+computer's existing specific-day tasks upload by themselves the first time
+it syncs (their 🔥 streak starts again).
+
 **After v2.21.0, an older schema no longer half-syncs.** The apps used to
 carry workarounds so an un-updated cloud kept mostly working; they're gone.
 Now, if `schema.sql` is older than the app, the desktop stops syncing (☁️
@@ -280,7 +288,7 @@ own devices — not between different people's separate accounts.
 | | Synced? |
 |---|---|
 | Notes | ✅ including extra pages (v2.16.0+). Bold/underline/lists are editable on the phone; other desktop formatting (highlights, colors) isn't, but isn't lost either |
-| Checklist | ✅ (tasks, order, renames, reminders, snoozes, steps and notes, and since v2.20.0 the days each task was done, for 🔥 streaks; the desktop-only "specific day" tasks and 🍅 counts stay on the desktop) |
+| Checklist | ✅ (tasks, order, renames, reminders, snoozes, steps and notes, and since v2.20.0 the days each task was done, for 🔥 streaks; "specific day" tasks since v2.22.0; 🍅 counts stay on the desktop) |
 | Shared household list | ✅ — shared with the people in your household, including whose turn an item is (v2.20.0) |
 | Calendar events and attached files | ✅ since v2.21.0. Household events, and files on shared items and household events, are shared with your household. Files are kept in the project's private `attachments` Storage bucket (25 MB each, 250 MB per account) |
 | The pomodoro timer | ✅ since v2.20.0: start, pause, reset or skip on one device and the others follow; a finished session counts once. Turn it off per device under Timer settings ("One timer on all my devices") |

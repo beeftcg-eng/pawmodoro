@@ -63,7 +63,7 @@ let householdFingerprint = null;
 // The cloud schema this page was written against (schema_version() in
 // supabase/schema.sql; supabase_sync.SCHEMA_VERSION on the desktop). An
 // older one gets the "needs updating" screen instead of the app.
-const SCHEMA_VERSION = 221;
+const SCHEMA_VERSION = 222;
 let pomodoro = {
   phase: "work",          // "work" | "short_break" | "long_break"
   secondsLeft: 25 * 60,
@@ -782,25 +782,37 @@ function monthOccurrence(monthDay, now) {
   return localISODate(candidate <= now ? candidate : inMonth(now.getFullYear(), now.getMonth() - 1));
 }
 
+// Monday = 0 .. Sunday = 6 (Python's weekday(), the cloud's weekday column).
+function mondayIndex(d) {
+  return (d.getDay() + 6) % 7;
+}
+
 function taskRemindsToday(task, now) {
   const today = localISODate(now);
+  if (task.recurrence === "weekday") return task.weekday == null || task.weekday === mondayIndex(now);
   if (task.recurrence === "monthly") return monthOccurrence(task.month_day, now) === today;
   if (task.recurrence === "once" && task.due_date) return task.due_date <= today;
   return true;
 }
 
-// Days in a row a daily task has been done (from done_days, which the cloud
-// keeps); today not done yet doesn't break it. The same rule as
-// task_dates.streak.
+// Days in a row a daily task has been done, or weeks for a specific-day one
+// (from done_days, which the cloud keeps); a period not done *yet* doesn't
+// break it. The same rule as task_dates.streak.
 function taskStreak(task, now = new Date()) {
-  if (task.recurrence !== "daily" || !Array.isArray(task.done_days)) return 0;
-  const done = new Set(task.done_days);
+  if (!Array.isArray(task.done_days)) return 0;
   const day = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  if (!done.has(localISODate(day))) day.setDate(day.getDate() - 1);
+  let step;
+  if (task.recurrence === "daily") step = 1;
+  else if (task.recurrence === "weekday" && task.weekday != null) {
+    step = 7;
+    day.setDate(day.getDate() - (mondayIndex(day) - task.weekday + 7) % 7);
+  } else return 0;
+  const done = new Set(task.done_days);
+  if (!done.has(localISODate(day))) day.setDate(day.getDate() - step);
   let count = 0;
   while (done.has(localISODate(day))) {
     count++;
-    day.setDate(day.getDate() - 1);
+    day.setDate(day.getDate() - step);
   }
   return count;
 }
@@ -813,6 +825,7 @@ function taskDueStatus(task, now = new Date()) {
 }
 
 function taskScheduleLabel(task, now = new Date()) {
+  if (task.recurrence === "weekday" && task.weekday != null) return `every ${WEEKDAY_NAMES[task.weekday]}`;
   if (task.recurrence === "monthly") return `monthly, ${ordinal(task.month_day || 1)}`;
   if (task.recurrence === "once" && task.due_date) {
     if (task.due_date === localISODate(now)) return "due today";
@@ -927,7 +940,8 @@ function renderTaskList(container, tasks, { showRecurrence = false, reminders = 
     const extras = !showRecurrence ? ""
       : (subtasks.length ? ` <em>☑ ${subtasks.filter(s => s.done).length}/${subtasks.length}</em>` : "")
         + ((task.note ?? "").trim() ? " <em>\u{1F4DD}</em>" : "")
-        + (taskStreak(task) >= 2 ? ` <em title="days in a row">\u{1F525} ${taskStreak(task)}</em>` : "");
+        + (taskStreak(task) >= 2
+          ? ` <em title="${task.recurrence === "weekday" ? "weeks" : "days"} in a row">\u{1F525} ${taskStreak(task)}</em>` : "");
     const bell = !reminders ? ""
       : task.reminder_every_h ? ` <em>\u{1F514} every ${Number(task.reminder_every_h)}h</em>`
       : task.reminder_time ? ` <em>\u{1F514} ${escapeHtml(task.reminder_time)}</em>` : "";
@@ -1030,7 +1044,11 @@ function renderChecklist() {
           <option value="daily">daily</option>
           <option value="weekly">weekly</option>
           <option value="monthly">monthly</option>
+          <option value="weekday">specific day</option>
           <option value="once">once</option>
+        </select>
+        <select id="task-weekday" title="Which day of the week" hidden>
+          ${WEEKDAY_NAMES.map((n, i) => `<option value="${i}"${i === mondayIndex(new Date()) ? " selected" : ""}>${n}</option>`).join("")}
         </select>
         <input id="task-month-day" type="number" min="1" max="31" value="${new Date().getDate()}" title="Day of the month" hidden>
         <input id="task-due-date" type="date" title="Due date (optional)" hidden>
@@ -1049,8 +1067,10 @@ function renderChecklist() {
 
   const repeat = document.getElementById("task-recurrence");
   const monthDay = document.getElementById("task-month-day");
+  const weekday = document.getElementById("task-weekday");
   const dueDate = document.getElementById("task-due-date");
   const showPickers = () => {
+    weekday.hidden = repeat.value !== "weekday";
     monthDay.hidden = repeat.value !== "monthly";
     dueDate.hidden = repeat.value !== "once";
   };
@@ -1067,6 +1087,7 @@ function renderChecklist() {
       if (!(day >= 1 && day <= 31)) return toast("Day of the month", "Pick a day between 1 and 31.");
       params.p_month_day = day;
     }
+    if (recurrence === "weekday") params.p_weekday = Number(weekday.value);
     if (recurrence === "once" && dueDate.value) params.p_due_date = dueDate.value;
     const { error } = await supabaseClient.rpc("add_task", params);
     if (error) {
@@ -1914,7 +1935,7 @@ function taskOnDay(task, day) {
   if (task.source === "wishlist") return false;
   if (task.recurrence === "once") return (task.due_date || "").slice(0, 10) === day;
   if (task.recurrence === "monthly") return monthOccurrence(task.month_day || 1, isoToDate(day)) === day;
-  if (task.recurrence === "weekday") return task.weekday === (isoToDate(day).getDay() + 6) % 7;
+  if (task.recurrence === "weekday") return task.weekday === mondayIndex(isoToDate(day));
   return false;
 }
 

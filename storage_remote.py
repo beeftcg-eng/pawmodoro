@@ -1,8 +1,8 @@
 """
 storage_remote.py - The half of Storage that applies a pull: the cloud's
 state replacing the local cache (the server is authoritative), carrying
-across what only this computer knows (reminder clocks, "specific day"
-tasks, pages and notes being typed in). Mixed into storage.Storage; see
+across what only this computer knows (reminder clocks, pages and notes
+being typed in). Mixed into storage.Storage; see
 CLAUDE.md's "Cloud sync" for the rules.
 """
 from datetime import date, datetime
@@ -28,17 +28,12 @@ class RemoteStateMixin:
         if "timer" in remote:  # v2.20; followed by PomodoroTab.follow_remote_timer
             self.data["remote_timer"] = remote["timer"]
         local_tasks = {t["id"]: t for t in self.data.get("checklist", [])}
-        # "weekday" (specific-day) tasks are local-only — the cloud
-        # schema's checklist_tasks.recurrence CHECK constraint doesn't
-        # allow that value, so they can never come back from the server.
-        # Preserve them across this replace instead of silently deleting
-        # them the next time any sync event pulls fresh server state.
-        local_weekday_tasks = [t for t in local_tasks.values() if t.get("recurrence") == "weekday"]
         self.data["checklist"] = [
             {
                 "id": t["id"],
                 "text": t["text"],
                 "recurrence": t["recurrence"],
+                "weekday": t.get("weekday"),
                 "last_completed": t.get("last_completed"),
                 "completed_today": t.get("completed_today", False),
                 "reminder_time": t.get("reminder_time"),
@@ -54,7 +49,7 @@ class RemoteStateMixin:
                 **self._remote_detail_fields(t, local_tasks.get(t["id"]) or {}),
             }
             for t in remote["checklist"]
-        ] + local_weekday_tasks
+        ]
         g = self.data["gamification"]
         g["xp"] = remote["xp"]
         g["total_pomodoros"] = remote["total_pomodoros"]

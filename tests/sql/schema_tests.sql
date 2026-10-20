@@ -227,6 +227,72 @@ end $$;
 reset role;
 update app_state set quiet_enabled = false where user_id = :'A';
 
+-- ============ Specific-day tasks and calendar event pushes (v2.22) ============
+set role authenticated;
+select set_config('request.jwt.claim.sub', :'A', false);
+select 1 from (select add_task('bins day', 'weekday', '00:00', 'checklist', 'wd1', null, null,
+                               extract(isodow from (now() at time zone 'utc'))::int - 1)) x;
+select 1 from (select add_task('tomorrows day', 'weekday', '00:00', 'checklist', 'wd2', null, null,
+                               extract(isodow from (now() at time zone 'utc'))::int % 7)) x;
+do $$
+declare r jsonb;
+begin
+  begin
+    perform add_task('no day', 'weekday', null, 'checklist', 'wd3');
+    assert false, 'a specific-day task needs its day of the week';
+  exception when raise_exception then null;
+  end;
+  select t into r from jsonb_array_elements(sync_pull()->'checklist') t where t->>'id' = 'wd1';
+  assert (r->>'weekday')::int = extract(isodow from (now() at time zone 'utc'))::int - 1, 'weekday in sync_pull';
+  r := complete_task('wd1', true);
+  assert (r->>'xp_gained')::int = 15, 'a specific-day task is worth 15 XP, got ' || r;
+  assert checklist_done_on(true, 'weekday', user_today(), user_today(), null,
+                           extract(isodow from user_today())::int - 1), 'ticked on its day: done';
+  perform complete_task('wd1', false);
+end $$;
+reset role;
+insert into calendar_events (id, user_id, title, start_date, end_date, start_time) values
+  ('pe1', :'A', 'Dentist', (now() at time zone 'utc')::date, (now() at time zone 'utc')::date, '00:00'),
+  ('pe2', :'A', 'Tomorrow', (now() at time zone 'utc')::date + 1, (now() at time zone 'utc')::date + 1, '00:00'),
+  ('pe3', :'A', 'All day', (now() at time zone 'utc')::date, (now() at time zone 'utc')::date, null),
+  ('pe4', :'A', 'Last week', (now() at time zone 'utc')::date - 7, (now() at time zone 'utc')::date - 7, '00:00');
+insert into calendar_events (id, user_id, household_id, title, start_date, end_date, start_time) values
+  ('he1', :'C', '44444444-4444-4444-4444-444444444444', 'Dinner', (now() at time zone 'utc')::date,
+   (now() at time zone 'utc')::date, '00:00');
+set role service_role;
+create temp table round_v222 as
+  select * from due_push_reminders() where ref in ('wd1', 'wd2', 'pe1', 'pe2', 'pe3', 'pe4', 'he1');
+do $$
+declare got text;
+begin
+  select string_agg(kind || ':' || ref, ',' order by kind, ref) into got from round_v222;
+  assert got = 'daily:wd1,event:he1,event:pe1',
+    'specific-day task on its day, timed events today (household ones to members with a phone) -- got ' || coalesce(got, 'nothing');
+  assert (select owner from round_v222 where ref = 'he1') = '22222222-2222-2222-2222-222222222222',
+    'a household event goes to B (C made it but has no phone; A isn''t a member)';
+  assert (select title from round_v222 where ref = 'pe1') like '%Dentist' and (select token from round_v222 where ref = 'pe1') is null,
+    'an event push is titled after the event, with no buttons';
+  perform mark_push_sent(jsonb_agg(jsonb_build_object('kind', kind, 'ref', ref, 'owner', owner, 'occurrence', occurrence)))
+  from round_v222;
+end $$;
+reset role;
+update event_push_sent set claimed_at = now() - interval '3 minutes';
+set role service_role;
+do $$
+begin
+  assert (select count(*) from due_push_reminders() where kind = 'event') = 0, 'a delivered event isn''t pushed again';
+end $$;
+reset role;
+update event_push_sent set sent = false, claimed_at = now() - interval '3 minutes' where event_id = 'pe1';
+set role service_role;
+do $$
+begin
+  assert (select count(*) from due_push_reminders() where ref = 'pe1') = 1, 'an undelivered one comes back after its claim';
+end $$;
+reset role;
+delete from calendar_events where id in ('pe1', 'pe2', 'pe3', 'pe4', 'he1');
+delete from checklist_tasks where id in ('wd1', 'wd2');
+
 -- ============ Push: the phone timer ============
 set role authenticated;
 select set_config('request.jwt.claim.sub', :'A', false);
@@ -392,7 +458,7 @@ do $$
 declare got text;
 begin
   select string_agg(ref, ',' order by ref) into got from due_push_reminders()
-  where owner = '33333333-3333-3333-3333-333333333333' and kind <> 'shared';
+  where owner = '33333333-3333-3333-3333-333333333333' and kind not in ('shared', 'event');
   assert got = 'r2,r3', 'only the overdue one-off and today''s monthly task remind -- got ' || coalesce(got, 'nothing');
 end $$;
 reset role;

@@ -158,14 +158,10 @@ class SyncSettingsDialog(QDialog):
                 g["current_streak"], g["longest_streak"], g.get("last_active_date"),
             )
             for task in self.storage.get_checklist():
-                if task["recurrence"] == "weekday":
-                    # "specific day" tasks are desktop-only: the cloud's
-                    # recurrence constraint rejects them, which would fail
-                    # this whole first sync.
-                    continue
                 client.add_task(
                     task["text"], task["recurrence"], task.get("reminder_time"), task.get("source", "checklist"),
                     task["id"], task.get("month_day"), task.get("due_date"),
+                    task.get("weekday") if task["recurrence"] == "weekday" else None,
                 )
                 if task.get("note") or task.get("subtasks"):
                     client.set_task_details(task["id"], task.get("note") or "",
@@ -179,6 +175,15 @@ class SyncSettingsDialog(QDialog):
                 "notes, checklist, and progress to seed it."
             )
         else:
+            # Specific-day tasks used to stay on the desktop (before v2.22),
+            # so the cloud may not have them yet: add them before taking its
+            # checklist, or they'd be lost.
+            weekday_tasks = [t for t in self.storage.get_checklist() if t["recurrence"] == "weekday"]
+            for task in weekday_tasks:
+                client.add_task(task["text"], "weekday", task.get("reminder_time"), task.get("source", "checklist"),
+                                task["id"], weekday=task.get("weekday"))
+            if weekday_tasks:
+                remote = client.sync_pull()
             self.storage.adopt_remote_state(remote)
             QMessageBox.information(
                 self, "Cloud Sync",

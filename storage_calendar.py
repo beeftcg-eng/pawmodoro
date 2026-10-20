@@ -8,7 +8,7 @@ import mimetypes
 import os
 import shutil
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import storage as _storage  # the module: its paths are what tests repoint
 
@@ -26,6 +26,35 @@ class CalendarMixin:
 
     def get_shared_events(self):
         return (self.get_household() or {}).get("events", []) or []
+
+    def check_due_event_reminders(self, now=None):
+        """Events (yours and the household's) with a time whose start has
+        come in the last day and that haven't been reminded about here yet
+        (the phone gets them pushed by the cloud). The first check after an
+        update lets ones already past go by."""
+        now = now or datetime.now()
+        first_check = self.data.get("event_reminded") is None
+        reminded = self.data.get("event_reminded") or {}
+        cutoff = (now.date() - timedelta(days=3)).isoformat()
+        reminded = {k: v for k, v in reminded.items() if v >= cutoff}
+        due = []
+        for event in self.get_events() + self.get_shared_events():
+            if not event.get("start_time"):
+                continue
+            try:
+                starts = datetime.fromisoformat(f"{event['start_date']}T{event['start_time']}")
+            except (KeyError, TypeError, ValueError):
+                continue
+            key = f"{event['id']}:{event['start_date']}"
+            if key in reminded or not (now - timedelta(days=1) < starts <= now):
+                continue
+            reminded[key] = now.date().isoformat()
+            if not first_check:
+                due.append(event)
+        if reminded != self.data.get("event_reminded"):
+            self.data["event_reminded"] = reminded
+            self.save()
+        return due
 
     def find_event(self, event_id):
         """(event, shared) -- (None, False) when there's no such event."""

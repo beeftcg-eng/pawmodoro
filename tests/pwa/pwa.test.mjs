@@ -144,8 +144,29 @@ test("adding a monthly task or a dated one-off sends the day / date (and a plain
     assert.equal("p_due_date" in monthly, false);
     const dated = await add("Taxes", "once", () => { doc.getElementById("task-due-date").value = "2026-10-15"; });
     assert.equal(dated.p_due_date, "2026-10-15");
+    assert.equal(doc.getElementById("task-weekday").hidden, true);
+    const bins = await add("Bins", "weekday", () => { doc.getElementById("task-weekday").value = "3"; });
+    assert.equal(bins.p_weekday, 3);
+    assert.equal(doc.getElementById("task-weekday").hidden, false);
     const daily = await add("Walk", "daily");
     assert.deepEqual(Object.keys(daily).sort(), ["p_recurrence", "p_reminder_time", "p_text"]);
+  } finally { app.close(); }
+});
+
+test("a specific-day task shows its day and reminds only then", async () => {
+  const app = await bootApp();
+  try {
+    const today = app.window.eval("mondayIndex(new Date())");
+    app.state.checklist.push(
+      { id: "b1", text: "Bins", recurrence: "weekday", weekday: today, completed_today: false, source: "checklist" },
+      { id: "b2", text: "Gym", recurrence: "weekday", weekday: (today + 1) % 7, completed_today: false, source: "checklist" });
+    app.window.eval('switchTab("checklist")');
+    await app.window.eval("pullAndRender()");
+    const names = app.window.eval("WEEKDAY_NAMES");
+    const row = id => app.window.document.querySelector(`[data-task-id="${id}"]`).textContent;
+    assert.match(row("b1"), new RegExp(`every ${names[today]}`));
+    assert.equal(app.window.eval('taskRemindsToday(state.checklist.find(t => t.id === "b1"), new Date())'), true);
+    assert.equal(app.window.eval('taskRemindsToday(state.checklist.find(t => t.id === "b2"), new Date())'), false);
   } finally { app.close(); }
 });
 
