@@ -8,8 +8,8 @@ How it fits together:
     list item...) is applied to the local data immediately by Storage, and
     ALSO appended to a persistent outbox (storage.data["sync_outbox"]).
   * This engine's worker thread drains that outbox in order, one RPC at a
-    time. If the network is down or the cloud schema is outdated, the queue
-    simply waits (it survives restarts, since it lives in data.json).
+    time. If the network is down or the cloud schema is older than this app
+    (schema_version() below SCHEMA_VERSION), the queue simply waits (it survives restarts, since it lives in data.json).
     A request the server rejects as *wrong* (e.g. "task not found") is
     dropped instead, so one bad entry can never wedge the queue.
   * Once the outbox is empty, it pulls the server's state and hands it to
@@ -40,10 +40,9 @@ STATUS_TEXT = {
     "online": "Synced",
     "offline": "Offline — changes are saved here and will sync when the connection is back",
     "auth": "Signed out of the cloud — open Cloud Sync and log in again (nothing is lost)",
-    "schema": "The cloud database needs updating — re-run supabase/schema.sql in the Supabase SQL Editor (see MOBILE_SYNC.md)",
+    "schema": ("The cloud database is older than this app — re-run supabase/schema.sql in the Supabase "
+               "SQL Editor (see MOBILE_SYNC.md). Changes are saved here and will sync once it's updated"),
 }
-SCHEMA_BEHIND_TEXT = ("Synced, but the cloud database is older than this app, so some features fall back — "
-                      "re-run supabase/schema.sql in the Supabase SQL Editor (see MOBILE_SYNC.md)")
 
 
 def local_utc_offset_minutes():
@@ -69,7 +68,6 @@ class SyncEngine:
         self._last_pull = 0.0
         self._tz_sent = None
         self._tz_retry_at = 0.0
-        self._household_supported = True
         self._next_household_probe = 0.0
         # Polling only sends what changed (sync_pull_if_changed). Storage
         # sets `applied` = (state fingerprint, household fingerprint, rev)
@@ -77,9 +75,6 @@ class SyncEngine:
         # storage.rev still equals that rev, so after any local edit or
         # upload the next pull is a full one.
         self.applied = (None, None, None)
-        self._fingerprints_supported = True
-        # True when the cloud's schema_version() is older than this app's.
-        self.schema_behind = False
         # Set from the UI thread: True while no window is showing. Pulls then
         # slow right down; local edits still upload immediately (wake()).
         self.background = False
@@ -118,8 +113,6 @@ class SyncEngine:
             self.client = None
             self._tz_sent = None
             self.applied = (None, None, None)
-            self._fingerprints_supported = True
-            self._household_supported = True
             self._next_household_probe = 0.0
             self._last_pull = 0.0
         self.status = "connecting" if self.storage.sync_configured() else "off"
@@ -130,12 +123,10 @@ class SyncEngine:
 
     def needs_attention(self):
         """Something only the user can fix (log in again, update the cloud)."""
-        return self.status in ("auth", "schema") or (self.status == "online" and self.schema_behind)
+        return self.status in ("auth", "schema")
 
     def status_text(self):
         text = STATUS_TEXT.get(self.status, self.status)
-        if self.status == "online" and self.schema_behind:
-            text = SCHEMA_BEHIND_TEXT
         pending = self.pending_count()
         if pending and self.status != "off":
             text += f" ({pending} change{'s' if pending != 1 else ''} waiting to upload)"
@@ -207,17 +198,28 @@ class SyncEngine:
         # Supabase rotates the refresh token on every use; the one we just
         # spent is dead, so persist the new one immediately.
         self._persist_token()
-        self._check_schema_version()
+        if not self._schema_current():
+            self.client = None  # asked again on the next (slow) retry
+            return False
         self.status = "online"
         return True
 
-    def _check_schema_version(self):
+    def _schema_current(self):
+        """An older cloud schema (or one from before schema_version(),
+        v2.20) doesn't sync at all until schema.sql is re-run: the queue
+        keeps every change meanwhile."""
         try:
             version = self.client.schema_version()
         except SyncError as e:
-            version = 0 if e.schema_outdated else None  # missing = from before v2.20
-        if version is not None:
-            self.schema_behind = int(version or 0) < SCHEMA_VERSION
+            if not e.schema_outdated:
+                self._note_failure(e)
+                return False
+            version = 0
+        if int(version or 0) < SCHEMA_VERSION:
+            self.last_error = f"cloud schema {version or 'unversioned'}, this app needs {SCHEMA_VERSION}"
+            self.status = "schema"
+            return False
+        return True
 
     def _persist_token(self):
         if self.client is not None:
@@ -256,13 +258,6 @@ class SyncEngine:
                 with self._io_lock:
                     self._execute(op)
             except SyncError as e:
-                if e.schema_outdated and op["op"].startswith("note_page"):
-                    # The cloud predates notes pages: don't let them hold up
-                    # everything else (see Storage.outbox_note_pages_unsupported).
-                    print(f"[sync] cloud has no notes pages yet; dropping {op['op']}")
-                    self.storage.outbox_note_pages_unsupported()
-                    self.storage.outbox_done(op["seq"])
-                    continue
                 if e.transient:
                     self.storage.outbox_release()
                     self._note_failure(e)
@@ -284,11 +279,11 @@ class SyncEngine:
             c.add_task(a["text"], a["recurrence"], a.get("reminder_time"), a.get("source", "checklist"), a["id"],
                        a.get("month_day"), a.get("due_date"))
         elif name == "set_task_due_date":
-            self._new_in_schema(lambda: c.set_task_due_date(a["id"], a["due_date"]))
+            c.set_task_due_date(a["id"], a["due_date"])
         elif name == "set_task_details":
-            self._new_in_schema(lambda: c.set_task_details(a["id"], a["note"], a["subtasks"]))
+            c.set_task_details(a["id"], a["note"], a["subtasks"])
         elif name == "set_subtask_done":
-            self._new_in_schema(lambda: c.set_subtask_done(a["id"], a["sub_id"], a["done"]))
+            c.set_subtask_done(a["id"], a["sub_id"], a["done"])
         elif name == "remove_task":
             c.remove_task(a["id"])
         elif name == "rename_task":
@@ -296,28 +291,21 @@ class SyncEngine:
         elif name == "set_task_reminder":
             c.set_task_reminder(a["id"], a["reminder_time"])
         elif name == "set_task_reminder_mode":
-            try:
-                c.set_task_reminder_mode(a["id"], a.get("reminder_time"), a.get("every_h"))
-            except SyncError as e:
-                if not e.schema_outdated:
-                    raise
-                # Cloud older than v2.17: it only knows a daily time.
-                c.set_task_reminder(a["id"], None if a.get("every_h") else a.get("reminder_time"))
+            c.set_task_reminder_mode(a["id"], a.get("reminder_time"), a.get("every_h"))
         elif name == "snooze_task":
-            self._new_in_schema(lambda: c.snooze_task(a["id"], a["until"]))
+            c.snooze_task(a["id"], a["until"])
         elif name == "set_reminder_settings":
-            self._new_in_schema(lambda: c.set_reminder_settings(a["quiet_enabled"], a["quiet_start"], a["quiet_end"]))
+            c.set_reminder_settings(a["quiet_enabled"], a["quiet_start"], a["quiet_end"])
         elif name == "reorder_tasks":
             c.reorder_tasks(a["ids"])
         elif name == "complete_task":
             c.complete_task(a["id"], a["done"])
         elif name == "pomodoro":
-            self._with_session_fallback(lambda session: c.record_pomodoro_completed(a.get("minutes", 25), session),
-                                        a.get("session"))
+            c.record_pomodoro_completed(a.get("minutes", 25), a.get("session"))
         elif name == "break":
-            self._with_session_fallback(c.record_break_completed, a.get("session"))
+            c.record_break_completed(a.get("session"))
         elif name == "timer_state":
-            self._new_in_schema(lambda: c.set_timer_state(a))
+            c.set_timer_state(a)
         elif name == "shared_add":
             c.shared_add_task(a["text"], a["id"], a.get("schedule"))
         elif name == "shared_schedule":
@@ -329,7 +317,7 @@ class SyncEngine:
         elif name == "shared_remove":
             c.shared_remove_task(a["id"])
         elif name == "shared_assign":
-            self._new_in_schema(lambda: c.shared_assign(a["id"], a["user_id"]))
+            c.shared_assign(a["id"], a["user_id"])
         elif name == "shared_clear_done":
             c.shared_clear_done()
         elif name == "note_page_set":
@@ -340,17 +328,17 @@ class SyncEngine:
             c.reorder_note_pages(a["ids"])
         elif name == "event_save":
             try:
-                self._new_in_schema(lambda: c.save_event(a, a.get("shared")))
+                c.save_event(a, a.get("shared"))
             except SyncError as e:
                 if not e.transient:
                     self.storage.outbox_event_failed(a["id"], _readable(e))
                 raise
         elif name == "event_remove":
-            self._new_in_schema(lambda: c.remove_event(a["id"]))
+            c.remove_event(a["id"])
         elif name == "attachment_add":
-            self._new_in_schema(lambda: self._upload_attachment(a))
+            self._upload_attachment(a)
         elif name == "attachment_remove":
-            self._new_in_schema(lambda: self._remove_attachment(a))
+            self._remove_attachment(a)
         else:
             print(f"[sync] unknown queued operation {name!r}; dropping it")
 
@@ -375,7 +363,7 @@ class SyncEngine:
                 raise
             c.attachment_uploaded(a["id"])
         except SyncError as e:
-            if not (e.transient or e.schema_outdated):
+            if not e.transient:
                 self.storage.outbox_attachment_failed(a["id"], _readable(e))
             raise
         self.storage.outbox_attachment_uploaded(a["id"], row["path"])
@@ -401,45 +389,17 @@ class SyncEngine:
         os.replace(partial, destination)
         return destination
 
-    def _with_session_fallback(self, call, session):
-        """A finished timer phase, with its session key; a cloud older than
-        v2.20 doesn't take the key, so it's sent without one there."""
-        try:
-            call(session)
-        except SyncError as e:
-            if not (session and e.schema_outdated):
-                raise
-            call(None)
-
-    def _new_in_schema(self, call):
-        """Something an older cloud schema simply doesn't have (it stays on
-        this computer): skip it rather than hold up the queue."""
-        try:
-            call()
-        except SyncError as e:
-            if not e.schema_outdated:
-                raise
-
     def _save_page_checked(self, page_id, title, html):
         """Saves notes (page_id "main") or a page, refused by the cloud if
         another device saved it since this computer last saw it. Then their
         version is kept as a separate page (Storage.outbox_notes_conflict)
-        and ours goes on top. A cloud older than v2.17 just takes it."""
+        and ours goes on top."""
         c = self.client
         main = page_id == self.storage.MAIN_NOTES_PAGE
         for _attempt in range(3):
             base = self.storage.outbox_base_rev(page_id)
-            try:
-                result = (c.set_notes_checked(html, base) if main
-                          else c.set_note_page_checked(page_id, title, html, base))
-            except SyncError as e:
-                if not e.schema_outdated:
-                    raise
-                if main:
-                    c.set_notes(html)
-                else:
-                    c.set_note_page(page_id, title, html)
-                return
+            result = (c.set_notes_checked(html, base) if main
+                      else c.set_note_page_checked(page_id, title, html, base))
             if result.get("ok"):
                 self.storage.outbox_saved_rev(page_id, result.get("rev"))
                 return
@@ -473,22 +433,13 @@ class SyncEngine:
 
     def _pull_state(self, fingerprint):
         """The server's state, or None when it still matches `fingerprint`."""
-        if self._fingerprints_supported:
-            try:
-                remote = self.client.sync_pull_if_changed(fingerprint)
-                return None if remote.get("unchanged") else remote
-            except SyncError as e:
-                if not e.schema_outdated:
-                    raise
-                self._fingerprints_supported = False  # older cloud schema
-        return self.client.sync_pull()
+        remote = self.client.sync_pull_if_changed(fingerprint)
+        return None if remote.get("unchanged") else remote
 
     def _pull_household(self, fingerprint=None):
         """False when not checked (or unchanged since `fingerprint`), None
         when the account isn't in a household, else the household dict
-        (with its "fingerprint" when the schema sends one)."""
-        if not self._household_supported:
-            return False
+        (with its "fingerprint")."""
         in_household = self.storage.get_household() is not None
         now = time.monotonic()
         if not in_household and now < self._next_household_probe:
@@ -496,8 +447,6 @@ class SyncEngine:
         self._next_household_probe = now + HOUSEHOLD_PROBE_SECONDS
         try:
             with self._io_lock:
-                if not self._fingerprints_supported:
-                    return self.client.household_pull()
                 pulled = self.client.household_pull_if_changed(fingerprint if in_household else None)
                 if pulled.get("unchanged"):
                     return False
@@ -506,11 +455,7 @@ class SyncEngine:
                     # taken back out by Storage.adopt_remote_state
                     household["fingerprint"] = pulled.get("fingerprint")
                 return household
-        except SyncError as e:
-            if e.schema_outdated:
-                # Older cloud schema without the household feature: the rest
-                # of sync works fine, so just stop asking.
-                self._household_supported = False
+        except SyncError:
             return False
 
 

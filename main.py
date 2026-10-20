@@ -280,7 +280,7 @@ class MainWindow(QMainWindow):
             self.sync_btn.setText("☁️ Sync …")
         self.sync_btn.setToolTip(engine.status_text())
         # Say so once when sync needs attention, since it fails quietly otherwise.
-        attention = (engine.status, engine.schema_behind) if engine.needs_attention() else None
+        attention = engine.status if engine.needs_attention() else None
         if attention and attention != self._last_sync_status:
             notifier.send("Pawmodoro cloud sync", engine.status_text())
         self._last_sync_status = attention
@@ -765,8 +765,8 @@ def main():
         try:
             import ctypes
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Pawmodoro.DesktopApp")
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[startup] couldn't set the taskbar identity: {e}")
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName("Pawmodoro")

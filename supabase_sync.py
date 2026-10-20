@@ -49,8 +49,8 @@ class SyncError(Exception):
 
 
 # The cloud schema this app was written against (schema_version() in
-# supabase/schema.sql, 221 = v2.21). An older one still syncs, with
-# fallbacks, but the app says it should be updated.
+# supabase/schema.sql, 221 = v2.21). Sync waits on an older one until
+# schema.sql is re-run (SyncEngine._schema_current).
 SCHEMA_VERSION = 221
 
 
@@ -177,11 +177,8 @@ class SupabaseSync:
 
     def sync_pull_if_changed(self, fingerprint):
         """sync_pull() plus a "fingerprint", or just {unchanged, fingerprint}
-        when `fingerprint` still matches (schema v2.20+)."""
+        when `fingerprint` still matches."""
         return self._rpc("sync_pull_if_changed", {"p_fingerprint": fingerprint})
-
-    def set_notes(self, text):
-        return self._rpc("set_notes", {"p_notes": text})
 
     def set_notes_checked(self, text, base_rev):
         return self._rpc("set_notes_checked", {"p_notes": text, "p_base_rev": base_rev})
@@ -201,9 +198,6 @@ class SupabaseSync:
         return self._rpc("set_reminder_settings", {
             "p_quiet_enabled": quiet_enabled, "p_quiet_start": quiet_start, "p_quiet_end": quiet_end})
 
-    def set_note_page(self, page_id, title, html):
-        return self._rpc("set_note_page", {"p_id": page_id, "p_title": title, "p_html": html})
-
     def remove_note_page(self, page_id):
         return self._rpc("remove_note_page", {"p_id": page_id})
 
@@ -216,18 +210,11 @@ class SupabaseSync:
     def add_task(self, text, recurrence, reminder_time=None, source="checklist", task_id=None,
                  month_day=None, due_date=None):
         # task_id lets the desktop create the task under the id it already
-        # gave it locally (safe to retry: the server returns the existing
-        # row). Left out when None so an older cloud schema, which doesn't
-        # know p_id yet, still accepts the call -- likewise the v2.18 month
-        # day and due date, so plain tasks still work before schema.sql is re-run.
-        params = {"p_text": text, "p_recurrence": recurrence, "p_reminder_time": reminder_time, "p_source": source}
-        if task_id:
-            params["p_id"] = task_id
-        if month_day is not None:
-            params["p_month_day"] = month_day
-        if due_date:
-            params["p_due_date"] = due_date
-        return self._rpc("add_task", params)
+        # gave it locally (safe to retry: the server returns the existing row).
+        return self._rpc("add_task", {
+            "p_text": text, "p_recurrence": recurrence, "p_reminder_time": reminder_time, "p_source": source,
+            "p_id": task_id, "p_month_day": month_day, "p_due_date": due_date or None,
+        })
 
     def set_task_due_date(self, task_id, due_date):
         return self._rpc("set_task_due_date", {"p_task_id": task_id, "p_due_date": due_date})
@@ -254,18 +241,14 @@ class SupabaseSync:
         return self._rpc("complete_task", {"p_task_id": task_id, "p_done": done})
 
     def record_pomodoro_completed(self, minutes=25, session=None):
-        """`session` (schema v2.20+): the session's key, so it counts once
-        across devices. Only sent when given."""
-        params = {"p_minutes": minutes}
-        if session:
-            params["p_session"] = session
-        return self._rpc("record_pomodoro_completed", params)
+        """`session`: the session's key, so it counts once across devices."""
+        return self._rpc("record_pomodoro_completed", {"p_minutes": minutes, "p_session": session or None})
 
     def record_break_completed(self, session=None):
-        return self._rpc("record_break_completed", {"p_session": session} if session else {})
+        return self._rpc("record_break_completed", {"p_session": session or None})
 
     def set_timer_state(self, state):
-        """The shared timer (schema v2.20+); returns its new revision."""
+        """The shared timer; returns its new revision."""
         return self._rpc("set_timer_state", {"p_state": state})
 
     def import_state(self, notes, xp, total_pomodoros, total_tasks, current_streak, longest_streak, last_active_date):
@@ -281,11 +264,8 @@ class SupabaseSync:
 
     # ---------- Household (shared list) ----------
 
-    def household_pull(self):
-        return self._rpc("household_pull")
-
     def household_pull_if_changed(self, fingerprint):
-        """{household, fingerprint}, or {unchanged, fingerprint} (schema v2.20+)."""
+        """{household, fingerprint}, or {unchanged, fingerprint}."""
         return self._rpc("household_pull_if_changed", {"p_fingerprint": fingerprint})
 
     def household_create(self, name):
@@ -309,7 +289,7 @@ class SupabaseSync:
         params = {"p_text": text}
         if task_id:
             params["p_id"] = task_id
-        if schedule:  # only sent when there is one, so plain items still work on an older schema
+        if schedule:  # plain items take the schema's defaults (once, no date)
             params.update(self._schedule_params(schedule))
         return self._rpc("shared_add_task", params)
 
@@ -326,13 +306,13 @@ class SupabaseSync:
         return self._rpc("shared_remove_task", {"p_id": task_id})
 
     def shared_assign(self, task_id, user_id):
-        """Gives a shared item to one member (None = anyone). Schema v2.20+."""
+        """Gives a shared item to one member (None = anyone)."""
         return self._rpc("shared_assign", {"p_id": task_id, "p_user": user_id})
 
     def shared_clear_done(self):
         return self._rpc("shared_clear_done")
 
-    # ---------- Calendar (schema v2.21) ----------
+    # ---------- Calendar ----------
 
     def save_event(self, event, shared):
         return self._rpc("save_event", {

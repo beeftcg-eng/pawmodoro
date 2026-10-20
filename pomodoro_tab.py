@@ -21,6 +21,7 @@ import chime
 import idle
 import notifier
 import quotes
+import shared_timer
 
 AUDIO_FILE_FILTER = "Audio files (*.wav *.wave *.mp3 *.ogg *.flac *.m4a *.aac);;All files (*)"
 
@@ -40,10 +41,6 @@ STALL_GAP_SECONDS = 3
 TICK_MS = 250
 # How often a running work session asks whether you're still at the computer.
 IDLE_CHECK_MS = 10000
-# One timer across devices: when a phase ends on a device that's only
-# following the timer, it waits this long for the device running it to
-# report the next phase before counting the session itself.
-TAKEOVER_MS = 90_000
 
 PHASE_NAMES = {
     "work": "\U0001F43E Work session",
@@ -616,13 +613,13 @@ class PomodoroTab(QWidget):
 
         settings = self.storage.get_pomodoro_settings()
         ended_at = self._ends_at
-        session = f"{self.phase}:{round(ended_at)}" if completed and ended_at else None
+        session = shared_timer.session_key(self.phase, ended_at) if completed else None
         # Following another device's timer: that device counts the session;
-        # this one takes over only if it doesn't report back (see TAKEOVER_MS).
-        counts_here = not completed or self._owner or not self.storage.shared_timer_enabled()
+        # this one takes over only if it doesn't report back in time.
+        counts_here = shared_timer.counts_here(completed, self._owner, self.storage.shared_timer_enabled())
         if completed and not counts_here:
             self._pending_takeover = (session, self.phase, settings["work_min"])
-            QTimer.singleShot(TAKEOVER_MS, lambda pending=self._pending_takeover: self._take_over(pending))
+            QTimer.singleShot(shared_timer.TAKEOVER_SECONDS * 1000, lambda pending=self._pending_takeover: self._take_over(pending))
         if self.phase == "work":
             if completed:
                 self.sessions_completed += 1
@@ -647,10 +644,7 @@ class PomodoroTab(QWidget):
         self.seconds_left = self._phase_minutes(self.phase) * 60
         self._refresh_labels()
         if completed and settings.get("auto_start_next", True):
-            # Chained onto the end of the last phase, so every device that
-            # follows this timer works out the same end time.
-            chained = ended_at + self.seconds_left if ended_at else None
-            self._start(ends_at=chained if chained and chained > time.time() + 1 else None)
+            self._start(ends_at=shared_timer.chained_end(ended_at, self.seconds_left, time.time()))
         else:
             self._sync_ambient_to_phase()
             self._save_timer_state()
@@ -699,11 +693,9 @@ class PomodoroTab(QWidget):
     def follow_remote_timer(self, timer):
         """Another device started, paused, reset or moved on the shared
         timer (Storage.take_remote_timer): do the same here."""
-        if not timer or timer.get("phase") not in PHASE_NAMES:
+        if not shared_timer.followable(timer, PHASE_NAMES, time.time()):
             return
         ends_at = timer.get("ends_at")
-        if timer.get("running") and ends_at and ends_at < time.time() - 60:
-            return  # left running somewhere long ago: nothing to follow
         self._following = True
         try:
             self._pending_takeover = None

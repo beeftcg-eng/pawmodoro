@@ -39,6 +39,7 @@ async function bootApp(handlers = {}) {
     rpc: async (name, params) => {
       calls.push({ name, params });
       if (handlers[name]) return handlers[name](params);
+      if (name === "schema_version") return { data: window.eval("SCHEMA_VERSION"), error: null };
       // The polling RPCs answer from the plain ones (never "unchanged", unless a test says so).
       if (name === "sync_pull_if_changed") return { data: state, error: null };
       if (name === "household_pull_if_changed") {
@@ -203,12 +204,31 @@ test("ticking a step, adding one, and editing the note", async () => {
   } finally { app.close(); }
 });
 
-test("an older cloud falls back to a plain daily time", async () => {
-  const missing = { data: null, error: { code: "PGRST202", message: "Could not find the function" } };
-  const app = await bootApp({ set_task_reminder_mode: () => missing });
+test("an older cloud gets the update screen instead of the app", async () => {
+  let answer = null;  // null = a newer cloud, which is fine
+  const app = await bootApp({ schema_version: () => answer ?? { data: 9999, error: null } });
   try {
-    await app.window.eval('setTaskReminder("t1", "07:15", null)');
-    assert.ok(app.calls.some(c => c.name === "set_task_reminder" && c.params.p_reminder_time === "07:15"));
+    const doc = app.window.document;
+    const older = [{ data: 210, error: null },
+                   { data: null, error: { code: "PGRST202", message: "Could not find the function" } }];
+    for (answer of older) {
+      app.window.eval("stopPolling()");
+      app.calls.length = 0;
+      await app.window.eval("enterApp()");
+      assert.ok(doc.getElementById("schema-retry-btn"), "the update screen");
+      assert.ok(!app.calls.some(c => c.name === "sync_pull"), "no pull from an older cloud");
+    }
+    answer = null;
+    doc.getElementById("schema-retry-btn").click();
+    await until(() => doc.getElementById("view"));
+  } finally { app.close(); }
+});
+
+test("a network error checking the schema still opens the app", async () => {
+  const app = await bootApp({ schema_version: () => ({ data: null, error: { message: "Failed to fetch" } }) });
+  try {
+    assert.ok(app.window.document.getElementById("view"));
+    assert.ok(app.calls.some(c => c.name === "sync_pull"));
   } finally { app.close(); }
 });
 
@@ -431,15 +451,6 @@ test("a poll with nothing new keeps what's shown, and an older cloud gets plain 
     assert.equal(app.calls.filter(c => c.name === "sync_pull_if_changed").at(-1).params.p_fingerprint, null,
       "the pull after an action is a full one");
   } finally { app.close(); }
-
-  const old = await bootApp({ sync_pull_if_changed: () => ({ data: null, error: { code: "PGRST202", status: 404 } }) });
-  try {
-    await old.window.eval("pullAndRender({ poll: true })");
-    await old.window.eval("pullAndRender({ poll: true })");
-    assert.equal(old.calls.filter(c => c.name === "sync_pull_if_changed").length, 1, "asked once");
-    assert.ok(old.calls.filter(c => c.name === "sync_pull").length >= 2);
-    assert.equal(old.window.eval("state.checklist.length"), 2);
-  } finally { old.close(); }
 });
 
 test("a shared item's turn goes round the members, and shows who", async () => {
@@ -511,20 +522,17 @@ test("the phone follows the desktop's timer, and leaves the count to it", async 
   } finally { app.close(); }
 });
 
-test("its own timer counts its sessions with a key, even on an older cloud", async () => {
+test("its own timer counts its sessions with a key", async () => {
   const app = await bootApp({
-    record_pomodoro_completed: params => params.p_session
-      ? { data: null, error: { code: "PGRST202", message: "Could not find the function" } }
-      : { data: { xp_gained: 20, completed_quests: [] }, error: null },
+    record_pomodoro_completed: () => ({ data: { xp_gained: 20, completed_quests: [] }, error: null }),
   });
   try {
     app.window.eval('switchTab("pomodoro"); startPomodoro(Date.now() - 1); pomodoro.owner = true');
     await app.window.eval("tickPomodoro()");
     await settle();
     const calls = app.calls.filter(c => c.name === "record_pomodoro_completed").map(c => plain(c.params));
-    assert.equal(calls.length, 2);
+    assert.equal(calls.length, 1);
     assert.match(calls[0].p_session, /^work:/);
-    assert.equal(calls[1].p_session, undefined, "retried without the key");
     assert.equal(app.window.eval("pomodoro.phase"), "short_break");
   } finally { app.close(); }
 });

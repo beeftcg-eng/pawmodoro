@@ -1,5 +1,7 @@
 """The local side of cloud sync: what gets queued, and what a pull may
 overwrite. (The server side is supabase/schema.sql.)"""
+from unittest import mock
+
 from support import StorageTestCase, remote_state
 
 
@@ -108,16 +110,16 @@ class PagesPullTests(StorageTestCase):
         self.storage._apply_remote_state(remote, keep_notes=True)
         self.assertEqual(self.storage.get_page_html(page), "<p>mine</p>")
 
-    def test_old_cloud_schema_drops_page_uploads_instead_of_blocking(self):
+    def test_a_missing_cloud_function_keeps_the_queue_waiting(self):
         self.enable_sync()
         self.storage.add_note_page("Ideas")
         self.storage.add_task("Walk", "daily")
-        cloud = FakeCloud(set_note_page_checked=outdated(), set_note_page=outdated())
+        cloud = FakeCloud(set_note_page_checked=outdated())
         self.storage.sync.client = cloud
-        self.assertTrue(self.storage.sync._flush())
-        self.assertIn("add_task", [c[0] for c in cloud.calls])
-        self.assertFalse(self.storage.data["notes_pages_synced"])
-        self.assertEqual(self.storage.outbox_len(), 0)
+        self.assertFalse(self.storage.sync._flush())
+        self.assertEqual(self.storage.sync.status, "schema")
+        self.assertNotIn("add_task", [c[0] for c in cloud.calls], "kept in order behind the page")
+        self.assertEqual(self.storage.outbox_len(), 2, "nothing dropped")
 
 
 class FakeCloud:
@@ -212,21 +214,16 @@ class ConflictTests(StorageTestCase):
         self.storage._apply_remote_state(dict(remote_state([], notes="theirs"), notes_rev=4))
         self.assertEqual(self.storage.data["notes_rev"], 4)
 
-    def test_older_cloud_gets_a_plain_save(self):
-        cloud = FakeCloud(set_notes_checked=outdated())
-        self.storage.set_notes("mine")
-        self.flush(cloud)
-        self.assertEqual([c[0] for c in cloud.calls], ["set_notes_checked", "set_notes"])
-
-    def test_older_cloud_and_new_reminder_ops(self):
+    def test_reminder_ops_go_up(self):
         task = self.storage.add_task("Water", "daily")
         self.storage.set_task_reminder(task["id"], None, every_hours=3)
         self.storage.snooze_task_reminder(task["id"], 15)
         self.storage.set_reminder_settings(quiet_enabled=True)
-        cloud = FakeCloud(set_task_reminder_mode=outdated(), snooze_task=outdated(), set_reminder_settings=outdated())
+        cloud = FakeCloud()
         self.flush(cloud)
-        self.assertIn(("set_task_reminder", (task["id"], None)), cloud.calls)
-        self.assertEqual(self.storage.outbox_len(), 0, "nothing may wedge the queue")
+        self.assertIn(("set_task_reminder_mode", (task["id"], None, 3)), cloud.calls)
+        self.assertIn("snooze_task", [c[0] for c in cloud.calls])
+        self.assertIn("set_reminder_settings", [c[0] for c in cloud.calls])
 
 
 class ReminderPullTests(StorageTestCase):
@@ -315,26 +312,17 @@ class PollingCloud:
     "unchanged" when given the current fingerprint."""
     refresh_token = "t"
 
-    def __init__(self, state, household=None, outdated_schema=False):
-        self.state, self.household, self.outdated_schema = state, household, outdated_schema
+    def __init__(self, state, household=None):
+        self.state, self.household = state, household
         self.calls = []
 
     def _fp(self, value):
         return str(hash(repr(value)))
 
-    def sync_pull(self):
-        self.calls.append(("sync_pull", None))
-        return dict(self.state)
-
     def sync_pull_if_changed(self, fingerprint):
         self.calls.append(("sync_pull_if_changed", fingerprint))
-        if self.outdated_schema:
-            raise outdated()
         fp = self._fp(self.state)
         return {"unchanged": True, "fingerprint": fp} if fingerprint == fp else dict(self.state, fingerprint=fp)
-
-    def household_pull(self):
-        return self.household
 
     def household_pull_if_changed(self, fingerprint):
         fp = self._fp(self.household)
@@ -401,12 +389,6 @@ class PollingTests(StorageTestCase):
         self.assertIsNone(handed[0][0], "the state itself didn't change")
         self.assertEqual(self.storage.get_household()["name"], "New name")
 
-    def test_older_cloud_schema_falls_back_to_full_pulls(self):
-        cloud = PollingCloud(remote_state([]), outdated_schema=True)
-        self.poll(cloud)
-        self.poll(cloud)
-        self.assertEqual([c[0] for c in cloud.calls], ["sync_pull_if_changed", "sync_pull", "sync_pull"])
-
 
 class SchemaVersionTests(StorageTestCase):
     def check(self, answer):
@@ -419,26 +401,46 @@ class SchemaVersionTests(StorageTestCase):
                     raise answer
                 return answer
         engine.client = Cloud()
-        engine.schema_behind = False
-        engine._check_schema_version()
-        engine.status = "online"
-        return engine
+        engine.status = "connecting"
+        current = engine._schema_current()
+        if current:
+            engine.status = "online"
+        return current, engine
 
     def test_current_schema_is_fine(self):
         from supabase_sync import SCHEMA_VERSION
-        engine = self.check(SCHEMA_VERSION)
+        current, engine = self.check(SCHEMA_VERSION)
+        self.assertTrue(current)
         self.assertFalse(engine.needs_attention())
         self.assertEqual(engine.status_text(), "Synced")
 
-    def test_older_or_missing_version_asks_for_an_update(self):
+    def test_older_or_missing_version_stops_sync_and_asks_for_an_update(self):
         for answer in (210, outdated()):
-            engine = self.check(answer)
+            current, engine = self.check(answer)
+            self.assertFalse(current)
             self.assertTrue(engine.needs_attention())
             self.assertIn("schema.sql", engine.status_text())
 
-    def test_a_network_blip_changes_nothing(self):
+    def test_a_network_blip_is_just_offline(self):
         from supabase_sync import SyncError
-        self.assertFalse(self.check(SyncError("offline")).needs_attention())
+        current, engine = self.check(SyncError("offline"))
+        self.assertFalse(current)
+        self.assertEqual(engine.status, "offline")
+        self.assertFalse(engine.needs_attention())
+
+    def test_an_older_cloud_keeps_the_queue(self):
+        from supabase_sync import SupabaseSync
+        self.enable_sync()
+        self.storage.add_task("Walk", "daily")
+        engine = self.storage.sync
+        with mock.patch.object(SupabaseSync, "refresh_session"), \
+                mock.patch.object(SupabaseSync, "schema_version", return_value=210), \
+                mock.patch.object(SupabaseSync, "add_task") as add_task:
+            engine._cycle()
+        add_task.assert_not_called()
+        self.assertIsNone(engine.client, "asks again next time")
+        self.assertEqual(engine.status, "schema")
+        self.assertEqual(self.storage.outbox_len(), 1)
 
     def test_app_and_schema_agree_on_the_version(self):
         import re
@@ -447,37 +449,24 @@ class SchemaVersionTests(StorageTestCase):
         with open(f"{support.ROOT}/supabase/schema.sql", encoding="utf-8") as f:
             found = re.search(r"function schema_version\(\).*?select (\d+);", f.read(), re.S)
         self.assertEqual(int(found.group(1)), SCHEMA_VERSION)
+        with open(f"{support.ROOT}/docs/app.js", encoding="utf-8") as f:
+            phone = re.search(r"const SCHEMA_VERSION = (\d+);", f.read())
+        self.assertEqual(int(phone.group(1)), SCHEMA_VERSION, "the phone app's too")
 
 
 class TimerSyncTests(StorageTestCase):
-    def test_session_key_falls_back_on_an_older_cloud(self):
-        calls = []
-
-        class OldCloud:
-            refresh_token = "t"
-
-            def record_pomodoro_completed(self, minutes, session=None):
-                calls.append(("pomodoro", minutes, session))
-                if session:
-                    raise outdated()
-
-            def record_break_completed(self, session=None):
-                calls.append(("break", session))
-                if session:
-                    raise outdated()
-
-            def set_timer_state(self, state):
-                calls.append(("timer", state["phase"]))
-                raise outdated()
-
+    def test_finished_phases_carry_their_session_key(self):
         self.enable_sync()
         self.storage.record_pomodoro_completed(25, session="work:100")
         self.storage.record_break_completed(session="short_break:400")
         self.storage.publish_timer("work", False, seconds_left=60)
-        self.storage.sync.client = OldCloud()
+        cloud = FakeCloud()
+        self.storage.sync.client = cloud
         self.assertTrue(self.storage.sync._flush())
-        self.assertEqual(calls, [("pomodoro", 25, "work:100"), ("pomodoro", 25, None),
-                                 ("break", "short_break:400"), ("break", None), ("timer", "work")])
+        self.assertEqual([(name, args[:2]) for name, args in cloud.calls],
+                         [("record_pomodoro_completed", (25, "work:100")),
+                          ("record_break_completed", ("short_break:400",)),
+                          ("set_timer_state", (cloud.calls[2][1][0],))])
         self.assertEqual(self.storage.outbox_len(), 0, "nothing left stuck in the queue")
 
     def test_sharing_can_be_turned_off(self):

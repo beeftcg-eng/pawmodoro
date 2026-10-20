@@ -34,6 +34,19 @@ class MainWindowTests(StorageTestCase):
             window.tabs.setCurrentIndex(index)
             self.app.processEvents()
 
+    def test_an_older_cloud_shows_a_warning_once(self):
+        import main
+        window = self.make_window()
+        window.storage.sync.stop()  # its thread mustn't change the status meanwhile
+        self.enable_sync(window.storage)
+        window.storage.sync.status = "schema"
+        with mock.patch.object(main.notifier, "send") as send:
+            window._refresh_sync_status()
+            window._refresh_sync_status()
+        self.assertEqual(window.sync_btn.text(), "☁️ Sync ⚠")
+        self.assertEqual(send.call_count, 1)
+        self.assertIn("schema.sql", send.call_args[0][1])
+
     def test_find_carries_on_into_other_pages(self):
         st = self.storage
         st.set_page_html("main", "<p>groceries</p>")

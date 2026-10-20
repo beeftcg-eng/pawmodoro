@@ -66,8 +66,8 @@ def _pick_backend():
             backend = candidate()
             backend.idle_seconds()  # must actually answer
             return backend
-        except Exception:
-            continue
+        except Exception as e:  # expected for all but one; said once, at startup
+            print(f"[idle] {candidate.__name__} unavailable: {e}")
     return None
 
 

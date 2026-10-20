@@ -318,12 +318,13 @@ class EngineFileTests(CalendarTestCase):
         self.storage.save_event("Dinner at Mum's", "2026-10-18", shared=True, event_id="ev9")
         self.assertEqual(self.storage.get_shared_events()[0]["title"], "Dinner at Mum's")
 
-    def test_an_older_cloud_skips_it_without_blocking(self):
-        self.storage.add_attachment("task", self.task["id"], self.make_file("r.pdf"))
+    def test_an_older_cloud_keeps_it_queued(self):
+        attachment = self.storage.add_attachment("task", self.task["id"], self.make_file("r.pdf"))
         self.storage.save_event("Trip", "2026-10-20")
         old = SyncError("no such function", status=404, code="PGRST202")
-        self.assertTrue(self.flush(FileCloud(fail={"add_attachment": old, "save_event": old})))
-        self.assertEqual(self.outbox_ops(), [])
+        self.assertFalse(self.flush(FileCloud(fail={"add_attachment": old, "save_event": old})))
+        self.assertEqual(self.outbox_ops(), ["attachment_add", "event_save"])
+        self.assertIsNone(self.storage.find_attachment(attachment["id"])["upload_error"])
 
     def test_removing_one_that_never_reported_its_path(self):
         attachment = self.storage.add_attachment("task", self.task["id"], self.make_file("r.pdf"))

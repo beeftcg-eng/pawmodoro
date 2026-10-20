@@ -118,6 +118,13 @@ Until the schema is re-run, events and files stay on the computer they were
 made on and upload by themselves afterwards. The phone shows dated tasks on
 its calendar but can't add events or files yet.
 
+**After v2.21.0, an older schema no longer half-syncs.** The apps used to
+carry workarounds so an un-updated cloud kept mostly working; they're gone.
+Now, if `schema.sql` is older than the app, the desktop stops syncing (☁️
+Sync shows ⚠ and a notification, and every change waits safely in its
+upload queue) and the phone shows a "re-run schema.sql" screen. Re-run
+`schema.sql` and both carry on, with nothing lost.
+
 **From v2.20.0 the schema can update itself**: the **Deploy cloud** GitHub
 workflow (`.github/workflows/deploy-functions.yml`) tests `schema.sql` and
 then runs it, and `push_reminders.sql`, against your project whenever they

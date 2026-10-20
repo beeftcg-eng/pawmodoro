@@ -60,7 +60,10 @@ let state = null;         // last sync_pull() result
 // leave a stale screen behind.
 let stateFingerprint = null;
 let householdFingerprint = null;
-let fingerprintsSupported = true;
+// The cloud schema this page was written against (schema_version() in
+// supabase/schema.sql; supabase_sync.SCHEMA_VERSION on the desktop). An
+// older one gets the "needs updating" screen instead of the app.
+const SCHEMA_VERSION = 221;
 let pomodoro = {
   phase: "work",          // "work" | "short_break" | "long_break"
   secondsLeft: 25 * 60,
@@ -80,7 +83,6 @@ const TIMER_TAKEOVER_MS = 90000;
 let lastTzSent = null;         // UTC offset (minutes) last reported to the server
 let tzRetryAt = 0;
 let householdState;            // undefined = not fetched yet, null = not in a household, object = the household
-let householdSupported = true; // false if the cloud schema predates households
 let lastHouseholdFetch = 0;
 let wakeLock = null;
 const renderKeys = {};         // per tab: what the last render was built from, so polls only re-render on change
@@ -314,7 +316,35 @@ async function sendTzOffset() {
   else lastTzSent = minutes;
 }
 
+// False only when the cloud certainly is older than this page (a network
+// error lets the app open as usual).
+async function schemaCurrent() {
+  const { data, error } = await supabaseClient.rpc("schema_version");
+  if (error) return !isMissingFunction(error);  // missing: from before v2.20
+  return Number(data) >= SCHEMA_VERSION;
+}
+
+function showSchemaOutdatedScreen() {
+  document.getElementById("app").innerHTML = `
+    <div class="centered-card">
+      <h1>\u{1F43E} Pawmodoro</h1>
+      <p>The cloud database is older than this app. Re-run <code>supabase/schema.sql</code>
+        in the Supabase SQL Editor (see MOBILE_SYNC.md), then try again.</p>
+      <button id="schema-retry-btn">Try again</button>
+      <button id="schema-logout-btn" class="secondary">Log out</button>
+    </div>`;
+  document.getElementById("schema-retry-btn").addEventListener("click", () => enterApp());
+  document.getElementById("schema-logout-btn").addEventListener("click", async () => {
+    await supabaseClient.auth.signOut();
+    showLoginScreen();
+  });
+}
+
 async function enterApp() {
+  if (!(await schemaCurrent())) {
+    showSchemaOutdatedScreen();
+    return;
+  }
   // Fetch state before building the shell — the shell's initial
   // switchTab() renders a tab immediately, and pullAndRender() skips
   // refreshing the Notes editor whenever it's focused (so a poll can't
@@ -364,33 +394,18 @@ document.addEventListener("visibilitychange", () => {
 
 async function refreshHousehold(force) {
   const due = force || activeTab === "shared" || activeTab === "progress" || Date.now() - lastHouseholdFetch > 30000;
-  if (!due || !householdSupported) return;
+  if (!due) return;
   lastHouseholdFetch = Date.now();
-  const { data, error } = await fetchHousehold(force);
+  // {household, fingerprint}, or {unchanged} when the fingerprint offered still matches.
+  const { data, error } = await supabaseClient.rpc("household_pull_if_changed",
+    { p_fingerprint: force ? null : householdFingerprint });
   if (error) {
-    // A cloud schema from before households existed: carry on without them.
-    if (error.code === "PGRST202" || error.status === 404) householdSupported = false;
     if (householdState === undefined) householdState = null;
     return;
   }
   if (data?.unchanged) return;
   householdFingerprint = data?.fingerprint ?? null;
   householdState = data?.household ?? null; // null when this account isn't in a household
-}
-
-// household_pull_if_changed (like fetchState): {household, fingerprint}, or
-// {unchanged} when the fingerprint offered still matches. Shaped the same
-// on an older schema, from a plain household_pull.
-async function fetchHousehold(force) {
-  if (fingerprintsSupported) {
-    const { data, error } = await supabaseClient.rpc("household_pull_if_changed",
-      { p_fingerprint: force ? null : householdFingerprint });
-    if (!error) return { data };
-    if (error.code !== "PGRST202" && error.status !== 404) return { error };
-    fingerprintsSupported = false;
-  }
-  const { data, error } = await supabaseClient.rpc("household_pull");
-  return error ? { error } : { data: { household: data } };
 }
 
 function renderShell() {
@@ -440,15 +455,8 @@ function switchTab(tab) {
 
 let pullRequestId = 0;
 
-async function fetchState(poll) {
-  if (fingerprintsSupported) {
-    const { data, error } = await supabaseClient.rpc("sync_pull_if_changed", { p_fingerprint: poll ? stateFingerprint : null });
-    if (!error) return { data };
-    // A cloud schema from before v2.20: plain pulls from now on.
-    if (error.code !== "PGRST202" && error.status !== 404) return { error };
-    fingerprintsSupported = false;
-  }
-  return supabaseClient.rpc("sync_pull");
+function fetchState(poll) {
+  return supabaseClient.rpc("sync_pull_if_changed", { p_fingerprint: poll ? stateFingerprint : null });
 }
 
 async function pullAndRender({ poll = false } = {}) {
@@ -553,8 +561,7 @@ let notesSaveTimer = null;
 let notesSaveNow = null;  // runs the pending save immediately (before switching page)
 
 // Notes pages: "main" is the original notes text (app_state.notes), the
-// rest come from the notes_pages table (desktop v2.16+). An older cloud
-// schema sends no notes_pages at all; then there's just the one page.
+// rest come from the notes_pages table.
 const NOTES_PAGE_KEY = "pawmodoro_notes_page";
 let notesPage = (() => { try { return localStorage.getItem(NOTES_PAGE_KEY) || "main"; } catch { return "main"; } })();
 
@@ -612,10 +619,6 @@ async function saveNotesCheckedNow(pageId, title, html) {
     const { data, error } = main
       ? await supabaseClient.rpc("set_notes_checked", { p_notes: html, p_base_rev: base })
       : await supabaseClient.rpc("set_note_page_checked", { p_id: pageId, p_title: title, p_html: html, p_base_rev: base });
-    if (error && isMissingFunction(error)) {  // older cloud: plain save
-      return main ? supabaseClient.rpc("set_notes", { p_notes: html })
-                  : supabaseClient.rpc("set_note_page", { p_id: pageId, p_title: title, p_html: html });
-    }
     if (error) { toast("⚠️ Couldn't save notes", error.message || "Check your connection."); return; }
     if (data.ok) {
       if (main && state) state.notes_rev = data.rev;
@@ -1059,7 +1062,6 @@ function renderChecklist() {
     if (!text) return;
     const recurrence = repeat.value;
     const params = { p_text: text, p_recurrence: recurrence, p_reminder_time: null };
-    // Only sent when used, so plain tasks still work on a cloud schema older than v2.18.
     if (recurrence === "monthly") {
       const day = Math.round(Number(monthDay.value));
       if (!(day >= 1 && day <= 31)) return toast("Day of the month", "Pick a day between 1 and 31.");
@@ -1173,11 +1175,8 @@ async function updatePushRow() {
 }
 
 async function setTaskReminder(taskId, time, everyHours) {
-  let { error } = await supabaseClient.rpc("set_task_reminder_mode",
+  const { error } = await supabaseClient.rpc("set_task_reminder_mode",
     { p_task_id: taskId, p_reminder_time: time, p_every_h: everyHours });
-  if (error && isMissingFunction(error) && !everyHours) {
-    ({ error } = await supabaseClient.rpc("set_task_reminder", { p_task_id: taskId, p_reminder_time: time }));
-  }
   if (error) toast("⚠️ Couldn't save the reminder", error.message || "Check your connection and try again.");
   else if (time && window.Notification && Notification.permission === "default") Notification.requestPermission();
   await pullAndRender();
@@ -1346,7 +1345,7 @@ function scheduleTimerPush() {
     p_fire_at: new Date(pomodoro.deadline).toISOString(),
     p_title: work ? "Focus session complete!" : "Break's over",
     p_body: work ? "Open Pawmodoro to collect your XP and start your break." : "Back to it when you're ready.",
-  }).then(({ error }) => { if (error && !isMissingFunction(error)) console.warn("timer push", error); });
+  }).then(({ error }) => { if (error) console.warn("timer push", error); });
 }
 
 function cancelTimerPush() {
@@ -1391,7 +1390,7 @@ function publishTimer() {
   if (pomodoro.running) timerState.ends_at = pomodoro.deadline / 1000;
   else timerState.seconds_left = pomodoro.secondsLeft;
   supabaseClient.rpc("set_timer_state", { p_state: timerState }).then(({ data, error }) => {
-    if (error) { if (!isMissingFunction(error)) console.warn("set_timer_state", error); return; }
+    if (error) { console.warn("set_timer_state", error); return; }
     pomodoro.revSeen = Math.max(pomodoro.revSeen, Number(data) || 0);
   });
 }
@@ -1426,8 +1425,7 @@ function followRemoteTimer(timer) {
 async function creditPhase(phase, session, minutes) {
   const name = phase === "work" ? "record_pomodoro_completed" : "record_break_completed";
   const params = phase === "work" ? { p_minutes: minutes } : {};
-  let { data, error } = await supabaseClient.rpc(name, { ...params, p_session: session });
-  if (error && isMissingFunction(error)) ({ data, error } = await supabaseClient.rpc(name, params)); // older cloud
+  const { data } = await supabaseClient.rpc(name, { ...params, p_session: session });
   return data;
 }
 
@@ -1645,7 +1643,7 @@ function daysUntilWeeklyReset(d) {
 // ---------- Shared tab (household to-do list) ----------
 
 function sharedKey() {
-  return JSON.stringify([householdState, householdSupported]);
+  return JSON.stringify(householdState);
 }
 
 async function sharedCall(name, params) {
@@ -1724,13 +1722,6 @@ function renderShared() {
   const restoreDraft = keepDraft("shared-text");
   renderKeys.shared = sharedKey();
   const view = document.getElementById("view");
-
-  if (!householdSupported) {
-    view.innerHTML = `<div class="pane"><section class="card"><h2>\u{1F3E0} Shared list</h2>
-      <p class="hint">The cloud database needs updating for shared lists. Re-run <code>supabase/schema.sql</code>
-      in the Supabase SQL Editor (see MOBILE_SYNC.md), then reopen this app.</p></section></div>`;
-    return;
-  }
 
   if (!householdState) {
     view.innerHTML = `

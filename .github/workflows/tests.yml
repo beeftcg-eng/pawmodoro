@@ -53,6 +53,18 @@ jobs:
           PGPASSWORD: postgres
         run: tests/sql/run.sh
 
+  # Deckbuilder, Pairings and Dungeons Desk ship their own copy of the shared
+  # project's URL and anon key; this fails when one has drifted.
+  cloud-defaults:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Compare with the other apps
+        run: python tools/check_cloud_defaults.py --remote
+
   # The phone app (docs/) in a simulated browser.
   pwa:
     runs-on: ubuntu-24.04
