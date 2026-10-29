@@ -271,6 +271,7 @@ class MainWindowTests(StorageTestCase):
         page = st.add_note_page("Ideas / plans")
         st.set_page_html(page, "<p>an idea</p>")
         st.add_task("Walk", "daily", reminder_time="09:00")
+        st.add_teleprompter_script("Intro / hook", "Hi [wave] everyone")
         path = os.path.join(self.tmp, "export.zip")
         self.assertEqual(exporter.export_zip(st, path), 2)
         with zipfile.ZipFile(path) as zf:
@@ -282,6 +283,7 @@ class MainWindowTests(StorageTestCase):
             # WINDOWS_TESTING.md covers it on a real desktop)
             self.assertIn("Main", zf.read("notes/01 Notes.md").decode())
             self.assertIn("- [ ] Walk (daily, reminder 09:00)", zf.read("checklist.md").decode())
+            self.assertEqual(zf.read("teleprompter/01 Intro  hook.txt").decode(), "Hi [wave] everyone")
         # and it restores
         from backup_dialog import BackupDialog  # noqa: F401  (imports cleanly)
         with zipfile.ZipFile(path) as zf:
@@ -291,6 +293,42 @@ class MainWindowTests(StorageTestCase):
         st.set_notes("changed")
         st.restore_from_file(data_path)
         self.assertEqual(st.get_page_html(page), "<p>an idea</p>")
+
+    def test_teleprompter_scrolls_a_script(self):
+        window = self.make_window()
+        tab = window.teleprompter_tab
+        self.assertFalse(tab.start_btn.isEnabled(), "nothing to read yet")
+        tab.editor.setPlainText("\n".join(f"Line {n} of my video script, read at a steady pace." for n in range(60)))
+        tab._save_text()
+        self.assertEqual(len(window.storage.get_teleprompter_scripts()), 1, "typing made a script")
+        tab.fullscreen_box.setChecked(False)
+        tab.start()
+        prompter = tab.prompter
+        self.addCleanup(lambda: tab.close_prompter())
+        self.app.processEvents()
+        self.assertGreater(prompter.speed(), 0)
+        QTest = __import__("PyQt6.QtTest", fromlist=["QTest"]).QTest
+        QTest.keyClick(prompter, Qt.Key.Key_Space)
+        self.assertEqual(prompter.countdown_left, 3)
+        prompter.frame_timer.stop()  # driven by hand from here
+        prompter.advance(2.5)
+        self.assertEqual(prompter.offset, 0, "still counting down")
+        prompter.advance(1.5)
+        self.assertIsNone(prompter.countdown_left)
+        self.assertAlmostEqual(prompter.offset, prompter.speed() * 1.0, places=3)
+        prompter.grab()  # paints without trouble, mirrored too
+        QTest.keyClick(prompter, Qt.Key.Key_M)
+        prompter.grab()
+        QTest.keyClick(prompter, Qt.Key.Key_Up)
+        self.assertEqual(window.storage.get_teleprompter_settings()["wpm"], 160)
+        prompter.advance(10_000)
+        self.assertFalse(prompter.running, "stops at the end")
+        self.assertEqual(prompter.offset, prompter._max_offset())
+        QTest.keyClick(prompter, Qt.Key.Key_Escape)
+        self.app.processEvents()
+        self.assertIsNone(tab.prompter)
+        self.assertTrue(tab.mirror_box.isChecked())
+        self.assertEqual(tab.wpm_box.value(), 160)
 
     def test_progress_shows_focus_by_task(self):
         window = self.make_window()

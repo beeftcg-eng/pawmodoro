@@ -26,6 +26,7 @@ from progress_tab import ProgressTab
 from shared_tab import SharedTab
 from calendar_tab import CalendarTab
 from music_tab import MusicTab
+from teleprompter_tab import TeleprompterTab
 from widget_window import WidgetWindow
 from player_bar import PlayerBar
 from spotify_client import SpotifyClient
@@ -88,6 +89,7 @@ class MainWindow(QMainWindow):
         self.shared_tab = SharedTab(self.storage)
         self.calendar_tab = CalendarTab(self.storage)
         self.music_tab = MusicTab(self.spotify_client)
+        self.teleprompter_tab = TeleprompterTab(self.storage)
 
         self.tabs.addTab(self.notes_checklist_tab, "Notes && Checklist")
         self.tabs.addTab(self.pomodoro_tab, "Pomodoro")
@@ -95,6 +97,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.shared_tab, "\U0001F3E0 Shared")
         self.tabs.addTab(self.calendar_tab, "\U0001F4C5 Calendar")
         self.tabs.addTab(self.music_tab, "Music")
+        self.tabs.addTab(self.teleprompter_tab, "\U0001F3AC Teleprompter")
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
         # Player bar stays visible under the tabs no matter which tab is active
@@ -601,6 +604,7 @@ class MainWindow(QMainWindow):
         self.shared_tab.refresh_theme()
         self.calendar_tab.refresh_theme()
         self.music_tab.refresh_theme()
+        self.teleprompter_tab.refresh_theme()
         self.widget_window.refresh_theme()
         self.player_bar.refresh_theme()
         self.toast.refresh_theme()
@@ -748,6 +752,7 @@ class MainWindow(QMainWindow):
         self.activateWindow()
 
     def close_app(self):
+        self.teleprompter_tab.close_prompter()
         self.pomodoro_tab.save_on_quit()
         self.pomodoro_tab.stop_all_ambient()
         self.storage.sync.stop()

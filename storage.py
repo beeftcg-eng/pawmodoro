@@ -24,6 +24,7 @@ from datetime import date, datetime, timedelta
 
 import gamification
 import task_dates
+import teleprompter
 from paths import app_data_dir
 from storage_calendar import CalendarMixin
 from storage_household import HouseholdMixin
@@ -137,6 +138,8 @@ DEFAULT_DATA = {
     "attachments": [],  # personal files: {id, item_kind, item_id, file_name, mime, size, path, uploaded,
                         #                  upload_error}; the bytes are cached under attachments_dir()
     "attachment_trash": [],  # this account's files whose item was removed: {id, path, trashed_at} (from sync_pull)
+    # Teleprompter scripts (local-only, never synced): {id, title, text}; see teleprompter.py for the settings.
+    "teleprompter": {"scripts": [], "current": None, "settings": dict(teleprompter.DEFAULT_SETTINGS)},
 }
 
 
@@ -1164,6 +1167,60 @@ class Storage(RemoteStateMixin, HouseholdMixin, CalendarMixin):
                 for key in totals:
                     totals[key] += row.get(key, 0)
         return totals
+
+    # ---------- Teleprompter (local-only, see teleprompter_tab.py) ----------
+    def get_teleprompter_scripts(self):
+        return self.data["teleprompter"]["scripts"]
+
+    def _find_teleprompter_script(self, script_id):
+        return next((s for s in self.get_teleprompter_scripts() if s["id"] == script_id), None)
+
+    def get_teleprompter_script(self, script_id):
+        return self._find_teleprompter_script(script_id)
+
+    def add_teleprompter_script(self, title, text=""):
+        script = {"id": uuid.uuid4().hex[:8], "title": title.strip() or "Untitled script", "text": text}
+        self.data["teleprompter"]["scripts"].append(script)
+        self.data["teleprompter"]["current"] = script["id"]
+        self.save()
+        return script["id"]
+
+    def set_teleprompter_script(self, script_id, title=None, text=None):
+        script = self._find_teleprompter_script(script_id)
+        if script is None:
+            return
+        if title is not None and title.strip():
+            script["title"] = title.strip()
+        if text is not None:
+            script["text"] = text
+        self.save()
+
+    def remove_teleprompter_script(self, script_id):
+        tp = self.data["teleprompter"]
+        tp["scripts"] = [s for s in tp["scripts"] if s["id"] != script_id]
+        if tp["current"] == script_id:
+            tp["current"] = tp["scripts"][0]["id"] if tp["scripts"] else None
+        self.save()
+
+    def get_current_teleprompter_script(self):
+        """The id of the script the tab shows (the first one if that's gone)."""
+        tp = self.data["teleprompter"]
+        if self._find_teleprompter_script(tp.get("current")) is None:
+            tp["current"] = tp["scripts"][0]["id"] if tp["scripts"] else None
+        return tp["current"]
+
+    def set_current_teleprompter_script(self, script_id):
+        self.data["teleprompter"]["current"] = script_id
+        self.save()
+
+    def get_teleprompter_settings(self):
+        return teleprompter.clean_settings(self.data["teleprompter"].get("settings"))
+
+    def set_teleprompter_settings(self, **changes):
+        settings = self.get_teleprompter_settings()
+        settings.update(changes)
+        self.data["teleprompter"]["settings"] = teleprompter.clean_settings(settings)
+        self.save()
 
     # ---------- Updates (see update_checker.py) ----------
     def get_update_auto_check(self):
